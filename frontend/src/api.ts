@@ -1,0 +1,851 @@
+/**
+ * API Client for Agent Manager Plugin
+ *
+ * Provides axios-based HTTP client and WebSocket connections for all backend endpoints.
+ * Handles agent lifecycle, container discovery, session management, and real-time events.
+ */
+
+import axios, { AxiosInstance, AxiosResponse, AxiosError } from 'axios';
+import type {
+  // Agent Types
+  AgentType,
+  AgentAssignment,
+  AgentAssignmentResponse,
+  AgentAssignmentState,
+  AgentState,
+  AgentStateAssignment,
+  AgentTemplate,
+  AgentTemplatesResponse,
+
+  // Container Types
+  ContainerInfo,
+  ContainerDiscoveryResponse,
+  ContainerState,
+
+  // Session Types
+  SessionInfo,
+  SessionCreateRequest,
+  SessionPromptRequest,
+  SessionMessage,
+  AgentResponse,
+  LogEntry,
+  LogStreamResponse,
+
+  // State & Reconciliation
+  ReconciliationResult,
+  ReconciliationStatusResponse,
+
+  // Health & Metrics
+  HealthResponse,
+  MetricsResponse,
+
+  // API Wrapper
+  APIResponse,
+  JobStatus,
+
+  // Events
+  AgentEvent,
+  EventType,
+
+  // Models for endpoints not in types.ts
+  AgentHostStatus,
+  JobStatusResponse,
+  ValidationResponse,
+  ContainerDetailResponse,
+  EndpointsSummary,
+  ContainerStatsResponse,
+
+  // Topology Types
+  Topology,
+  Network,
+  Host,
+} from './types';
+
+// =============================================================================
+// Configuration
+// =============================================================================
+
+// Use empty string so axios makes same-origin requests (works for any host).
+// Falls back to localhost:8000 only if the env var is truly absent (undefined).
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000';
+const WS_BASE_URL = import.meta.env.VITE_WS_BASE_URL ?? 'ws://localhost:8000';
+
+// =============================================================================
+// Error Types
+// =============================================================================
+
+export class APIError extends Error {
+  constructor(
+    message: string,
+    public statusCode?: number,
+    public response?: any
+  ) {
+    super(message);
+    this.name = 'APIError';
+  }
+}
+
+export class WebSocketError extends Error {
+  constructor(message: string, public event?: MessageEvent) {
+    super(message);
+    this.name = 'WebSocketError';
+  }
+}
+
+// =============================================================================
+// Axios Instance
+// =============================================================================
+
+const apiClient: AxiosInstance = axios.create({
+  baseURL: API_BASE_URL,
+  headers: {
+    'Content-Type': 'application/json',
+  },
+  timeout: 30000,
+});
+
+// Request interceptor
+apiClient.interceptors.request.use(
+  (config) => {
+    console.log('[API Request]', config.method?.toUpperCase(), config.url, config.data);
+    // Add auth token if available
+    const token = localStorage.getItem('auth_token');
+    if (token && config.headers) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  },
+  (error) => {
+    console.error('[API Request Error]', error);
+    return Promise.reject(error);
+  }
+);
+
+// Response interceptor
+apiClient.interceptors.response.use(
+  (response: AxiosResponse) => {
+    console.log('[API Response]', response.status, response.config.url, response.data);
+    return response;
+  },
+  (error: AxiosError) => {
+    console.error('[API Error]', {
+      message: error.message,
+      code: error.code,
+      status: error.response?.status,
+      url: error.config?.url,
+      requestURL: error.request?.responseURL,
+      hasResponse: !!error.response,
+      hasRequest: !!error.request
+    });
+    if (error.response) {
+      // Server responded with error status
+      const message = (error.response.data as any)?.message || error.message;
+      throw new APIError(message, error.response.status, error.response.data);
+    } else if (error.request) {
+      // Request made but no response
+      throw new APIError('No response from server. Please check your connection.');
+    } else {
+      // Request setup error
+      throw new APIError(error.message);
+    }
+  }
+);
+
+// =============================================================================
+// Topology Management APIs
+// =============================================================================
+
+/**
+ * Get all topologies from network-topology plugin
+ */
+export async function getTopologies(): Promise<{ topologies: Topology[] }> {
+  const response = await apiClient.get<{ topologies: Topology[] }>('/api/topologies');
+  return response.data;
+}
+
+/**
+ * Get a specific topology by ID
+ */
+export async function getTopology(topologyId: string): Promise<Topology> {
+  const response = await apiClient.get<Topology>(`/api/topologies/${topologyId}`);
+  return response.data;
+}
+
+/**
+ * Start a topology (launch docker containers)
+ */
+export async function startTopology(topologyId: string): Promise<{ message: string }> {
+  const response = await apiClient.post<{ message: string }>(`/api/topologies/${topologyId}/start`);
+  return response.data;
+}
+
+/**
+ * Stop a topology (stop docker containers)
+ */
+export async function stopTopology(topologyId: string): Promise<{ message: string }> {
+  const response = await apiClient.post<{ message: string }>(`/api/topologies/${topologyId}/stop`);
+  return response.data;
+}
+
+/**
+ * Save updated topology (agent assignments per host) back to the network-topology plugin.
+ * Only sends the networks array — the backend merges it with the full topology to preserve
+ * firewall rules and infrastructure settings.
+ */
+export async function saveTopology(topologyId: string, networks: Network[]): Promise<Topology> {
+  const response = await apiClient.put<Topology>(`/api/topologies/${topologyId}`, { networks });
+  return response.data;
+}
+
+// =============================================================================
+// Agent Management APIs
+// =============================================================================
+
+/**
+ * Get all available agent templates
+ */
+export async function getAgentTemplates(): Promise<AgentTemplatesResponse> {
+  const response = await apiClient.get<AgentTemplatesResponse>('/api/agents/templates');
+  return response.data;
+}
+
+/**
+ * Get a specific agent template by type
+ */
+export async function getAgentTemplate(agentType: AgentType): Promise<AgentTemplate> {
+  const response = await apiClient.get<AgentTemplate>(`/api/agents/templates/${agentType}`);
+  return response.data;
+}
+
+/**
+ * Assign an agent to a host (returns immediately with job_id)
+ */
+export async function assignAgent(assignment: AgentAssignment): Promise<AgentAssignmentResponse> {
+  const response = await apiClient.post<AgentAssignmentResponse>('/api/agents/assign', assignment);
+  return response.data;
+}
+
+/**
+ * Remove an agent from a host (returns immediately with job_id)
+ */
+export async function removeAgent(
+  topologyId: string,
+  hostId: string,
+  agentType: AgentType,
+  networkId: string
+): Promise<AgentAssignmentResponse> {
+  const response = await apiClient.delete<AgentAssignmentResponse>(
+    `/api/agents/${topologyId}/${hostId}/${agentType}`,
+    { params: { network_id: networkId } }
+  );
+  return response.data;
+}
+
+/**
+ * Get global agent state
+ */
+export async function getAgentState(statePath?: string): Promise<AgentState> {
+  const params = statePath ? { state_path: statePath } : {};
+  const response = await apiClient.get<AgentState>('/api/agents/state', { params });
+  return response.data;
+}
+
+/**
+ * Get all agent assignments (optionally filtered)
+ */
+export async function getAgentAssignments(filters?: {
+  topologyId?: string;
+  hostId?: string;
+  statePath?: string;
+}): Promise<AgentStateAssignment[]> {
+  const params: Record<string, string> = {};
+  if (filters?.topologyId) params.topology_id = filters.topologyId;
+  if (filters?.hostId) params.host_id = filters.hostId;
+  if (filters?.statePath) params.state_path = filters.statePath;
+
+  const response = await apiClient.get<AgentStateAssignment[]>('/api/agents/assignments', { params });
+  return response.data;
+}
+
+/**
+ * Get agent status for a specific host
+ */
+export async function getHostStatus(
+  topologyId: string,
+  hostId: string,
+  networkId: string
+): Promise<AgentHostStatus> {
+  const response = await apiClient.get<AgentHostStatus>(
+    `/api/agents/status/${topologyId}/${hostId}`,
+    { params: { network_id: networkId } }
+  );
+  return response.data;
+}
+
+/**
+ * Get status of a background job
+ */
+export async function getJobStatus(jobId: string): Promise<JobStatusResponse> {
+  const response = await apiClient.get<JobStatusResponse>(`/api/agents/jobs/${jobId}`);
+  return response.data;
+}
+
+/**
+ * Validate an agent assignment before attempting
+ */
+export async function validateAssignment(assignment: AgentAssignment): Promise<ValidationResponse> {
+  const response = await apiClient.post<ValidationResponse>('/api/agents/validate', assignment);
+  return response.data;
+}
+
+/**
+ * Get reconciliation status
+ */
+export async function getReconciliationStatus(): Promise<ReconciliationStatusResponse> {
+  const response = await apiClient.get<ReconciliationStatusResponse>('/api/agents/reconciliation/status');
+  return response.data;
+}
+
+/**
+ * Health check for agents service
+ */
+export async function getAgentsHealth(): Promise<{ status: string; version: string; supported_agents: string[] }> {
+  const response = await apiClient.get('/api/agents/health');
+  return response.data;
+}
+
+// =============================================================================
+// Container Discovery APIs
+// =============================================================================
+
+/**
+ * Discover containers with comprehensive filtering
+ */
+export async function discoverContainers(filters?: {
+  topologyId?: string;
+  networkId?: string;
+  hostId?: string;
+  state?: ContainerState;
+  hasAgents?: boolean;
+  hostType?: string;
+  includeStopped?: boolean;
+}): Promise<ContainerDiscoveryResponse> {
+  const params: Record<string, any> = {};
+  if (filters?.topologyId) params.topology_id = filters.topologyId;
+  if (filters?.networkId) params.network_id = filters.networkId;
+  if (filters?.hostId) params.host_id = filters.hostId;
+  if (filters?.state) params.state = filters.state;
+  if (filters?.hasAgents !== undefined) params.has_agents = filters.hasAgents;
+  if (filters?.hostType) params.host_type = filters.hostType;
+  if (filters?.includeStopped !== undefined) params.include_stopped = filters.includeStopped;
+
+  const response = await apiClient.get<ContainerDiscoveryResponse>('/api/containers/discover', { params });
+  return response.data;
+}
+
+/**
+ * Get detailed container info by container ID
+ */
+export async function getContainerDetails(containerId: string): Promise<ContainerDetailResponse> {
+  const response = await apiClient.get<ContainerDetailResponse>(`/api/containers/${containerId}`);
+  return response.data;
+}
+
+/**
+ * Get container by topology and host ID
+ */
+export async function getContainerByHost(
+  topologyId: string,
+  hostId: string
+): Promise<ContainerDetailResponse> {
+  const response = await apiClient.get<ContainerDetailResponse>(
+    `/api/containers/by-host/${topologyId}/${hostId}`
+  );
+  return response.data;
+}
+
+/**
+ * Get container statistics for a topology
+ */
+export async function getContainerStats(topologyId: string): Promise<ContainerStatsResponse> {
+  const response = await apiClient.get<ContainerStatsResponse>(`/api/containers/stats/${topologyId}`);
+  return response.data;
+}
+
+// =============================================================================
+// Session Management APIs
+// =============================================================================
+
+/**
+ * List all sessions with optional filtering
+ */
+export async function listSessions(filters?: {
+  limit?: number;
+  offset?: number;
+  statusFilter?: string;
+}): Promise<SessionInfo[]> {
+  const params: Record<string, any> = {};
+  if (filters?.limit) params.limit = filters.limit;
+  if (filters?.offset) params.offset = filters.offset;
+  if (filters?.statusFilter) params.status_filter = filters.statusFilter;
+
+  const response = await apiClient.get<SessionInfo[]>('/api/sessions/list', { params });
+  return response.data;
+}
+
+/**
+ * Get session info by ID
+ */
+export async function getSession(sessionId: string): Promise<SessionInfo> {
+  const response = await apiClient.get<SessionInfo>(`/api/sessions/${sessionId}`);
+  return response.data;
+}
+
+/**
+ * Get session messages
+ */
+export async function getSessionMessages(
+  sessionId: string,
+  limit: number = 100,
+  offset: number = 0
+): Promise<SessionMessage[]> {
+  const response = await apiClient.get<SessionMessage[]>(`/api/sessions/${sessionId}/messages`, {
+    params: { limit, offset }
+  });
+  return response.data;
+}
+
+/**
+ * Create a new session
+ */
+export async function createSession(request: SessionCreateRequest): Promise<SessionInfo> {
+  const response = await apiClient.post<SessionInfo>('/api/sessions', request);
+  return response.data;
+}
+
+/**
+ * Send a prompt to a session
+ */
+export async function sendPrompt(
+  sessionId: string,
+  request: SessionPromptRequest
+): Promise<AgentResponse> {
+  const response = await apiClient.post<AgentResponse>(
+    `/api/sessions/${sessionId}/prompt`,
+    request
+  );
+  return response.data;
+}
+
+/**
+ * Delete a session
+ */
+export async function deleteSession(sessionId: string): Promise<{ message: string }> {
+  const response = await apiClient.delete<{ message: string }>(`/api/sessions/${sessionId}`);
+  return response.data;
+}
+
+/**
+ * Get session logs
+ */
+export async function getSessionLogs(
+  sessionId: string,
+  filters?: {
+    levelFilter?: string;
+    since?: string;
+    includeToolCalls?: boolean;
+  }
+): Promise<LogStreamResponse> {
+  const params: Record<string, any> = {};
+  if (filters?.levelFilter) params.level_filter = filters.levelFilter;
+  if (filters?.since) params.since = filters.since;
+  if (filters?.includeToolCalls !== undefined) params.include_tool_calls = filters.includeToolCalls;
+
+  const response = await apiClient.get<LogStreamResponse>(`/api/sessions/${sessionId}/logs`, { params });
+  return response.data;
+}
+
+// =============================================================================
+// WebSocket Connection Manager
+// =============================================================================
+
+export interface WebSocketMessage {
+  type: string;
+  timestamp?: string;
+  data?: Record<string, any>;
+}
+
+export interface WebSocketCallbacks {
+  onMessage?: (event: AgentEvent) => void;
+  onError?: (error: WebSocketError) => void;
+  onOpen?: (event: Event) => void;
+  onClose?: (event: CloseEvent) => void;
+  onReconnecting?: (attempt: number) => void;
+  onReconnected?: (attempt: number) => void;
+}
+
+export class AgentWebSocket {
+  private ws: WebSocket | null = null;
+  private url: string;
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 5;
+  private reconnectDelay = 1000;
+  private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+  private callbacks: WebSocketCallbacks = {};
+  private manualClose = false;
+  private pingInterval: ReturnType<typeof setInterval> | null = null;
+
+  constructor(url: string, callbacks?: WebSocketCallbacks) {
+    this.url = url;
+    if (callbacks) {
+      this.callbacks = callbacks;
+    }
+  }
+
+  /**
+   * Connect to WebSocket server
+   */
+  connect(): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      return;
+    }
+
+    this.manualClose = false;
+
+    try {
+      this.ws = new WebSocket(this.url);
+
+      this.ws.onopen = (event) => {
+        this.reconnectAttempts = 0;
+        this.startPing();
+        this.callbacks.onOpen?.(event);
+      };
+
+      this.ws.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data) as WebSocketMessage;
+          const msg = message as Partial<WebSocketMessage & AgentEvent>;
+          if (msg.event_type && msg.event_id) {
+            this.callbacks.onMessage?.(msg as AgentEvent);
+          } else {
+            // Handle messages that don't match AgentEvent format
+            console.warn('Received message without event_type or event_id:', message);
+          }
+        } catch (error) {
+          this.callbacks.onError?.(
+            new WebSocketError('Failed to parse WebSocket message', event)
+          );
+        }
+      };
+
+      this.ws.onerror = (event) => {
+        this.callbacks.onError?.(new WebSocketError('WebSocket error occurred'));
+      };
+
+      this.ws.onclose = (event) => {
+        this.stopPing();
+        this.callbacks.onClose?.(event);
+
+        if (!this.manualClose && this.reconnectAttempts < this.maxReconnectAttempts) {
+          this.scheduleReconnect();
+        }
+      };
+    } catch (error) {
+      this.callbacks.onError?.(
+        new WebSocketError(`Failed to connect: ${error instanceof Error ? error.message : 'Unknown error'}`)
+      );
+    }
+  }
+
+  /**
+   * Disconnect from WebSocket server
+   */
+  disconnect(): void {
+    this.manualClose = true;
+    this.stopPing();
+
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
+
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+  }
+
+  /**
+   * Send a message through WebSocket
+   */
+  send(message: WebSocketMessage): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(message));
+    } else {
+      throw new WebSocketError('WebSocket is not connected');
+    }
+  }
+
+  /**
+   * Subscribe to specific events
+   */
+  subscribe(events: string[]): void {
+    this.send({
+      type: 'subscribe',
+      timestamp: new Date().toISOString(),
+      data: { events }
+    });
+  }
+
+  /**
+   * Send ping message
+   */
+  ping(): void {
+    this.send({ type: 'ping' });
+  }
+
+  /**
+   * Schedule reconnection attempt
+   */
+  private scheduleReconnect(): void {
+    this.reconnectAttempts++;
+    const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
+
+    this.callbacks.onReconnecting?.(this.reconnectAttempts);
+
+    this.reconnectTimeout = setTimeout(() => {
+      this.callbacks.onReconnected?.(this.reconnectAttempts);
+      this.connect();
+    }, delay);
+  }
+
+  /**
+   * Start periodic ping to keep connection alive
+   */
+  private startPing(): void {
+    this.pingInterval = setInterval(() => {
+      this.ping();
+    }, 30000); // Ping every 30 seconds
+  }
+
+  /**
+   * Stop periodic ping
+   */
+  private stopPing(): void {
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+    }
+  }
+
+  /**
+   * Get connection state
+   */
+  get readyState(): number {
+    return this.ws?.readyState ?? WebSocket.CLOSED;
+  }
+
+  /**
+   * Check if connected
+   */
+  get isConnected(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
+  }
+}
+
+/**
+ * Create a WebSocket connection for events
+ */
+export function createEventWebSocket(callbacks?: WebSocketCallbacks): AgentWebSocket {
+  const url = `${WS_BASE_URL}/ws/events`;
+  return new AgentWebSocket(url, callbacks);
+}
+
+/**
+ * Create a WebSocket connection for a specific session
+ */
+export function createSessionWebSocket(
+  sessionId: string,
+  callbacks?: WebSocketCallbacks
+): AgentWebSocket {
+  const url = `${WS_BASE_URL}/api/sessions/ws/${sessionId}`;
+  return new AgentWebSocket(url, callbacks);
+}
+
+// =============================================================================
+// Health & Metrics APIs
+// =============================================================================
+
+/**
+ * Get system health status
+ */
+export async function getHealth(): Promise<HealthResponse> {
+  const response = await apiClient.get<HealthResponse>('/health');
+  return response.data;
+}
+
+/**
+ * Get system metrics
+ */
+export async function getMetrics(): Promise<MetricsResponse> {
+  const response = await apiClient.get<MetricsResponse>('/metrics');
+  return response.data;
+}
+
+/**
+ * Get API root information
+ */
+export async function getApiInfo(): Promise<APIResponse<{ docs: string; redoc: string; websocket: string }>> {
+  const response = await apiClient.get<APIResponse>('/');
+  return response.data;
+}
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+/**
+ * Convert API error to user-friendly message
+ */
+export function getErrorMessage(error: unknown): string {
+  if (error instanceof APIError) {
+    return error.message;
+  }
+  if (error instanceof WebSocketError) {
+    return error.message;
+  }
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return 'An unknown error occurred';
+}
+
+/**
+ * Check if error is a network error
+ */
+export function isNetworkError(error: unknown): boolean {
+  return error instanceof APIError && !error.statusCode;
+}
+
+/**
+ * Check if error is a timeout
+ */
+export function isTimeoutError(error: unknown): boolean {
+  return error instanceof APIError && error.statusCode === 408;
+}
+
+/**
+ * Create a query string from parameters
+ */
+export function buildQueryString(params: Record<string, any>): string {
+  const searchParams = new URLSearchParams();
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null) {
+      searchParams.append(key, String(value));
+    }
+  });
+  return searchParams.toString();
+}
+
+// =============================================================================
+// Re-Export Types for Convenience
+// =============================================================================
+
+export type {
+  AgentType,
+  AgentAssignment,
+  AgentAssignmentResponse,
+  AgentAssignmentState,
+  AgentState,
+  AgentStateAssignment,
+  AgentTemplate,
+  AgentTemplatesResponse,
+  ContainerInfo,
+  ContainerDiscoveryResponse,
+  ContainerState,
+  SessionInfo,
+  SessionCreateRequest,
+  SessionPromptRequest,
+  SessionMessage,
+  AgentResponse,
+  LogEntry,
+  LogStreamResponse,
+  ReconciliationResult,
+  ReconciliationStatusResponse,
+  HealthResponse,
+  MetricsResponse,
+  APIResponse,
+  JobStatus,
+  AgentEvent,
+  EventType,
+  AgentHostStatus,
+  JobStatusResponse,
+  ValidationResponse,
+  ContainerDetailResponse,
+  EndpointsSummary,
+  ContainerStatsResponse,
+  Topology,
+  Network,
+  Host,
+};
+
+// =============================================================================
+// API Client Instance (for direct use)
+// =============================================================================
+
+export { apiClient as httpClient };
+
+export default {
+  // Topology Management
+  getTopologies,
+  getTopology,
+  startTopology,
+  stopTopology,
+  saveTopology,
+
+  // Agent Management
+  getAgentTemplates,
+  getAgentTemplate,
+  assignAgent,
+  removeAgent,
+  getAgentState,
+  getAgentAssignments,
+  getHostStatus,
+  getJobStatus,
+  validateAssignment,
+  getReconciliationStatus,
+  getAgentsHealth,
+
+  // Container Discovery
+  discoverContainers,
+  getContainerDetails,
+  getContainerByHost,
+  getContainerStats,
+
+  // Session Management
+  listSessions,
+  getSession,
+  getSessionMessages,
+  createSession,
+  sendPrompt,
+  deleteSession,
+  getSessionLogs,
+
+  // WebSocket
+  createEventWebSocket,
+  createSessionWebSocket,
+
+  // Health & Metrics
+  getHealth,
+  getMetrics,
+  getApiInfo,
+
+  // Utilities
+  getErrorMessage,
+  isNetworkError,
+  isTimeoutError,
+  buildQueryString,
+
+  // HTTP Client
+  httpClient: apiClient,
+};

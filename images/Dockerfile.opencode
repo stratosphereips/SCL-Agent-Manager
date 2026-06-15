@@ -1,0 +1,92 @@
+# Dockerfile.opencode - Template for building OpenCode-enabled images
+# Usage: docker build --build-arg BASE_IMAGE=ubuntu:24.04 -t scl-opencode .
+
+ARG BASE_IMAGE=ubuntu:24.04
+FROM ${BASE_IMAGE}
+
+LABEL maintainer="StratoCyberLab Team"
+LABEL description="SCL OpenCode Base Image"
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+# Install essential packages
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    bash \
+    sudo \
+    openssh-server \
+    openssh-client \
+    ca-certificates \
+    gnupg \
+    lsb-release \
+    software-properties-common \
+    python3 \
+    python3-pip \
+    python3-venv \
+    git \
+    vim \
+    nano \
+    net-tools \
+    iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+
+# NOTE: OpenCode installation skipped - requires private access
+# Create mock OpenCode directory structure
+RUN mkdir -p \
+    /root/.opencode/bin \
+    /root/.config/opencode \
+    /root/.local/share/opencode \
+    /opt/shared \
+    /opt/agents \
+    /var/log/agent \
+    /secrets \
+    /var/run/sshd
+
+# Create mock opencode binary for health checks
+RUN printf '#!/bin/bash\ncase "$1" in\n    --health)\n        echo '\''{"status": "ready", "version": "0.1.0-mock"}'\''\n        exit 0\n        ;;\n    --version)\n        echo "OpenCode v0.1.0-mock"\n        exit 0\n        ;;\n    *)\n        echo "Mock OpenCode - for testing only"\n        exit 0\n        ;;\nesac\n' > /root/.opencode/bin/opencode && \
+    chmod +x /root/.opencode/bin/opencode
+
+# Create mock OpenCode server script
+RUN printf '#!/bin/bash\nPORT=${PORT:-4096}\nwhile true; do\n    echo "Serving mock OpenCode on port $PORT"\n    sleep 60\ndone\n' > /usr/local/bin/opencode-server && \
+    chmod +x /usr/local/bin/opencode-server
+
+# Add OpenCode bin directory to PATH
+ENV PATH="/root/.opencode/bin:${PATH}"
+
+# Create labuser for SSH access
+RUN useradd -m -s /bin/bash labuser && \
+    echo "labuser:labuser" | chpasswd && \
+    echo "labuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/labuser && \
+    chmod 440 /etc/sudoers.d/labuser && \
+    ssh-keygen -A
+
+# Install Python packages using apt (Ubuntu 24.04+)
+RUN apt-get update && apt-get install -y \
+    python3-requests \
+    python3-yaml \
+    && rm -rf /var/lib/apt/lists/* || \
+    pip3 install --no-cache-dir --break-system-packages \
+    requests \
+    pyyaml
+
+# Create symlink for opencode
+RUN ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode
+
+# Create a basic OpenCode configuration
+RUN printf '{\n    "server": {\n        "host": "0.0.0.0",\n        "port": 4096,\n        "enabled": true\n    },\n    "agent": {\n        "name": "scl-agent",\n        "workspace": "/opt/agents"\n    },\n    "security": {\n        "auth_enabled": false,\n        "allow_anonymous": true\n    }\n}\n' > /root/.config/opencode/opencode.json
+
+# Expose OpenCode HTTP API port
+EXPOSE 4096
+EXPOSE 22
+
+# Set working directory
+WORKDIR /opt/agents
+
+# Create entrypoint script
+RUN printf '#!/bin/bash\n/usr/sbin/sshd -D &\npython3 -m http.server 4096 --bind 0.0.0.0 &\n/bin/bash\n' > /usr/local/bin/entrypoint.sh && \
+    chmod +x /usr/local/bin/entrypoint.sh
+
+CMD ["/usr/local/bin/entrypoint.sh"]

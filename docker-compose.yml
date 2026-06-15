@@ -1,0 +1,33 @@
+services:
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: scl-agent-manager-dashboard
+    ports:
+      - "${DASHBOARD_PORT:-9005}:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - agent_state:/app/state
+      # Mount topology data directory - use environment variable or default relative path
+      - ${TOPOLOGY_DATA_DIR:-../network-topology/data/topologies}:/app/topologies:ro
+      # Mount backend for development (optional, remove in production)
+      - ./backend:/app/backend
+      # Mount outputs directory for Trident compatibility (optional)
+      - ${OUTPUTS_DIR:-/tmp/outputs}:/outputs:ro
+    environment:
+      - TOPOLOGY_DATA_DIR=/app/topologies
+      - AGENT_STATE_DIR=/app/state
+      - DASHBOARD_PORT=8080
+      - OUTPUTS_DIR=/outputs
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    networks:
+      - scl-playground-net
+    restart: unless-stopped
+
+volumes:
+  agent_state:
+
+networks:
+  scl-playground-net:
+    external: true

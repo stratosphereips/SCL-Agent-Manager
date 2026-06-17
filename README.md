@@ -15,7 +15,7 @@ The Agent Manager plugin provides a web UI and REST API for managing AI agents i
 ## Architecture
 
 ```
-stratocyberlab/plugins/agent-manager/
+agent-manager/
 ├── backend/                 # FastAPI/Quart Python backend
 │   ├── app.py              # Main application, routers, background tasks
 │   ├── models.py           # Pydantic models
@@ -46,10 +46,13 @@ stratocyberlab/plugins/agent-manager/
 
 ## Running
 
-### With Docker Compose
+Run all commands from the repository root.
+
+### With Docker Compose (recommended)
+
+The Compose stack uses the external Docker network `scl-playground-net`, which is created by the network-topology plugin. Make sure that plugin is running first.
 
 ```bash
-cd ./stratocyberlab/plugins/agent-manager
 # Set LLM environment variables (required for agent functionality)
 export OPENCODE_API_KEY=your-api-key-here
 export LLM_URL=https://llm.ai.e-infra.cz/v1
@@ -58,23 +61,7 @@ export LLM_MODEL=qwen3-coder
 docker compose up -d --build
 ```
 
-The dashboard is available at http://localhost:9005.
-
-### Backend Development
-
-```bash
-cd /home/diego/SCLT/stratocyberlab/plugins/agent-manager/backend
-pip install -r requirements.txt
-python -m uvicorn backend.app:app --reload --host 0.0.0.0 --port 8080
-```
-
-### Frontend Development
-
-```bash
-cd /home/diego/SCLT/stratocyberlab/plugins/agent-manager/frontend
-npm ci
-npm run dev
-```
+The dashboard is available at http://localhost:9005 (override the host port with `DASHBOARD_PORT`).
 
 ## Configuration
 
@@ -148,7 +135,6 @@ export LLM_MODEL=qwen3-coder
 Run the assignment verification test:
 
 ```bash
-cd /home/diego/SCLT/stratocyberlab/plugins/agent-manager
 python tests/test_assignments.py
 ```
 

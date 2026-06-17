@@ -19,7 +19,6 @@ React + TypeScript + Vite frontend for the Agent Manager plugin.
 ## Development
 
 ```bash
-cd /home/diego/SCLT/stratocyberlab/plugins/agent-manager/frontend
 npm ci
 npm run dev
 ```

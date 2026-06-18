@@ -11,6 +11,8 @@ Source files (from Trident infrastructure):
 - images/compromised/opencode.json (coder56, db_admin, soc_god)
 """
 
+import os
+
 from ..models import AgentType
 from typing import Dict
 
@@ -63,15 +65,15 @@ You are a non-conversational, autonomous red-team subsystem running inside a con
 "CREDENTIALS_AND_ACCESS":
 {
   "jump_host": {
-    "address": "172.30.0.10",
-    "user": "labuser",
-    "password": "adminadmin"
+    "address": "{jump_host_address}",
+    "user": "{jump_host_user}",
+    "password": "{jump_host_password}"
   },
   "db_server": {
-    "address": "172.31.0.10",
-    "user": "john_scott",
-    "password": "john_scott",
-    "database": "labdb"
+    "address": "{db_server_address}",
+    "user": "{db_server_user}",
+    "password": "{db_server_password}",
+    "database": "{db_server_database}"
   }
 }
 
@@ -134,27 +136,31 @@ You are a non-conversational, autonomous red-team subsystem running inside a con
 }
 
 
-def get_agent_prompt(agent_type: AgentType) -> str:
+_DB_ADMIN_DEFAULTS = {
+    "jump_host_address":  os.getenv("DB_ADMIN_JUMP_HOST_ADDRESS",  "172.30.0.10"),
+    "jump_host_user":     os.getenv("DB_ADMIN_JUMP_HOST_USER",     "labuser"),
+    "jump_host_password": os.getenv("DB_ADMIN_JUMP_HOST_PASSWORD", "adminadmin"),
+    "db_server_address":  os.getenv("DB_ADMIN_DB_SERVER_ADDRESS",  "172.31.0.10"),
+    "db_server_user":     os.getenv("DB_ADMIN_DB_SERVER_USER",     "john_scott"),
+    "db_server_password": os.getenv("DB_ADMIN_DB_SERVER_PASSWORD", "john_scott"),
+    "db_server_database": os.getenv("DB_ADMIN_DB_NAME",            "labdb"),
+}
+
+
+def get_agent_prompt(agent_type: AgentType, **kwargs) -> str:
     """
-    Get the system prompt for a given agent type.
-
-    Args:
-        agent_type: The agent type to get the prompt for.
-
-    Returns:
-        The system prompt string for the agent.
-
-    Raises:
-        KeyError: If the agent type is not found.
+    Get the system prompt for a given agent type, with topology-specific values
+    substituted in. For db_admin, pass jump_host_address, db_server_address, etc.
+    as keyword arguments to override the env-var defaults.
     """
-    return AGENT_SYSTEM_PROMPTS[agent_type]
+    prompt = AGENT_SYSTEM_PROMPTS[agent_type]
+    if agent_type == AgentType.DB_ADMIN:
+        values = {**_DB_ADMIN_DEFAULTS, **kwargs}
+        for key, value in values.items():
+            prompt = prompt.replace(f'{{{key}}}', str(value))
+    return prompt
 
 
 def list_available_prompts() -> Dict[AgentType, str]:
-    """
-    Get all available agent system prompts.
-
-    Returns:
-        Dictionary mapping agent types to their prompts.
-    """
+    """Returns raw prompt templates (placeholders not filled)."""
     return AGENT_SYSTEM_PROMPTS.copy()

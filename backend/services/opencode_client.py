@@ -12,6 +12,7 @@ OpenCodeClient implementation.
 import asyncio
 import json
 import logging
+import os
 import subprocess
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, AsyncIterator, Set
@@ -30,7 +31,7 @@ from ..models import (
 
 # Track networks we've already connected to avoid repeated commands
 _CONNECTED_NETWORKS: Set[str] = set()
-_AGENT_MANAGER_CONTAINER = "scl-agent-manager-dashboard"
+_AGENT_MANAGER_CONTAINER = os.getenv("AGENT_MANAGER_CONTAINER_NAME", "scl-agent-manager-dashboard")
 
 
 logger = logging.getLogger(__name__)
@@ -40,9 +41,12 @@ logger = logging.getLogger(__name__)
 # Constants
 # =============================================================================
 
-# Default OpenCode server configuration
-DEFAULT_OPENCODE_HOST = "127.0.0.1"
-DEFAULT_OPENCODE_PORT = 4096
+# Default OpenCode server configuration.
+# Callers that know the target container should always pass host explicitly.
+# 127.0.0.1 is kept as the fallback only for local health probes that run
+# inside the same container as OpenCode (e.g. the background health check in app.py).
+DEFAULT_OPENCODE_HOST = os.getenv("OPENCODE_DEFAULT_HOST", "127.0.0.1")
+DEFAULT_OPENCODE_PORT = int(os.getenv("OPENCODE_PORT", "4096"))
 DEFAULT_OPENCODE_TIMEOUT = 30
 OPENCODE_HEALTH_ENDPOINT = "/global/health"
 OPENCODE_SESSION_ENDPOINT = "/session"

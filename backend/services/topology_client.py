@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 
 # Default paths
 TOPOLOGY_DATA_DIR = os.environ.get('TOPOLOGY_DATA_DIR', '/app/topologies/topologies')
+TOPOLOGY_PLUGIN_URL = os.environ.get('TOPOLOGY_PLUGIN_URL', 'http://scl-plugin-network-topology-control-plane:9002')
 COMPOSE_FILE = os.environ.get('COMPOSE_FILE', '/app/docker-compose.yml')
 
 

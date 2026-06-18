@@ -60,11 +60,9 @@ logger = logging.getLogger(__name__)
 # Configuration
 # =============================================================================
 
-# Agent to OpenCode image mapping
-# Only keeping Coder56 and DB_ADMIN (benign) as requested
 AGENT_OPENCODE_IMAGES: Dict[AgentType, str] = {
-    AgentType.CODER56: "ghcr.io/stratocyber/opencode-coder56:latest",
-    AgentType.DB_ADMIN: "ghcr.io/stratocyber/opencode-db-admin:latest",
+    AgentType.CODER56: os.getenv("OPENCODE_IMAGE_CODER56", "ghcr.io/stratocyber/opencode-coder56:latest"),
+    AgentType.DB_ADMIN: os.getenv("OPENCODE_IMAGE_DB_ADMIN", "ghcr.io/stratocyber/opencode-db-admin:latest"),
 }
 
 # Import agent system prompts from dedicated prompts module

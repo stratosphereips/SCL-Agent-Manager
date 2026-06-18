@@ -48,8 +48,9 @@ async def _get_container_address(container_id: str) -> str:
     try:
         async with create_docker_client() as docker:
             details = await get_container_details(docker, container_id)
-            # Use IP address if available, otherwise fallback to container name
-            return details.ip_address or details.name
+            # Prefer container name — stable DNS hostname on Docker networks.
+            # Fall back to IP only if name is unavailable.
+            return details.name or details.ip_address
     except ContainerNotFoundError:
         raise HTTPException(status_code=404, detail=f"Container {container_id} not found")
     except Exception as e:

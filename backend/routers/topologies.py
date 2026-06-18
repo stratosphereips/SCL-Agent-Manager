@@ -12,9 +12,8 @@ from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-# Configuration
-# Use the container name since both are on playground-net
-TOPOLOGY_PLUGIN_URL = os.getenv("TOPOLOGY_PLUGIN_URL", "http://scl-network-topology:9002")
+# Configuration — resolved via env vars set in docker-compose.yml
+TOPOLOGY_PLUGIN_URL = os.getenv("TOPOLOGY_PLUGIN_URL", "http://scl-plugin-network-topology-control-plane:9002")
 TOPOLOGY_DATA_DIR = os.getenv("TOPOLOGY_DATA_DIR", "/app/topologies/topologies")
 
 logger = logging.getLogger(__name__)

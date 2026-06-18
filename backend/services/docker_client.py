@@ -9,6 +9,7 @@ from the migration plan.
 import asyncio
 import json
 import logging
+import os
 import subprocess
 import time
 from dataclasses import dataclass
@@ -40,8 +41,11 @@ CONTAINER_STATE_POLL_INTERVAL = 0.5  # seconds
 OPENCODE_READY_TIMEOUT = 30  # seconds
 CONTAINER_RECREATE_TIMEOUT = 60  # seconds
 
+# SCL shared network name — must match the value in SCL's docker-compose.yml
+SCL_NETWORK_NAME = os.getenv("SCL_NETWORK_NAME", "playground-net")
+
 # OpenCode configuration
-OPENCODE_PORT = 4096
+OPENCODE_PORT = int(os.getenv("OPENCODE_PORT", "4096"))
 OPENCODE_HEALTH_PATH = "/global/health"
 OPENCODE_READY_INDICATORS = [
     "OpenCode server ready",
@@ -1051,16 +1055,9 @@ def _extract_container_ip(container_dict: Dict[str, Any]) -> Optional[str]:
     """
     networks = container_dict.get('NetworkSettings', {}).get('Networks', {})
 
-    # Prefer playground-net since that's where the agent-manager runs
-    if 'playground-net' in networks:
-        return networks['playground-net'].get('IPAddress')
+    if SCL_NETWORK_NAME in networks:
+        return networks[SCL_NETWORK_NAME].get('IPAddress')
 
-    # Prefer networks with 'scl' in the name
-    for network_name, network_info in networks.items():
-        if 'scl' in network_name.lower():
-            return network_info.get('IPAddress')
-
-    # Fall back to first available network
     for network_info in networks.values():
         if network_info.get('IPAddress'):
             return network_info['IPAddress']
@@ -1079,12 +1076,9 @@ def _get_primary_network(container_dict: Dict[str, Any]) -> Optional[str]:
     """
     networks = container_dict.get('NetworkSettings', {}).get('Networks', {})
 
-    # Prefer SCL networks
-    for network_name in networks.keys():
-        if 'scl' in network_name.lower():
-            return network_name
+    if SCL_NETWORK_NAME in networks:
+        return SCL_NETWORK_NAME
 
-    # Return first network if available
     return next(iter(networks.keys()), None)
 
 

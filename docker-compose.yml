@@ -10,24 +10,32 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - agent_state:/app/state
       # Mount topology data directory - use environment variable or default relative path
-      - ${TOPOLOGY_DATA_DIR:-../network-topology/data/topologies}:/app/topologies:ro
+      - scl-plugin-network-topology-data:/app/topologies:ro
       # Mount backend for development (optional, remove in production)
       - ./backend:/app/backend
       # Mount outputs directory for Trident compatibility (optional)
       - ${OUTPUTS_DIR:-/tmp/outputs}:/outputs:ro
     environment:
-      - TOPOLOGY_DATA_DIR=/app/topologies
+      - TOPOLOGY_DATA_DIR=/app/topologies/topologies
+      - TOPOLOGY_PLUGIN_URL=http://scl-plugin-network-topology-control-plane:9002
+      - SCL_NETWORK_NAME=playground-net
+      - AGENT_MANAGER_CONTAINER_NAME=scl-agent-manager-dashboard
+      - OPENCODE_PORT=4096
+      - OPENCODE_IMAGE_CODER56=${OPENCODE_IMAGE_CODER56:-ghcr.io/stratocyber/opencode-coder56:latest}
+      - OPENCODE_IMAGE_DB_ADMIN=${OPENCODE_IMAGE_DB_ADMIN:-ghcr.io/stratocyber/opencode-db-admin:latest}
       - AGENT_STATE_DIR=/app/state
       - DASHBOARD_PORT=8080
       - OUTPUTS_DIR=/outputs
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     networks:
-      - scl-playground-net
+      - playground-net
     restart: unless-stopped
 
 volumes:
   agent_state:
+  scl-plugin-network-topology-data:
+    external: true
 
 networks:
-  scl-playground-net:
+  playground-net:
     external: true

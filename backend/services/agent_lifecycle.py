@@ -39,6 +39,7 @@ from .topology_client import (
     find_host,
     regenerate_compose,
     get_service_name,
+    list_topology_ids,
 )
 
 from .docker_client import (
@@ -63,6 +64,11 @@ logger = logging.getLogger(__name__)
 AGENT_OPENCODE_IMAGES: Dict[AgentType, str] = {
     AgentType.CODER56: os.getenv("OPENCODE_IMAGE_CODER56", "ghcr.io/stratocyber/opencode-coder56:latest"),
     AgentType.DB_ADMIN: os.getenv("OPENCODE_IMAGE_DB_ADMIN", "ghcr.io/stratocyber/opencode-db-admin:latest"),
+    # soc_god reuses the existing OpenCode image family (no new image). The actual host
+    # image for a soc_god host is chosen by the network-topology plugin based on
+    # host_has_agents; this entry exists so /health lists soc_god as supported and the
+    # assignment metadata resolves an image.
+    AgentType.SOC_GOD: os.getenv("OPENCODE_IMAGE_SOC_GOD", "ghcr.io/stratocyber/opencode-coder56:latest"),
 }
 
 # Import agent system prompts from dedicated prompts module
@@ -334,34 +340,9 @@ async def assign_agent(
             if not opencode_ready:
                 logger.warning(f"OpenCode not ready after {OPENCODE_READY_TIMEOUT}s")
 
-            # Step 7: Update agent state
-            logger.info("Step 7: Updating agent state")
-
-            # Get container details for state
-            container_dict = await docker.docker.containers.get(new_container_id)
-            container_info = await container_dict.show()
-
-            # Create state assignment
-            state_assignment = AgentStateAssignment(
-                id=str(uuid.uuid4()),
-                container_id=new_container_id,
-                container_name=container_info.get('Name', '').lstrip('/'),
-                topology_id=request.topology_id,
-                network_id=request.network_id,
-                host_id=request.host_id,
-                host_name=host.get('name', request.host_id),
-                agent_type=request.agent_type,
-                state=AgentAssignmentState.READY if opencode_ready else AgentAssignmentState.ASSIGNED,
-                assigned_by=request.assigned_by or "user",
-                opencode_image=AGENT_OPENCODE_IMAGES.get(request.agent_type, ""),
-                original_image=host.get('image', ''),
-                recreated_at=datetime.utcnow()
-            )
-
-            # Load, update, and save state
-            agent_state = load_agent_state(state_path)
-            agent_state = update_agent_assignment(agent_state, state_assignment)
-            save_agent_state(agent_state, state_path)
+            # Agent assignment is persisted in topology.json (Step 3 save_topology);
+            # assignments are derived from topology.json as the single source of truth,
+            # so there is no separate registry to update.
 
             logger.info(f"Agent assignment completed: {job_id}")
 
@@ -451,13 +432,13 @@ async def remove_agent(
 
         host['agents'] = [a for a in current_agents if a != agent_type.value]
 
-        # Step 3: Save topology
+        # Step 3: Save topology (via plugin API)
         logger.info("Step 3: Saving updated topology")
-        save_topology(request.topology_id, topology, topology_path)
+        save_topology(topology_id, topology, topology_path)
 
         # Step 4: Regenerate compose
         logger.info("Step 4: Regenerating docker-compose")
-        compose_result = regenerate_compose(request.topology_id)
+        compose_result = regenerate_compose(topology_id)
 
         if not compose_result.get('success'):
             return AgentAssignmentResponse(
@@ -473,7 +454,7 @@ async def remove_agent(
 
         # Step 5: Recreate container
         logger.info("Step 5: Recreating container without agent")
-        service_name = get_service_name(host_id, topology_path)
+        service_name = get_service_name(topology_id, host_id, topology_path)
 
         if not service_name:
             return AgentAssignmentResponse(
@@ -509,18 +490,8 @@ async def remove_agent(
                     estimated_completion_seconds=0
                 )
 
-            # Step 6: Update agent state
-            logger.info("Step 6: Updating agent state")
-
-            # Load, update, and save state
-            agent_state = load_agent_state(state_path)
-            agent_state = remove_agent_assignment(
-                agent_state,
-                topology_id,
-                host_id,
-                agent_type
-            )
-            save_agent_state(agent_state, state_path)
+            # Agent removal is persisted in topology.json (Step 3 save_topology);
+            # assignments are derived from topology.json, so no registry to update.
 
             logger.info(f"Agent removal completed: {job_id}")
 
@@ -618,120 +589,125 @@ async def remove_agents_batch(
 # Agent State Queries
 # =============================================================================
 
-import glob
-import os
+def _agent_type_of(agent: Any) -> Optional[AgentType]:
+    """An `agents` entry may be a str ('coder56') or a dict ({name:'coder56',...})."""
+    name = agent if isinstance(agent, str) else (agent or {}).get('name') or (agent or {}).get('id')
+    if not name:
+        return None
+    try:
+        return AgentType(name)
+    except ValueError:
+        return None
+
+
+def _iter_topology_hosts(topology_id: Optional[str] = None):
+    """Yield (tid, network_id, host_dict) for every host across the plugin's
+    topologies. Single source of truth: topology.json via the plugin HTTP API."""
+    try:
+        tids = list_topology_ids()
+    except Exception as e:
+        logger.warning(f"Failed to list topologies from plugin: {e}")
+        return
+    for tid in tids:
+        if topology_id and tid != topology_id:
+            continue
+        try:
+            top = load_topology(tid)
+        except Exception as e:
+            logger.warning(f"Failed to load topology {tid}: {e}")
+            continue
+        for host in top.get("hosts", []) or []:
+            yield (tid, "default", host)
+        for network in top.get("networks", []) or []:
+            nid = network.get("id", "unknown")
+            for host in network.get("hosts", []) or []:
+                yield (tid, nid, host)
+
+
+def _derive_assignments(
+    topology_id: Optional[str] = None,
+    host_id: Optional[str] = None
+) -> List[AgentStateAssignment]:
+    """Derive agent assignments from topology.json (via the plugin API).
+
+    There is no persisted assignment registry — `host.agents` in topology.json is
+    the single source of truth. Container state is left as ASSIGNED here; the
+    async variant enriches it with live container status.
+    """
+    assignments: List[AgentStateAssignment] = []
+    for tid, nid, host in _iter_topology_hosts(topology_id):
+        h_id = host.get("id")
+        if host_id and h_id != host_id:
+            continue
+        expected_container_name = f"scl-topology-{tid}-{nid}-{h_id}"
+        for agent in host.get("agents", []) or []:
+            a_type = _agent_type_of(agent)
+            if not a_type:
+                continue
+            assignments.append(AgentStateAssignment(
+                id=f"{tid}-{nid}-{h_id}-{a_type.value}",
+                container_id=expected_container_name,
+                container_name=expected_container_name,
+                topology_id=tid,
+                network_id=nid,
+                host_id=h_id,
+                host_name=host.get("name", h_id),
+                agent_type=a_type,
+                state=AgentAssignmentState.ASSIGNED,
+                assigned_by="user",
+                opencode_image=AGENT_OPENCODE_IMAGES.get(a_type, ""),
+                original_image=host.get("image", ""),
+                recreated_at=datetime.utcnow()
+            ))
+    return assignments
+
 
 async def get_agent_assignments_async(
     topology_id: Optional[str] = None,
     host_id: Optional[str] = None,
     state_path: Optional[str] = None
 ) -> List[AgentStateAssignment]:
-    """Get current agent assignments dynamically from topology files."""
-    from .topology_client import TOPOLOGY_DATA_DIR
-    assignments = []
-    
-    search_path = os.path.join(TOPOLOGY_DATA_DIR, topology_id, "topology.json") if topology_id else os.path.join(TOPOLOGY_DATA_DIR, "*", "topology.json")
-    topology_files = glob.glob(search_path)
-    
-    hosts_with_agents = []
-    for t_file in topology_files:
-        try:
-            import json
-            with open(t_file, "r") as f:
-                top = json.load(f)
-                tid = top.get("id", os.path.basename(os.path.dirname(t_file)))
-                
-                for host in top.get("hosts", []):
-                    if host.get("agents"):
-                        hosts_with_agents.append((tid, "default", host))
-                        
-                for network in top.get("networks", []):
-                    nid = network.get("id", "unknown")
-                    for host in network.get("hosts", []):
-                        if host.get("agents"):
-                            hosts_with_agents.append((tid, nid, host))
-        except Exception:
-            continue
-            
+    """Get current agent assignments derived from topology.json (single source),
+    enriched with live container state where the container is running."""
+    assignments = _derive_assignments(topology_id, host_id)
+
     async with create_docker_client() as docker:
-        for tid, nid, host in hosts_with_agents:
-            h_id = host.get("id")
-            if host_id and h_id != host_id:
-                continue
-
-            # Use the actual container naming convention from network-topology plugin
-            # Format: scl-topology-{topology_id}-{network_id}-{host_id}
-            expected_container_name = f"scl-topology-{tid}-{nid}-{h_id}"
-
-            c_id = expected_container_name  # fallback
-            c_name = expected_container_name
-            state = AgentAssignmentState.ASSIGNED
-
+        for a in assignments:
             try:
-                # Try to find the actual container
-                container = await docker.docker.containers.get(expected_container_name)
-                c_id = container.id
+                container = await docker.docker.containers.get(a.container_name)
                 info = await container.show()
-                c_name = info.get("Name", "").lstrip("/")
-                state = AgentAssignmentState.READY
+                a.container_id = container.id
+                a.container_name = info.get("Name", "").lstrip("/")
+                a.state = AgentAssignmentState.READY
             except Exception:
                 pass
-                
-            for agent in host.get("agents", []):
-                try:
-                    a_type = AgentType(agent)
-                except ValueError:
-                    continue
-                    
-                assignments.append(AgentStateAssignment(
-                    id=f"{tid}-{nid}-{h_id}-{a_type.value}",
-                    container_id=c_id,
-                    container_name=c_name,
-                    topology_id=tid,
-                    network_id=nid,
-                    host_id=h_id,
-                    host_name=host.get("name", h_id),
-                    agent_type=a_type,
-                    state=state,
-                    assigned_by="user",
-                    opencode_image="",
-                    original_image=host.get("image", ""),
-                    recreated_at=datetime.utcnow()
-                ))
-                
+
     return assignments
+
 
 def get_agent_assignments(
     topology_id: Optional[str] = None,
     host_id: Optional[str] = None,
     state_path: Optional[str] = None
 ) -> List[AgentStateAssignment]:
-    # Kept for synchronous backward compatibility
-    state = load_agent_state(state_path)
-    assignments = state.assignments
-    if topology_id:
-        assignments = [a for a in assignments if a.topology_id == topology_id]
-    if host_id:
-        assignments = [a for a in assignments if a.host_id == host_id]
-    return assignments
+    """Synchronous variant: derived from topology.json (no persisted registry)."""
+    return _derive_assignments(topology_id, host_id)
 
 
 def get_agent_state(
     assignment_id: str,
     state_path: Optional[str] = None
 ) -> Optional[AgentStateAssignment]:
-    """Get a specific agent assignment state.
+    """Get a specific agent assignment (derived from topology.json).
 
     Args:
         assignment_id: Assignment ID to look up.
-        state_path: Optional path to agent_state.json.
+        state_path: Ignored (kept for backward-compatible signature).
 
     Returns:
         AgentStateAssignment if found, None otherwise.
     """
-    state = load_agent_state(state_path)
-
-    for assignment in state.assignments:
+    for assignment in _derive_assignments():
         if assignment.id == assignment_id:
             return assignment
 
@@ -825,15 +801,13 @@ def get_agent_count(state_path: Optional[str] = None) -> Dict[str, int]:
     """Get count of agents by type.
 
     Args:
-        state_path: Optional path to agent_state.json.
+        state_path: Ignored (kept for backward-compatible signature).
 
     Returns:
         Dict mapping agent type strings to counts.
     """
-    state = load_agent_state(state_path)
-
-    counts = {}
-    for assignment in state.assignments:
+    counts: Dict[str, int] = {}
+    for assignment in _derive_assignments():
         agent_str = assignment.agent_type.value
         counts[agent_str] = counts.get(agent_str, 0) + 1
 

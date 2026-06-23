@@ -81,7 +81,7 @@ router = APIRouter(
 # =============================================================================
 
 # Agent template definitions (could be loaded from config/database)
-# Only keeping Coder56 and DB_ADMIN (benign) as requested
+# Coder56 (red-team), DB_ADMIN (benign), and SOC_GOD (autonomous blue-team defender)
 AGENT_TEMPLATES: Dict[AgentType, AgentTemplate] = {
     AgentType.CODER56: AgentTemplate(
         agent_type=AgentType.CODER56,
@@ -105,6 +105,18 @@ AGENT_TEMPLATES: Dict[AgentType, AgentTemplate] = {
             {"name": "Query Operations", "description": "Execute SELECT, INSERT, UPDATE, DELETE operations"},
             {"name": "Web Research", "description": "Research database best practices before operations"},
             {"name": "Human Simulation", "description": "Exhibits natural human behavior including work breaks"},
+        ],
+        opencode_image_required=True,
+        supported_base_images=["ubuntu:24.04", "ubuntu:22.04", "debian:12"],
+    ),
+    AgentType.SOC_GOD: AgentTemplate(
+        agent_type=AgentType.SOC_GOD,
+        name="SOC God (Autonomous Defender)",
+        description="Autonomous blue-team defender. Analyzes IDS alerts and executes immediate remediation (firewall containment, process kills) plus creative deception/counter-attack, while preserving its own SSH/HTTPS/OpenCode connectivity.",
+        capabilities=[
+            {"name": "Threat Detection & Analysis", "description": "Ingest IDS alerts, classify threats and assess risk"},
+            {"name": "Threat Containment", "description": "Apply firewall drops and process kills against attacker sources"},
+            {"name": "Deception & Counter-attack", "description": "Deploy honeypots and active counter-measures after containment"},
         ],
         opencode_image_required=True,
         supported_base_images=["ubuntu:24.04", "ubuntu:22.04", "debian:12"],
@@ -438,7 +450,8 @@ async def get_agent_state_endpoint(
         Current AgentState
     """
     try:
-        return load_agent_state(state_path)
+        # Derived from topology.json (single source of truth) — no persisted registry.
+        return AgentState(assignments=get_agent_assignments())
     except Exception as e:
         logger.error(f"Failed to load agent state: {e}")
         raise HTTPException(

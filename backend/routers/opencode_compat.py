@@ -30,6 +30,7 @@ DEFAULT_RUN_ID = os.getenv("RUN_ID", "test-run")
 AGENT_FILE_PATHS: Dict[str, str] = {
     "coder56": "coder56/opencode_api_messages.json",
     "db_admin": "benign_agent/opencode_api_messages.json",
+    "soc_god": "soc_god/opencode_api_messages.json",
 }
 
 

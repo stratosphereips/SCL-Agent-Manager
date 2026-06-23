@@ -9,16 +9,13 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - agent_state:/app/state
-      # Mount topology data directory - use environment variable or default relative path
-      - scl-plugin-network-topology-data:/app/topologies:ro
       # Mount backend for development (optional, remove in production)
       - ./backend:/app/backend
       # Mount outputs directory for Trident compatibility (optional)
       - ${OUTPUTS_DIR:-/tmp/outputs}:/outputs:ro
     environment:
-      - TOPOLOGY_DATA_DIR=/app/topologies/topologies
-      - TOPOLOGY_PLUGIN_URL=http://scl-plugin-network-topology-control-plane:9002
-      - SCL_NETWORK_NAME=playground-net
+      - TOPOLOGY_PLUGIN_URL=http://scl-network-topology:9002
+      - SCL_NETWORK_NAME=scl-playground-net
       - AGENT_MANAGER_CONTAINER_NAME=scl-agent-manager-dashboard
       - OPENCODE_PORT=4096
       - OPENCODE_IMAGE_CODER56=${OPENCODE_IMAGE_CODER56:-ghcr.io/stratocyber/opencode-coder56:latest}
@@ -27,15 +24,18 @@ services:
       - DASHBOARD_PORT=8080
       - OUTPUTS_DIR=/outputs
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # LLM config for the defender planner (and reused by soc_god via the topology)
+      - LLM_URL=${LLM_URL:-https://llm.ai.e-infra.cz/v1}
+      - OPENCODE_API_KEY=${OPENCODE_API_KEY}
+      - DEFENDER_LLM_API_KEY=${OPENCODE_API_KEY}
+      - PLANNER_MODEL=${PLANNER_MODEL:-gpt-oss-120b}
     networks:
-      - playground-net
+      - scl-playground-net
     restart: unless-stopped
 
 volumes:
   agent_state:
-  scl-plugin-network-topology-data:
-    external: true
 
 networks:
-  playground-net:
+  scl-playground-net:
     external: true

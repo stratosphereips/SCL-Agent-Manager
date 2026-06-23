@@ -27,7 +27,7 @@ from ..models import (
     SessionMetrics,
     SessionPromptRequest
 )
-from ..services.docker_client import create_docker_client, get_container_details, ContainerNotFoundError
+from ..services.container_addr import get_container_address, ContainerAddressError
 from ..services.opencode_client import create_session_async, send_prompt_async, get_session_messages_async, _ensure_network_connectivity
 from ..services.state_manager import get_state_manager
 
@@ -44,17 +44,14 @@ class PromptResponse(BaseModel):
     timestamp: datetime
 
 async def _get_container_address(container_id: str) -> str:
-    """Helper to get the resolvable address of a container."""
+    """Helper to get the resolvable address of a container (shared with the defender)."""
     try:
-        async with create_docker_client() as docker:
-            details = await get_container_details(docker, container_id)
-            # Prefer container name — stable DNS hostname on Docker networks.
-            # Fall back to IP only if name is unavailable.
-            return details.name or details.ip_address
-    except ContainerNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Container {container_id} not found")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get container address: {str(e)}")
+        return await get_container_address(container_id)
+    except ContainerAddressError as e:
+        msg = str(e)
+        if "not found" in msg:
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=500, detail=msg)
 
 def _transform_opencode_message(opencode_msg: Dict[str, Any]) -> SessionMessage:
     """Transform OpenCode message format to SessionMessage format.

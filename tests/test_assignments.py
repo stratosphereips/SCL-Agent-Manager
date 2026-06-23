@@ -5,7 +5,7 @@ from pathlib import Path
 
 # Add backend dir to python path (use relative path for portability)
 script_dir = Path(__file__).parent
-sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parent))
 
 from backend.services.agent_lifecycle import get_agent_assignments_async
 

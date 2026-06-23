@@ -255,12 +255,14 @@ class ReconciliationService:
 
         desired_state = {}
         for assignment in assignments:
-            desired_state[assignment.host_id] = {
-                "agents": assignment.current_agents,
+            # Assignments are one-per (host, agent); aggregate agent types per host.
+            slot = desired_state.setdefault(assignment.host_id, {
+                "agents": [],
                 "opencode_image": assignment.opencode_image,
                 "original_image": assignment.original_image,
                 "container_name": assignment.container_name,
-            }
+            })
+            slot["agents"].append(assignment.agent_type.value)
 
         return desired_state
 
@@ -475,29 +477,47 @@ class ReconciliationService:
         host_id: str,
         agent_types: List[AgentType]
     ) -> None:
-        """
-        Remove extra agents from container state.
+        """Remove extra agents from a host by editing topology.json (the single
+        source of truth) via the plugin API. There is no persisted assignment
+        registry to edit.
 
         Args:
             topology_id: Topology identifier
             host_id: Host identifier
             agent_types: Agent types to remove
         """
-        # Load and update agent state
-        agent_state = load_agent_state()
+        from ..services.topology_client import load_topology, save_topology
 
-        # Find and remove the extra agents for this host
-        updated_assignments = []
-        for assignment in agent_state.assignments:
-            if assignment.topology_id == topology_id and assignment.host_id == host_id:
-                # Filter out the extra agents
-                if assignment.agent_type not in agent_types:
-                    updated_assignments.append(assignment)
-            else:
-                updated_assignments.append(assignment)
+        remove = {a.value for a in agent_types}
+        try:
+            topology = load_topology(topology_id)
+        except Exception as e:
+            logger.error(f"Failed to load topology {topology_id} for agent removal: {e}")
+            return
 
-        agent_state.assignments = updated_assignments
-        save_agent_state(agent_state)
+        modified = False
+        hosts = list(topology.get("hosts", []) or [])
+        for key in ("networks", "subnets"):
+            for network in topology.get(key, []) or []:
+                hosts += list(network.get("hosts", []) or [])
+        for host in hosts:
+            if host.get("id") != host_id:
+                continue
+            before = list(host.get("agents", []) or [])
+            after = []
+            for a in before:
+                name = a if isinstance(a, str) else (a or {}).get("name") or (a or {}).get("id")
+                if name not in remove:
+                    after.append(a)
+            if len(after) != len(before):
+                host["agents"] = after
+                modified = True
+
+        if modified:
+            try:
+                save_topology(topology_id, topology)
+            except Exception as e:
+                logger.error(f"Failed to save topology {topology_id} after agent removal: {e}")
 
     def _add_to_history(self, result: ReconciliationResult) -> None:
         """

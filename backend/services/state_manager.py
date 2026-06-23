@@ -20,9 +20,6 @@ DEFAULT_STATE_PATH = os.getenv(
     "/app/state/agent_state.json"
 )
 
-# Ensure the data directory exists
-os.makedirs(os.path.dirname(DEFAULT_STATE_PATH), exist_ok=True)
-
 
 class StateManager:
     """Manages agent state persistence and operations."""
@@ -35,6 +32,9 @@ class StateManager:
             state_path: Path to the agent state JSON file
         """
         self.state_path = Path(state_path)
+        # Ensure the data directory exists (deferred from module level to avoid
+        # PermissionError during import when running tests outside Docker).
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_state_file()
 
     def _ensure_state_file(self):

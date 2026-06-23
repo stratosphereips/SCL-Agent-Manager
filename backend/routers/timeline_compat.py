@@ -34,6 +34,9 @@ _TIMELINE_PATHS: Dict[str, List[str]] = {
     "db_admin": [
         "benign_agent/db_admin_timeline.jsonl",
     ],
+    "soc_god": [
+        "soc_god/soc_god_timeline.jsonl",
+    ],
 }
 
 

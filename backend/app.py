@@ -54,6 +54,9 @@ from .services import (
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 RECONCILE_INTERVAL_SECONDS = int(os.getenv("RECONCILE_INTERVAL_SECONDS", "300"))  # 5 minutes
 IMAGE_BUILD_INTERVAL_SECONDS = int(os.getenv("IMAGE_BUILD_INTERVAL_SECONDS", "3600"))  # 1 hour
+# The defender auto_responder is a no-op when no topology has the defender enabled,
+# but can be disabled entirely with DEFENDER_AUTORESPONDER_ENABLED=false.
+DEFENDER_AUTORESPONDER_ENABLED = os.getenv("DEFENDER_AUTORESPONDER_ENABLED", "true").lower() in ("1", "true", "yes")
 
 
 # =============================================================================
@@ -122,6 +125,8 @@ class BackgroundTaskManager:
     def __init__(self):
         self.reconcile_task: Optional[asyncio.Task] = None
         self.image_build_task: Optional[asyncio.Task] = None
+        self.defender_task: Optional[asyncio.Task] = None
+        self._auto_responder = None
         self.running = False
 
     async def start(self):
@@ -143,6 +148,17 @@ class BackgroundTaskManager:
             self._periodic_image_build()
         )
 
+        # Start the defender auto_responder (soc_god driver). It broadcasts
+        # defender events over the existing WebSocket event stream.
+        if DEFENDER_AUTORESPONDER_ENABLED:
+            try:
+                from .services.defender.auto_responder import AutoResponder
+                self._auto_responder = AutoResponder(broadcast=connection_manager.broadcast)
+                self.defender_task = asyncio.create_task(self._auto_responder.run())
+                logger.info("Defender auto_responder started")
+            except Exception as e:
+                logger.error(f"Failed to start defender auto_responder: {e}", exc_info=True)
+
     async def stop(self):
         """Stop all background tasks."""
         if not self.running:
@@ -156,11 +172,16 @@ class BackgroundTaskManager:
             self.reconcile_task.cancel()
         if self.image_build_task:
             self.image_build_task.cancel()
+        if self._auto_responder:
+            self._auto_responder.stop()
+        if self.defender_task:
+            self.defender_task.cancel()
 
         # Wait for cancellation
         await asyncio.gather(
             self.reconcile_task if self.reconcile_task else asyncio.sleep(0),
             self.image_build_task if self.image_build_task else asyncio.sleep(0),
+            self.defender_task if self.defender_task else asyncio.sleep(0),
             return_exceptions=True
         )
 
@@ -332,6 +353,11 @@ app.include_router(topologies.router)
 app.include_router(opencode_compat.router)
 # Add Timeline compatibility router for Trident-style agent timeline data
 app.include_router(timeline_compat.router)
+
+# Defender (soc_god) routers: alert ingest, enable/status, planner
+from .services.defender import defender_router, planner_router
+app.include_router(defender_router.router)
+app.include_router(planner_router.router)
 
 
 # =============================================================================

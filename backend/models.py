@@ -20,6 +20,7 @@ class AgentType(str, Enum):
     """Supported agent types available for assignment."""
     CODER56 = "coder56"
     DB_ADMIN = "db_admin"
+    SOC_GOD = "soc_god"
 
 
 class HostType(str, Enum):

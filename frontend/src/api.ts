@@ -59,6 +59,13 @@ import type {
   Topology,
   Network,
   Host,
+
+  // Defender Types
+  DefenderStatus,
+  DefenderAlert,
+  DefendedHost,
+  PlannerHealth,
+  PlannerPlanResponse,
 } from './types';
 
 // =============================================================================
@@ -466,6 +473,77 @@ export async function getSessionLogs(
 }
 
 // =============================================================================
+// Defender (soc_god) APIs
+// =============================================================================
+
+/** Defender status: counters, buffered alerts, per-topology policy. */
+export async function getDefenderStatus(): Promise<DefenderStatus> {
+  const response = await apiClient.get<DefenderStatus>('/api/defender/status');
+  return response.data;
+}
+
+/** Enable/disable the defender for a topology and set its defended hosts. */
+export async function enableDefender(
+  topologyId: string,
+  hostIds: string[],
+  enabled: boolean
+): Promise<{ status: string; topology_id: string; defended: any }> {
+  const response = await apiClient.post('/api/defender/enable', {
+    topology_id: topologyId,
+    host_ids: hostIds,
+    enabled,
+  });
+  return response.data;
+}
+
+/** Ingest a raw SLIPS alert into the defender work-queue. */
+export async function ingestDefenderAlert(
+  alert: Record<string, any>,
+  topologyId?: string
+): Promise<{ status: string; run_id: string; buffered_alerts: number }> {
+  const response = await apiClient.post('/api/defender/alerts', alert, {
+    params: topologyId ? { topology_id: topologyId } : {},
+  });
+  return response.data;
+}
+
+/** Recent buffered alerts (for the dashboard feed). */
+export async function getRecentAlerts(
+  limit = 50
+): Promise<{ alerts: DefenderAlert[]; buffered: number }> {
+  const response = await apiClient.get('/api/defender/alerts/recent', { params: { limit } });
+  return response.data;
+}
+
+/** Defended hosts for a topology with their live IPs. */
+export async function getDefendedHosts(
+  topologyId: string
+): Promise<{ topology_id: string; hosts: DefendedHost[] }> {
+  const response = await apiClient.get(`/api/defender/defended-hosts/${topologyId}`);
+  return response.data;
+}
+
+/** Planner config/health snapshot. */
+export async function getPlannerHealth(): Promise<PlannerHealth> {
+  const response = await apiClient.get<PlannerHealth>('/api/defender/planner/healthz');
+  return response.data;
+}
+
+/** Generate a 5-field incident-response plan for an alert + target host. */
+export async function planDefender(
+  alert: string,
+  targetHost?: string,
+  topologyId?: string
+): Promise<PlannerPlanResponse> {
+  const response = await apiClient.post<PlannerPlanResponse>('/api/defender/planner/plan', {
+    alert,
+    target_host: targetHost,
+    topology_id: topologyId,
+  });
+  return response.data;
+}
+
+// =============================================================================
 // WebSocket Connection Manager
 // =============================================================================
 
@@ -787,6 +865,11 @@ export type {
   Topology,
   Network,
   Host,
+  DefenderStatus,
+  DefenderAlert,
+  DefendedHost,
+  PlannerHealth,
+  PlannerPlanResponse,
 };
 
 // =============================================================================
@@ -845,6 +928,15 @@ export default {
   isNetworkError,
   isTimeoutError,
   buildQueryString,
+
+  // Defender
+  getDefenderStatus,
+  enableDefender,
+  ingestDefenderAlert,
+  getRecentAlerts,
+  getDefendedHosts,
+  getPlannerHealth,
+  planDefender,
 
   // HTTP Client
   httpClient: apiClient,

@@ -6,6 +6,7 @@ import { AgentsPage } from './pages/AgentsPage';
 import { TopologyPage } from './pages/TopologyPage';
 import { HostDiscoveryPage } from './pages/HostDiscoveryPage';
 import { SettingsPage } from './pages/SettingsPage';
+import { DefenderPage } from './pages/DefenderPage';
 import './index.css';
 
 function App() {
@@ -17,6 +18,7 @@ function App() {
           <Route path="/agents" element={<AgentsPage />} />
           <Route path="/topology" element={<TopologyPage />} />
           <Route path="/discovery" element={<HostDiscoveryPage />} />
+          <Route path="/defender" element={<DefenderPage />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Route>
       </Routes>

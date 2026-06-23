@@ -121,11 +121,13 @@ const AgentTypeBadge: React.FC<{ agentType: AgentType; isRemovable?: boolean }> 
   const colors: Record<AgentType, string> = {
     [AgentType.CODER56]: 'bg-blue-100 text-blue-800 border-blue-200',
     [AgentType.DB_ADMIN]: 'bg-green-100 text-green-800 border-green-200',
+    [AgentType.SOC_GOD]: 'bg-red-100 text-red-800 border-red-200',
   };
 
   const labels: Record<AgentType, string> = {
     [AgentType.CODER56]: 'Coder',
     [AgentType.DB_ADMIN]: 'DB Admin',
+    [AgentType.SOC_GOD]: 'Defender',
   };
 
   return (

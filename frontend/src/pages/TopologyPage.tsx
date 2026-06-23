@@ -1,16 +1,32 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import {
   ChevronDown, ChevronRight, Server, Network as NetworkIcon,
   Plus, X, Save, Play, Square, CheckCircle, AlertCircle, Loader2
 } from 'lucide-react';
 import api from '@/api';
-import type { Topology, Network, Host } from '@/types';
+import type { Topology, Network, Host, AgentTemplate } from '@/types';
 
 // ─── Agent catalogue ────────────────────────────────────────────────────────
-const AGENT_TYPES: Record<string, { label: string; color: string; bg: string }> = {
-  coder56:  { label: 'Coder 5.6',  color: 'text-violet-700', bg: 'bg-violet-100' },
-  db_admin: { label: 'DB Admin',   color: 'text-blue-700',   bg: 'bg-blue-100'   },
+// Presentation only (label + colour). The *set* of available agents is fetched
+// from the backend (GET /api/agents/templates) so the dropdown always reflects
+// what actually exists, instead of a hardcoded list that drifts out of sync.
+type TemplateMap = Record<string, AgentTemplate>;
+
+const AGENT_STYLE: Record<string, { label?: string; color: string; bg: string }> = {
+  coder56:  { label: 'Coder 5.6', color: 'text-violet-700', bg: 'bg-violet-100' },
+  db_admin: { label: 'DB Admin',  color: 'text-blue-700',   bg: 'bg-blue-100'   },
+  soc_god:  { label: 'SOC God',   color: 'text-red-700',    bg: 'bg-red-100'    },
 };
+
+function metaFor(type: string, templates: TemplateMap) {
+  const style = AGENT_STYLE[type];
+  return {
+    label: style?.label ?? templates[type]?.name ?? type,
+    color: style?.color ?? 'text-gray-700',
+    bg: style?.bg ?? 'bg-gray-100',
+  };
+}
 
 // ─── List summary type (what /api/topologies returns) ───────────────────────
 interface TopologySummary {
@@ -23,8 +39,8 @@ interface TopologySummary {
 }
 
 // ─── Agent chip ─────────────────────────────────────────────────────────────
-function AgentChip({ agent, onRemove }: { agent: string; onRemove?: () => void }) {
-  const meta = AGENT_TYPES[agent] ?? { label: agent, color: 'text-gray-700', bg: 'bg-gray-100' };
+function AgentChip({ agent, templates, onRemove }: { agent: string; templates: TemplateMap; onRemove?: () => void }) {
+  const meta = metaFor(agent, templates);
   return (
     <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold ${meta.bg} ${meta.color}`}>
       {meta.label}
@@ -38,37 +54,88 @@ function AgentChip({ agent, onRemove }: { agent: string; onRemove?: () => void }
 }
 
 // ─── Add-agent dropdown ──────────────────────────────────────────────────────
-function AddAgentButton({ currentAgents, onAdd }: { currentAgents: string[]; onAdd: (a: string) => void }) {
+// Rendered through a portal (document.body) with position: fixed so it escapes
+// the overflow-hidden network card and the overflow-auto scroll containers that
+// otherwise clip an absolutely-positioned menu (the old "only first agent
+// visible / can't scroll" bug).
+function AddAgentButton({ currentAgents, agentTypes, templates, onAdd }: {
+  currentAgents: string[];
+  agentTypes: string[];
+  templates: TemplateMap;
+  onAdd: (a: string) => void;
+}) {
   const [open, setOpen] = useState(false);
-  const available = Object.keys(AGENT_TYPES).filter(a => !currentAgents.includes(a));
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const available = agentTypes.filter(a => !currentAgents.includes(a));
+
+  const toggle = () => {
+    if (open) { setOpen(false); return; }
+    if (available.length === 0) return;
+    const r = btnRef.current?.getBoundingClientRect();
+    if (!r) return;
+    const menuH = Math.min(available.length * 30 + 8, 240);
+    let top = r.bottom + 4;
+    if (top + menuH > window.innerHeight - 8) top = Math.max(8, r.top - menuH - 4); // flip up if needed
+    const left = Math.min(r.left, window.innerWidth - 184);
+    setPos({ top, left });
+    setOpen(true);
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (menuRef.current?.contains(t) || btnRef.current?.contains(t)) return;
+      setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    const close = () => setOpen(false);
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('resize', close);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('resize', close);
+    };
+  }, [open]);
+
   if (available.length === 0) return null;
+
   return (
     <div className="relative">
       <button
-        onClick={() => setOpen(v => !v)}
+        ref={btnRef}
+        onClick={toggle}
         className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold
                    border border-dashed border-gray-400 text-gray-500 hover:border-blue-500 hover:text-blue-600 transition-colors"
       >
         <Plus size={11} /> Add agent
       </button>
-      {open && (
-        <>
-          <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
-          <div className="absolute left-0 top-6 z-20 w-44 bg-white dark:bg-gray-800 rounded-lg shadow-xl border border-gray-200 dark:border-gray-700 py-1">
-            {available.map(a => {
-              const meta = AGENT_TYPES[a];
-              return (
-                <button
-                  key={a}
-                  onClick={() => { onAdd(a); setOpen(false); }}
-                  className={`w-full text-left px-3 py-1.5 text-xs font-semibold hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors ${meta.color}`}
-                >
-                  {meta.label}
-                </button>
-              );
-            })}
-          </div>
-        </>
+      {open && pos && createPortal(
+        <div
+          ref={menuRef}
+          style={{ position: 'fixed', top: pos.top, left: pos.left }}
+          className="z-50 max-h-60 w-44 overflow-y-auto bg-white dark:bg-gray-800 rounded-lg shadow-xl border border-gray-200 dark:border-gray-700 py-1"
+        >
+          {available.map(a => {
+            const m = metaFor(a, templates);
+            return (
+              <button
+                key={a}
+                onClick={() => { onAdd(a); setOpen(false); }}
+                className={`w-full text-left px-3 py-1.5 text-xs font-semibold hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors ${m.color}`}
+              >
+                {m.label}
+              </button>
+            );
+          })}
+        </div>,
+        document.body
       )}
     </div>
   );
@@ -76,9 +143,11 @@ function AddAgentButton({ currentAgents, onAdd }: { currentAgents: string[]; onA
 
 // ─── Host row ────────────────────────────────────────────────────────────────
 function HostRow({
-  host, onAgentAdd, onAgentRemove,
+  host, agentTypes, templates, onAgentAdd, onAgentRemove,
 }: {
   host: Host;
+  agentTypes: string[];
+  templates: TemplateMap;
   onAgentAdd: (agentType: string) => void;
   onAgentRemove: (agentType: string) => void;
 }) {
@@ -92,9 +161,9 @@ function HostRow({
       </span>
       <div className="flex flex-wrap items-center gap-1.5 ml-auto">
         {agents.map(a => (
-          <AgentChip key={a} agent={a} onRemove={() => onAgentRemove(a)} />
+          <AgentChip key={a} agent={a} templates={templates} onRemove={() => onAgentRemove(a)} />
         ))}
-        <AddAgentButton currentAgents={agents} onAdd={onAgentAdd} />
+        <AddAgentButton currentAgents={agents} agentTypes={agentTypes} templates={templates} onAdd={onAgentAdd} />
       </div>
     </div>
   );
@@ -115,6 +184,10 @@ export function TopologyPage() {
   const [stopping, setStopping] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [toast, setToast] = useState<{ msg: string; ok: boolean } | null>(null);
+  // Available agents — authoritative list from /api/agents/templates (falls back
+  // to the AGENT_STYLE keys below until the fetch resolves or if it fails).
+  const [agentTypes, setAgentTypes] = useState<string[]>(Object.keys(AGENT_STYLE));
+  const [templates, setTemplates] = useState<TemplateMap>({});
 
   const showToast = (msg: string, ok = true) => {
     setToast({ msg, ok });
@@ -130,6 +203,19 @@ export function TopologyPage() {
   }, []);
 
   useEffect(() => { loadList(); }, [loadList]);
+
+  // Load the authoritative list of available agents from the backend.
+  const loadAgentTemplates = useCallback(() => {
+    api.getAgentTemplates()
+      .then((data) => {
+        const t = ((data as any).agents ?? {}) as TemplateMap;
+        setTemplates(t);
+        const keys = Object.keys(t);
+        if (keys.length) setAgentTypes(keys);
+      })
+      .catch(() => { /* keep AGENT_STYLE defaults */ });
+  }, []);
+  useEffect(() => { loadAgentTemplates(); }, [loadAgentTemplates]);
 
   // Load detail
   const selectTopology = async (id: string) => {
@@ -377,6 +463,8 @@ export function TopologyPage() {
                           <HostRow
                             key={host.id}
                             host={host}
+                            agentTypes={agentTypes}
+                            templates={templates}
                             onAgentAdd={a => addAgent(network.id, host.id, a)}
                             onAgentRemove={a => removeAgent(network.id, host.id, a)}
                           />
@@ -390,11 +478,14 @@ export function TopologyPage() {
               {/* Legend */}
               <div className="flex-shrink-0 flex flex-wrap gap-2 pt-1">
                 <p className="text-xs text-gray-400 w-full">Available agents:</p>
-                {Object.entries(AGENT_TYPES).map(([k, v]) => (
-                  <span key={k} className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold ${v.bg} ${v.color}`}>
-                    {v.label}
-                  </span>
-                ))}
+                {agentTypes.map(k => {
+                  const m = metaFor(k, templates);
+                  return (
+                    <span key={k} className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold ${m.bg} ${m.color}`}>
+                      {m.label}
+                    </span>
+                  );
+                })}
               </div>
             </>
           ) : null}

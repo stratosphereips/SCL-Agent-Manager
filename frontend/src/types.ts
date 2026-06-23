@@ -16,6 +16,67 @@
 export enum AgentType {
   CODER56 = "coder56",
   DB_ADMIN = "db_admin",
+  SOC_GOD = "soc_god",
+}
+
+// =============================================================================
+// Defender (soc_god)
+// =============================================================================
+
+export interface DefenderCounters {
+  alerts_received: number;
+  alerts_dropped_nondefended: number;
+  alerts_dropped_duplicate: number;
+  plans_generated: number;
+  soc_god_sessions_created: number;
+  soc_god_sessions_failed: number;
+  [k: string]: number;
+}
+
+export interface DefenderPolicyEntry {
+  enabled: boolean;
+  host_ids: string[];
+}
+
+export interface DefenderStatus {
+  counters: DefenderCounters;
+  buffered_alerts: number;
+  policy: Record<string, DefenderPolicyEntry>;
+  run_id: string;
+}
+
+export interface DefenderAlert {
+  [k: string]: any;
+  received_at?: number;
+  run_id?: string;
+  topology_id?: string;
+}
+
+export interface DefendedHost {
+  host_id: string;
+  name: string;
+  ip: string;
+}
+
+export interface PlannerHealth {
+  status: string;
+  model: string;
+  llm_url: string;
+  llm_configured: boolean;
+  temperature: number;
+  max_tokens: number;
+}
+
+export interface DefenderPlan {
+  target_host: string;
+  plan: string;
+}
+
+export interface PlannerPlanResponse {
+  plans: DefenderPlan[];
+  model: string;
+  request_id: string;
+  created: string;
 }
 
 /**

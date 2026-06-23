@@ -7,6 +7,7 @@ import {
   LayoutDashboard,
   Network,
   Search,
+  Shield,
 } from 'lucide-react';
 import { ContainerStatusBar } from './ContainerStatusBar';
 import { ReplayProvider, useReplayContext } from '@/contexts/ReplayContext';
@@ -17,6 +18,7 @@ const navItems = [
   { to: '/agents', icon: Bot, label: 'Agent Execution' },
   { to: '/topology', icon: Network, label: 'Topologies' },
   { to: '/discovery', icon: Search, label: 'Host Discovery' },
+  { to: '/defender', icon: Shield, label: 'Defender' },
   { to: '/settings', icon: Settings, label: 'Settings' },
 ];
 

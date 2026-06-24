@@ -341,7 +341,7 @@ app.add_middleware(
 # Include Routers
 # =============================================================================
 
-from .routers import agents, containers, sessions, reconciliation, topologies, opencode_compat, timeline_compat
+from .routers import agents, containers, sessions, reconciliation, topologies, opencode_compat, timeline_compat, settings
 
 # Routers already have prefixes defined, include without additional prefixes
 app.include_router(agents.router)
@@ -353,6 +353,8 @@ app.include_router(topologies.router)
 app.include_router(opencode_compat.router)
 # Add Timeline compatibility router for Trident-style agent timeline data
 app.include_router(timeline_compat.router)
+# Add Settings router for LLM credentials management
+app.include_router(settings.router)
 
 # Defender (soc_god) routers: alert ingest, enable/status, planner
 from .services.defender import defender_router, planner_router

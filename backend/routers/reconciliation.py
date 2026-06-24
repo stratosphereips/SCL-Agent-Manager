@@ -300,6 +300,7 @@ class ReconciliationService:
 
         except Exception as e:
             logger.error(f"Failed to get actual state: {e}")
+            raise
 
         return actual_state
 

@@ -1,10 +1,10 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import type {
   SessionsMap,
-  SessionMessage,
+  TridentSessionMessage,
   OpenCodeStatePayload,
   ReplayEvent,
-} from '@/types/index';
+} from '@/types';
 import { api } from '@/api-trident';
 import { useReplayContext } from '@/contexts/ReplayContext';
 
@@ -32,7 +32,7 @@ const HOST_SOURCE_PATTERNS: Record<string, string[]> = {
 /** Convert replay events to OpenCode-like format */
 function replayEventsToOpenCodeState(events: ReplayEvent[], host: string | undefined, positionMs: number, startTimeMs: number): {
   sessions: SessionsMap;
-  messagesBySession: Record<string, SessionMessage[]>;
+  messagesBySession: Record<string, TridentSessionMessage[]>;
   sessionSources: Record<string, string>;
 } {
   const sessions: SessionsMap = {};
@@ -103,9 +103,9 @@ function replayEventsToOpenCodeState(events: ReplayEvent[], host: string | undef
     }
   }
 
-  const messagesBySession: Record<string, SessionMessage[]> = {};
+  const messagesBySession: Record<string, TridentSessionMessage[]> = {};
   for (const [sid, msgMap] of Object.entries(bySession)) {
-    const msgs: SessionMessage[] = Array.from(msgMap.values())
+    const msgs: TridentSessionMessage[] = Array.from(msgMap.values())
       .sort((a, b) => a.ts - b.ts)
       .map(({ parts }) => ({
         info: { role: 'assistant' as const, sessionID: sid },
@@ -124,7 +124,7 @@ function replayEventsToOpenCodeState(events: ReplayEvent[], host: string | undef
 export function useOpenCodeStream(_host?: string, timelineEntries?: Array<{ level: string; data?: any }>) {
   const { replay } = useReplayContext();
   const [sessions, setSessions] = useState<SessionsMap>({});
-  const [messagesBySession, setMessagesBySession] = useState<Record<string, SessionMessage[]>>({});
+  const [messagesBySession, setMessagesBySession] = useState<Record<string, TridentSessionMessage[]>>({});
   const [sessionSources, setSessionSources] = useState<Record<string, string>>({});
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
@@ -171,7 +171,7 @@ export function useOpenCodeStream(_host?: string, timelineEntries?: Array<{ leve
         const normalised = normaliseSessions((state?.sessions ?? {}) as Record<string, unknown>);
         setSessions(normalised);
 
-        const bySession = (state?.messages_by_session ?? {}) as Record<string, SessionMessage[]>;
+        const bySession = (state?.messages_by_session ?? {}) as Record<string, TridentSessionMessage[]>;
         setMessagesBySession(bySession);
         setSessionSources((state?.session_sources ?? {}) as Record<string, string>);
       } catch {
@@ -243,7 +243,7 @@ export function useOpenCodeStream(_host?: string, timelineEntries?: Array<{ leve
 export function reconstructTimelineMessages(
   entries: Array<{ level: string; data?: any }>,
   sessionFilter?: string,
-): Record<string, SessionMessage[]> {
+): Record<string, TridentSessionMessage[]> {
   const bySession: Record<string, Map<string, { ts: number; parts: any[] }>> = {};
 
   for (const e of entries) {
@@ -267,9 +267,9 @@ export function reconstructTimelineMessages(
     msgMap.get(mid)!.parts.push(part);
   }
 
-  const result: Record<string, SessionMessage[]> = {};
+  const result: Record<string, TridentSessionMessage[]> = {};
   for (const [sid, msgMap] of Object.entries(bySession)) {
-    const msgs: SessionMessage[] = Array.from(msgMap.values())
+    const msgs: TridentSessionMessage[] = Array.from(msgMap.values())
       .sort((a, b) => a.ts - b.ts)
       .map(({ parts }) => ({
         info: { role: 'assistant' as const, sessionID: sid },

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import type { TimelineEntry, ReplayEvent } from '@/types/index';
+import type { TimelineEntry, ReplayEvent } from '@/types';
 import { api } from '@/api-trident';
 import { useReplayContext } from '@/contexts/ReplayContext';
 

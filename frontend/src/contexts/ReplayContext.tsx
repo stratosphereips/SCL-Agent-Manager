@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useCallback, useRef, useEffect } from 'react';
-import type { ReplayState, ReplayMetadata } from '@/types/index';
+import type { ReplayState, ReplayMetadata } from '@/types';
 
 interface ReplayControls {
   loadReplay: (path?: string, runId?: string) => Promise<void>;

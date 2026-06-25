@@ -1,24 +1,24 @@
 /** @type {import('tailwindcss').Config} */
 export default {
   content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
-  darkMode: 'class',
+  darkMode: ['class'],
   theme: {
     extend: {
       colors: {
         trident: {
-          // Light mode colors - MAXIMUM contrast
-          bg: '#f1f5f9',
-          surface: '#ffffff',
-          border: '#cbd5e1',
-          'border-hover': '#94a3b8',
-          accent: '#1d4ed8',
-          'accent-hover': '#1e40af',
-          success: '#166534',
-          warning: '#92400e',
-          danger: '#991b1b',
-          muted: '#1e293b',
-          text: '#020617',
-          'text-secondary': '#1e293b',
+          bg: 'rgb(var(--color-trident-bg) / <alpha-value>)',
+          surface: 'rgb(var(--color-trident-surface) / <alpha-value>)',
+          border: 'rgb(var(--color-trident-border) / <alpha-value>)',
+          'border-hover': 'rgb(var(--color-trident-border-hover) / <alpha-value>)',
+          accent: 'rgb(var(--color-trident-accent) / <alpha-value>)',
+          'accent-hover': 'rgb(var(--color-trident-accent-hover) / <alpha-value>)',
+          success: 'rgb(var(--color-trident-success) / <alpha-value>)',
+          warning: 'rgb(var(--color-trident-warning) / <alpha-value>)',
+          danger: 'rgb(var(--color-trident-danger) / <alpha-value>)',
+          muted: 'rgb(var(--color-trident-muted) / <alpha-value>)',
+          text: 'rgb(var(--color-trident-text) / <alpha-value>)',
+          'text-secondary': 'rgb(var(--color-trident-text) / <alpha-value>)',
+          'border-subtle': 'rgb(var(--color-trident-border-subtle) / <alpha-value>)',
         },
       },
       fontFamily: {
@@ -28,10 +28,5 @@ export default {
       },
     },
   },
-  plugins: [
-    // Plugin to add dark mode color overrides
-    function({ addVariant }) {
-      addVariant('dark', '.dark &');
-    },
-  ],
+  plugins: [],
 };

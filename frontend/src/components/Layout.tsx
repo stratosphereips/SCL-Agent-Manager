@@ -100,7 +100,7 @@ function LayoutContent() {
       </aside>
 
       {/* Main content */}
-      <main className="flex-1 flex flex-col overflow-hidden bg-trident-bg">
+      <main className="flex-1 flex flex-col overflow-hidden bg-trident-bg text-trident-text">
         <div className="flex-1 overflow-auto p-6">
           <Outlet />
         </div>

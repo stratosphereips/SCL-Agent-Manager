@@ -161,7 +161,7 @@ export function SettingsPage() {
   if (!schema) {
     return (
       <div className="flex h-full items-center justify-center">
-        <div className="text-red-400">Failed to load settings schema.</div>
+          <div className="text-red-400 dark:text-red-300">Failed to load settings schema.</div>
       </div>
     );
   }
@@ -242,7 +242,7 @@ export function SettingsPage() {
                 <div key={v.key}>
                   <label className="block text-sm font-medium text-trident-text mb-1">
                     {v.label}
-                    {v.required && <span className="text-red-400 ml-1">*</span>}
+                    {v.required && <span className="text-red-400 dark:text-red-300 ml-1">*</span>}
                   </label>
 
                   {v.type === 'select' ? (

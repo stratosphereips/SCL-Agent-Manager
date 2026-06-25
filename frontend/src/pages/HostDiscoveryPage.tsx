@@ -66,14 +66,14 @@ interface ContainerWithStatus extends ContainerInfo {
 
 const ContainerStateBadge: React.FC<{ state: ContainerState }> = ({ state }) => {
   const colors: Record<ContainerState, string> = {
-    [ContainerState.RUNNING]: 'bg-green-100 text-green-800 border-green-200',
-    [ContainerState.STOPPED]: 'bg-gray-100 text-gray-800 border-gray-200',
-    [ContainerState.PAUSED]: 'bg-yellow-100 text-yellow-800 border-yellow-200',
-    [ContainerState.RESTARTING]: 'bg-blue-100 text-blue-800 border-blue-200',
-    [ContainerState.EXITED]: 'bg-red-100 text-red-800 border-red-200',
-    [ContainerState.DEAD]: 'bg-red-100 text-red-800 border-red-200',
-    [ContainerState.REMOVING]: 'bg-orange-100 text-orange-800 border-orange-200',
-    [ContainerState.RECREATING]: 'bg-purple-100 text-purple-800 border-purple-200',
+    [ContainerState.RUNNING]: 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900/30 dark:text-green-300 dark:border-green-700',
+    [ContainerState.STOPPED]: 'bg-gray-100 text-gray-800 border-gray-200 dark:bg-gray-700 dark:text-gray-300 dark:border-gray-600',
+    [ContainerState.PAUSED]: 'bg-yellow-100 text-yellow-800 border-yellow-200 dark:bg-yellow-900/30 dark:text-yellow-300 dark:border-yellow-700',
+    [ContainerState.RESTARTING]: 'bg-blue-100 text-blue-800 border-blue-200 dark:bg-blue-900/30 dark:text-blue-300 dark:border-blue-700',
+    [ContainerState.EXITED]: 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900/30 dark:text-red-300 dark:border-red-700',
+    [ContainerState.DEAD]: 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900/30 dark:text-red-300 dark:border-red-700',
+    [ContainerState.REMOVING]: 'bg-orange-100 text-orange-800 border-orange-200 dark:bg-orange-900/30 dark:text-orange-300 dark:border-orange-700',
+    [ContainerState.RECREATING]: 'bg-purple-100 text-purple-800 border-purple-200 dark:bg-purple-900/30 dark:text-purple-300 dark:border-purple-700',
   };
 
   return (
@@ -91,8 +91,8 @@ const OpenCodeHealthIndicator: React.FC<{
   if (!opencodeReady) {
     return (
       <div className="flex items-center space-x-2">
-        <div className="w-2 h-2 rounded-full bg-gray-400" />
-        <span className="text-xs text-gray-500">Not Ready</span>
+        <div className="w-2 h-2 rounded-full bg-gray-400 dark:bg-gray-500" />
+        <span className="text-xs text-gray-500 dark:text-gray-400">Not Ready</span>
       </div>
     );
   }
@@ -101,13 +101,13 @@ const OpenCodeHealthIndicator: React.FC<{
     healthy: 'bg-green-500',
     degraded: 'bg-yellow-500',
     unhealthy: 'bg-red-500',
-    unknown: 'bg-gray-400',
+    unknown: 'bg-gray-400 dark:bg-gray-500',
   };
 
   return (
     <div className="flex items-center space-x-2">
       <div className={`w-2 h-2 rounded-full ${healthColors[health]} animate-pulse`} />
-      <span className="text-xs text-gray-600">
+      <span className="text-xs text-gray-600 dark:text-gray-400">
         {port ? `Port ${port}` : 'Ready'}
       </span>
     </div>
@@ -119,9 +119,9 @@ const AgentTypeBadge: React.FC<{ agentType: AgentType; isRemovable?: boolean }> 
   isRemovable = true
 }) => {
   const colors: Record<AgentType, string> = {
-    [AgentType.CODER56]: 'bg-blue-100 text-blue-800 border-blue-200',
-    [AgentType.DB_ADMIN]: 'bg-green-100 text-green-800 border-green-200',
-    [AgentType.SOC_GOD]: 'bg-red-100 text-red-800 border-red-200',
+    [AgentType.CODER56]: 'bg-blue-100 text-blue-800 border-blue-200 dark:bg-blue-900/30 dark:text-blue-300 dark:border-blue-700',
+    [AgentType.DB_ADMIN]: 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900/30 dark:text-green-300 dark:border-green-700',
+    [AgentType.SOC_GOD]: 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900/30 dark:text-red-300 dark:border-red-700',
   };
 
   const labels: Record<AgentType, string> = {
@@ -139,14 +139,14 @@ const AgentTypeBadge: React.FC<{ agentType: AgentType; isRemovable?: boolean }> 
 
 const HostTypeBadge: React.FC<{ hostType: HostType }> = ({ hostType }) => {
   const colors: Record<HostType, string> = {
-    [HostType.WEB_SERVER]: 'bg-blue-50 text-blue-700 border-blue-200',
-    [HostType.DATABASE_SERVER]: 'bg-green-50 text-green-700 border-green-200',
-    [HostType.WORKSTATION]: 'bg-purple-50 text-purple-700 border-purple-200',
-    [HostType.FIREWALL]: 'bg-red-50 text-red-700 border-red-200',
-    [HostType.ROUTER]: 'bg-orange-50 text-orange-700 border-orange-200',
-    [HostType.SERVER]: 'bg-gray-50 text-gray-700 border-gray-200',
-    [HostType.DOMAIN_ADMIN]: 'bg-indigo-50 text-indigo-700 border-indigo-200',
-    [HostType.NORMAL_USER]: 'bg-yellow-50 text-yellow-700 border-yellow-200',
+    [HostType.WEB_SERVER]: 'bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-900/20 dark:text-blue-300 dark:border-blue-700',
+    [HostType.DATABASE_SERVER]: 'bg-green-50 text-green-700 border-green-200 dark:bg-green-900/20 dark:text-green-300 dark:border-green-700',
+    [HostType.WORKSTATION]: 'bg-purple-50 text-purple-700 border-purple-200 dark:bg-purple-900/20 dark:text-purple-300 dark:border-purple-700',
+    [HostType.FIREWALL]: 'bg-red-50 text-red-700 border-red-200 dark:bg-red-900/20 dark:text-red-300 dark:border-red-700',
+    [HostType.ROUTER]: 'bg-orange-50 text-orange-700 border-orange-200 dark:bg-orange-900/20 dark:text-orange-300 dark:border-orange-700',
+    [HostType.SERVER]: 'bg-gray-50 text-gray-700 border-gray-200 dark:bg-gray-700 dark:text-gray-300 dark:border-gray-600',
+    [HostType.DOMAIN_ADMIN]: 'bg-indigo-50 text-indigo-700 border-indigo-200 dark:bg-indigo-900/20 dark:text-indigo-300 dark:border-indigo-700',
+    [HostType.NORMAL_USER]: 'bg-yellow-50 text-yellow-700 border-yellow-200 dark:bg-yellow-900/20 dark:text-yellow-300 dark:border-yellow-700',
   };
 
   const labels: Record<HostType, string> = {
@@ -185,13 +185,13 @@ const AssignmentDialog: React.FC<{
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
-      <div className="bg-white rounded-lg shadow-xl max-w-2xl w-full max-h-[80vh] overflow-y-auto">
+      <div className="bg-white dark:bg-gray-800 dark:border dark:border-gray-700 rounded-lg shadow-xl max-w-2xl w-full max-h-[80vh] overflow-y-auto">
         <div className="p-6">
           <div className="flex items-center justify-between mb-4">
-            <h3 className="text-xl font-semibold">Assign Agent to Host</h3>
+            <h3 className="text-xl font-semibold dark:text-white">Assign Agent to Host</h3>
             <button
               onClick={onClose}
-              className="text-gray-400 hover:text-gray-600 text-2xl"
+              className="text-gray-400 dark:text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 text-2xl"
               disabled={state.isAssigning}
             >
               ×
@@ -199,30 +199,30 @@ const AssignmentDialog: React.FC<{
           </div>
 
           {state.selectedContainer && (
-            <div className="mb-6 p-4 bg-gray-50 rounded-lg">
-              <h4 className="font-medium mb-2">Target Container</h4>
+            <div className="mb-6 p-4 bg-gray-50 dark:bg-gray-700/50 rounded-lg">
+              <h4 className="font-medium mb-2 dark:text-gray-200">Target Container</h4>
               <div className="grid grid-cols-2 gap-2 text-sm">
                 <div>
-                  <span className="text-gray-500">Host:</span>
-                  <span className="ml-2 font-medium">{state.selectedContainer.host_name}</span>
+                  <span className="text-gray-500 dark:text-gray-400">Host:</span>
+                  <span className="ml-2 font-medium dark:text-gray-200 break-all">{state.selectedContainer.host_name}</span>
                 </div>
                 <div>
-                  <span className="text-gray-500">Type:</span>
+                  <span className="text-gray-500 dark:text-gray-400">Type:</span>
                   <span className="ml-2"><HostTypeBadge hostType={state.selectedContainer.host_type} /></span>
                 </div>
                 <div>
-                  <span className="text-gray-500">Image:</span>
-                  <span className="ml-2 font-mono text-xs">{state.selectedContainer.image}</span>
+                  <span className="text-gray-500 dark:text-gray-400">Image:</span>
+                  <span className="ml-2 font-mono text-xs dark:text-gray-300 break-all">{state.selectedContainer.image}</span>
                 </div>
                 <div>
-                  <span className="text-gray-500">State:</span>
+                  <span className="text-gray-500 dark:text-gray-400">State:</span>
                   <span className="ml-2"><ContainerStateBadge state={state.selectedContainer.state} /></span>
                 </div>
               </div>
 
               {state.selectedContainer.current_agents.length > 0 && (
                 <div className="mt-3">
-                  <span className="text-gray-500 text-sm">Current Agents:</span>
+                  <span className="text-gray-500 dark:text-gray-400 text-sm">Current Agents:</span>
                   <div className="flex flex-wrap gap-2 mt-1">
                     {state.selectedContainer.current_agents.map(agent => (
                       <AgentTypeBadge key={agent} agentType={agent} />
@@ -234,7 +234,7 @@ const AssignmentDialog: React.FC<{
           )}
 
           <div className="mb-6">
-            <h4 className="font-medium mb-3">Select Agent Type</h4>
+            <h4 className="font-medium mb-3 dark:text-gray-200">Select Agent Type</h4>
             <div className="grid grid-cols-1 gap-3">
               {agentTemplates.map((template) => (
                 <button
@@ -243,8 +243,8 @@ const AssignmentDialog: React.FC<{
                   disabled={state.isAssigning || !template.opencode_image_required}
                   className={`p-4 rounded-lg border-2 text-left transition-all ${
                     state.selectedAgentType === template.agent_type
-                      ? 'border-blue-500 bg-blue-50'
-                      : 'border-gray-200 hover:border-gray-300'
+                      ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/30 dark:border-blue-400'
+                      : 'border-gray-200 dark:border-gray-600 hover:border-gray-300 dark:hover:border-gray-500'
                   } ${
                     !template.opencode_image_required
                       ? 'opacity-50 cursor-not-allowed'
@@ -253,23 +253,23 @@ const AssignmentDialog: React.FC<{
                 >
                   <div className="flex items-start justify-between">
                     <div>
-                      <div className="font-medium text-gray-900">{template.name}</div>
-                      <div className="text-sm text-gray-500 mt-1">{template.description}</div>
+                      <div className="font-medium text-gray-900 dark:text-white">{template.name}</div>
+                      <div className="text-sm text-gray-500 dark:text-gray-400 mt-1 line-clamp-2" title={template.description}>{template.description}</div>
                       <div className="flex flex-wrap gap-1 mt-2">
                         {template.capabilities.slice(0, 3).map((cap, idx) => (
-                          <span key={idx} className="text-xs bg-gray-100 px-2 py-1 rounded">
+                          <span key={idx} className="text-xs bg-gray-100 dark:bg-gray-700 px-2 py-1 rounded dark:text-gray-300">
                             {cap.name}
                           </span>
                         ))}
                         {template.capabilities.length > 3 && (
-                          <span className="text-xs text-gray-400">
+                          <span className="text-xs text-gray-400 dark:text-gray-500">
                             +{template.capabilities.length - 3} more
                           </span>
                         )}
                       </div>
                     </div>
                     {state.selectedAgentType === template.agent_type && (
-                      <div className="text-blue-500 text-xl">✓</div>
+                      <div className="text-blue-500 dark:text-blue-400 text-xl">✓</div>
                     )}
                   </div>
                 </button>
@@ -278,9 +278,9 @@ const AssignmentDialog: React.FC<{
           </div>
 
           {selectedTemplate && state.selectedAgentType && (
-            <div className="mb-6 p-4 bg-blue-50 rounded-lg">
-              <h4 className="font-medium text-blue-900 mb-2">Selected Agent Details</h4>
-              <div className="text-sm text-blue-800 space-y-1">
+            <div className="mb-6 p-4 bg-blue-50 dark:bg-blue-900/30 rounded-lg">
+              <h4 className="font-medium text-blue-900 dark:text-blue-200 mb-2">Selected Agent Details</h4>
+              <div className="text-sm text-blue-800 dark:text-blue-300 space-y-1">
                 <p><strong>Type:</strong> {selectedTemplate.name}</p>
                 <p><strong>Base Image:</strong> {selectedTemplate.supported_base_images.join(', ')}</p>
                 <p><strong>Capabilities:</strong></p>
@@ -294,15 +294,15 @@ const AssignmentDialog: React.FC<{
           )}
 
           {state.error && (
-            <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+            <div className="mb-4 p-3 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-700 rounded-lg text-red-700 dark:text-red-300 text-sm">
               {state.error}
             </div>
           )}
 
           {state.jobId && (
-            <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg text-blue-700 text-sm">
+            <div className="mb-4 p-3 bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-700 rounded-lg text-blue-700 dark:text-blue-300 text-sm">
               <div className="flex items-center space-x-2">
-                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600" />
+                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600 dark:border-blue-400" />
                 <span>Assignment in progress... Job ID: {state.jobId}</span>
               </div>
             </div>
@@ -312,7 +312,7 @@ const AssignmentDialog: React.FC<{
             <button
               onClick={onClose}
               disabled={state.isAssigning}
-              className="px-4 py-2 text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200 disabled:opacity-50"
+              className="px-4 py-2 text-gray-700 dark:text-gray-200 bg-gray-100 dark:bg-gray-700 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 disabled:opacity-50"
             >
               Cancel
             </button>
@@ -337,43 +337,43 @@ const ContainerRow: React.FC<{
   const [expanded, setExpanded] = useState(false);
 
   return (
-    <div className="border border-gray-200 rounded-lg mb-3 overflow-hidden">
+    <div className="border border-gray-200 dark:border-gray-600 rounded-lg mb-3 overflow-hidden">
       <div
-        className="p-4 cursor-pointer hover:bg-gray-50 transition-colors"
+        className="p-4 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors"
         onClick={() => setExpanded(!expanded)}
       >
         <div className="flex items-center justify-between">
           <div className="flex-1 grid grid-cols-12 gap-4 items-center">
             {/* Expand Button */}
             <div className="col-span-1">
-              <button className="text-gray-400 hover:text-gray-600">
+              <button className="text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300">
                 {expanded ? '▼' : '▶'}
               </button>
             </div>
 
             {/* Container Name */}
-            <div className="col-span-2">
-              <div className="font-medium text-gray-900">{container.container_name}</div>
-              <div className="text-xs text-gray-500 truncate">{container.container_id.slice(0, 12)}</div>
+            <div className="col-span-2 min-w-0">
+              <div className="font-medium text-gray-900 dark:text-white truncate" title={container.container_name}>{container.container_name}</div>
+              <div className="text-xs text-gray-500 dark:text-gray-400 truncate" title={container.container_id}>{container.container_id.slice(0, 12)}</div>
             </div>
 
             {/* Host Info */}
             <div className="col-span-2">
-              <div className="text-sm font-medium">{container.host_name}</div>
+              <div className="text-sm font-medium dark:text-gray-200 truncate" title={container.host_name}>{container.host_name || '—'}</div>
               <div className="mt-1"><HostTypeBadge hostType={container.host_type} /></div>
             </div>
 
             {/* Network/Topology */}
             <div className="col-span-2">
-              <div className="text-xs text-gray-500">Topology</div>
-              <div className="text-sm font-mono">{container.topology_id.slice(0, 8)}...</div>
-              <div className="text-xs text-gray-500 mt-1">Network</div>
-              <div className="text-sm font-mono">{container.network_id.slice(0, 8)}...</div>
+              <div className="text-xs text-gray-500 dark:text-gray-400">Topology</div>
+              <div className="text-sm font-mono dark:text-gray-300">{container.topology_id.slice(0, 8)}...</div>
+              <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">Network</div>
+              <div className="text-sm font-mono dark:text-gray-300">{container.network_id.slice(0, 8)}...</div>
             </div>
 
             {/* IP Address */}
             <div className="col-span-1">
-              <div className="text-sm font-mono">{container.ip_address || 'N/A'}</div>
+              <div className="text-sm font-mono dark:text-gray-300">{container.ip_address || 'N/A'}</div>
             </div>
 
             {/* State */}
@@ -398,11 +398,11 @@ const ContainerRow: React.FC<{
                     <AgentTypeBadge key={agent} agentType={agent} />
                   ))
                 ) : (
-                  <span className="text-xs text-gray-400">None</span>
+                  <span className="text-xs text-gray-400 dark:text-gray-500">None</span>
                 )}
               </div>
               {container.activeSessions !== undefined && container.activeSessions > 0 && (
-                <div className="text-xs text-green-600 mt-1">
+                <div className="text-xs text-green-600 dark:text-green-400 mt-1">
                   {container.activeSessions} active session{container.activeSessions > 1 ? 's' : ''}
                 </div>
               )}
@@ -427,25 +427,25 @@ const ContainerRow: React.FC<{
       </div>
 
       {expanded && (
-        <div className="p-4 bg-gray-50 border-t border-gray-200">
+        <div className="p-4 bg-gray-50 dark:bg-gray-700/30 border-t border-gray-200 dark:border-gray-600">
           <div className="grid grid-cols-2 gap-4 text-sm">
             <div>
-              <span className="font-medium text-gray-700">Image:</span>
-              <span className="ml-2 font-mono text-gray-600">{container.image}</span>
+              <span className="font-medium text-gray-700 dark:text-gray-300">Image:</span>
+              <span className="ml-2 font-mono text-gray-600 dark:text-gray-400 break-all">{container.image}</span>
             </div>
             <div>
-              <span className="font-medium text-gray-700">Container ID:</span>
-              <span className="ml-2 font-mono text-gray-600">{container.container_id}</span>
+              <span className="font-medium text-gray-700 dark:text-gray-300">Container ID:</span>
+              <span className="ml-2 font-mono text-gray-600 dark:text-gray-400 break-all">{container.container_id}</span>
             </div>
             <div>
-              <span className="font-medium text-gray-700">Host ID:</span>
-              <span className="ml-2 font-mono text-gray-600">{container.host_id}</span>
+              <span className="font-medium text-gray-700 dark:text-gray-300">Host ID:</span>
+              <span className="ml-2 font-mono text-gray-600 dark:text-gray-400 break-all">{container.host_id}</span>
             </div>
             <div>
-              <span className="font-medium text-gray-700">Labels:</span>
+              <span className="font-medium text-gray-700 dark:text-gray-300">Labels:</span>
               <div className="ml-2 mt-1">
                 {Object.entries(container.labels).map(([key, value]) => (
-                  <span key={key} className="inline-block bg-gray-200 px-2 py-0.5 rounded text-xs mr-1 mb-1">
+                  <span key={key} className="inline-block bg-gray-200 dark:bg-gray-600 px-2 py-0.5 rounded text-xs mr-1 mb-1 dark:text-gray-300 break-all">
                     {key}={value}
                   </span>
                 ))}
@@ -466,7 +466,7 @@ const FiltersPanel: React.FC<{
   containerCount: number;
 }> = ({ filters, onFilterChange, onRefresh, isLoading, containerCount }) => {
   return (
-    <div className="bg-white rounded-lg shadow-sm p-4 mb-4">
+    <div className="bg-white dark:bg-gray-800 dark:border dark:border-gray-700 rounded-lg shadow-sm p-4 mb-4">
       <div className="flex flex-wrap items-center gap-4">
         {/* Search Query */}
         <div className="flex-1 min-w-[200px]">
@@ -475,7 +475,7 @@ const FiltersPanel: React.FC<{
             placeholder="Search containers or hosts..."
             value={filters.searchQuery}
             onChange={(e) => onFilterChange({ searchQuery: e.target.value })}
-            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 dark:bg-gray-700 dark:text-white dark:placeholder-gray-400"
           />
         </div>
 
@@ -486,7 +486,7 @@ const FiltersPanel: React.FC<{
             placeholder="Topology ID"
             value={filters.topologyId}
             onChange={(e) => onFilterChange({ topologyId: e.target.value })}
-            className="w-40 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            className="w-40 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 dark:bg-gray-700 dark:text-white dark:placeholder-gray-400"
           />
         </div>
 
@@ -497,7 +497,7 @@ const FiltersPanel: React.FC<{
             placeholder="Network ID"
             value={filters.networkId}
             onChange={(e) => onFilterChange({ networkId: e.target.value })}
-            className="w-40 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            className="w-40 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 dark:bg-gray-700 dark:text-white dark:placeholder-gray-400"
           />
         </div>
 
@@ -506,7 +506,7 @@ const FiltersPanel: React.FC<{
           <select
             value={filters.hostType}
             onChange={(e) => onFilterChange({ hostType: e.target.value as HostType | 'all' })}
-            className="px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 dark:bg-gray-700 dark:text-white"
           >
             <option value="all">All Types</option>
             <option value={HostType.WEB_SERVER}>Web Server</option>
@@ -523,7 +523,7 @@ const FiltersPanel: React.FC<{
           <select
             value={filters.state}
             onChange={(e) => onFilterChange({ state: e.target.value as ContainerState | 'all' })}
-            className="px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 dark:bg-gray-700 dark:text-white"
           >
             <option value="all">All States</option>
             <option value={ContainerState.RUNNING}>Running</option>
@@ -538,7 +538,7 @@ const FiltersPanel: React.FC<{
           <select
             value={String(filters.hasAgents)}
             onChange={(e) => onFilterChange({ hasAgents: e.target.value === 'true' ? true : e.target.value === 'false' ? false : 'all' })}
-            className="px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 dark:bg-gray-700 dark:text-white"
           >
             <option value="all">All Containers</option>
             <option value="true">With Agents</option>
@@ -550,14 +550,14 @@ const FiltersPanel: React.FC<{
         <button
           onClick={onRefresh}
           disabled={isLoading}
-          className="px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 disabled:opacity-50 flex items-center space-x-2"
+          className="px-4 py-2 bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-200 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 disabled:opacity-50 flex items-center space-x-2"
         >
           <span>{isLoading ? 'Refreshing...' : 'Refresh'}</span>
           {!isLoading && <span>🔄</span>}
         </button>
 
         {/* Container Count */}
-        <div className="text-sm text-gray-500">
+        <div className="text-sm text-gray-500 dark:text-gray-400">
           {containerCount} container{containerCount !== 1 ? 's' : ''}
         </div>
       </div>
@@ -805,31 +805,31 @@ export const HostDiscoveryPage: React.FC = () => {
     return (
       <div className="flex items-center justify-center h-screen">
         <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
-          <p className="text-gray-600">Loading Host Discovery...</p>
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 dark:border-blue-400 mx-auto mb-4"></div>
+          <p className="text-gray-600 dark:text-gray-400">Loading Host Discovery...</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gray-100 p-6">
+    <div className="min-h-screen bg-gray-100 dark:bg-gray-900 p-6">
       {/* Header */}
       <header className="mb-6">
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-3xl font-bold text-gray-900">Host Discovery</h1>
-            <p className="text-gray-600 mt-1">
+            <h1 className="text-3xl font-bold text-gray-900 dark:text-white">Host Discovery</h1>
+            <p className="text-gray-600 dark:text-gray-400 mt-1">
               Discover containers and assign AI agents
             </p>
           </div>
           {health && (
             <div className="flex items-center space-x-4">
               <div className="text-sm">
-                <span className="text-gray-500">System Health: </span>
+                <span className="text-gray-500 dark:text-gray-400">System Health: </span>
                 <span className={`font-medium ${
-                  health.status === 'healthy' ? 'text-green-600' :
-                  health.status === 'degraded' ? 'text-yellow-600' : 'text-red-600'
+                  health.status === 'healthy' ? 'text-green-600 dark:text-green-400' :
+                  health.status === 'degraded' ? 'text-yellow-600 dark:text-yellow-400' : 'text-red-600 dark:text-red-400'
                 }`}>
                   {health.status}
                 </span>
@@ -849,13 +849,13 @@ export const HostDiscoveryPage: React.FC = () => {
       />
 
       {/* Container List */}
-      <div className="bg-white rounded-lg shadow-sm p-4">
+      <div className="bg-white dark:bg-gray-800 rounded-lg shadow-sm p-4">
         <div className="mb-4">
-          <h2 className="text-xl font-semibold text-gray-900">Discovered Containers</h2>
+          <h2 className="text-xl font-semibold text-gray-900 dark:text-white">Discovered Containers</h2>
         </div>
 
         {/* Table Header */}
-        <div className="hidden md:grid grid-cols-12 gap-4 px-4 py-2 bg-gray-50 rounded-t-lg border-b border-gray-200 text-sm font-medium text-gray-500">
+        <div className="hidden md:grid grid-cols-12 gap-4 px-4 py-2 bg-gray-50 dark:bg-gray-700/50 rounded-t-lg border-b border-gray-200 dark:border-gray-600 text-sm font-medium text-gray-500 dark:text-gray-400">
           <div className="col-span-1"></div>
           <div className="col-span-2">Container</div>
           <div className="col-span-2">Host</div>
@@ -878,7 +878,7 @@ export const HostDiscoveryPage: React.FC = () => {
               />
             ))
           ) : (
-            <div className="text-center py-12 text-gray-500">
+            <div className="text-center py-12 text-gray-500 dark:text-gray-400">
               <p className="text-lg">No containers found</p>
               <p className="text-sm mt-2">Try adjusting your filters or refresh the discovery</p>
             </div>

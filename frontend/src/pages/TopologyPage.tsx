@@ -14,17 +14,17 @@ import type { Topology, Network, Host, AgentTemplate } from '@/types';
 type TemplateMap = Record<string, AgentTemplate>;
 
 const AGENT_STYLE: Record<string, { label?: string; color: string; bg: string }> = {
-  coder56:  { label: 'Coder 5.6', color: 'text-violet-700', bg: 'bg-violet-100' },
-  db_admin: { label: 'DB Admin',  color: 'text-blue-700',   bg: 'bg-blue-100'   },
-  soc_god:  { label: 'SOC God',   color: 'text-red-700',    bg: 'bg-red-100'    },
+  coder56:  { label: 'Coder 5.6', color: 'text-violet-700 dark:text-violet-300', bg: 'bg-violet-100 dark:bg-violet-900/40' },
+  db_admin: { label: 'DB Admin',  color: 'text-blue-700 dark:text-blue-300',   bg: 'bg-blue-100 dark:bg-blue-900/40'   },
+  soc_god:  { label: 'SOC God',   color: 'text-red-700 dark:text-red-300',    bg: 'bg-red-100 dark:bg-red-900/40'    },
 };
 
 function metaFor(type: string, templates: TemplateMap) {
   const style = AGENT_STYLE[type];
   return {
     label: style?.label ?? templates[type]?.name ?? type,
-    color: style?.color ?? 'text-gray-700',
-    bg: style?.bg ?? 'bg-gray-100',
+    color: style?.color ?? 'text-gray-700 dark:text-gray-300',
+    bg: style?.bg ?? 'bg-gray-100 dark:bg-gray-700',
   };
 }
 
@@ -111,8 +111,8 @@ function AddAgentButton({ currentAgents, agentTypes, templates, onAdd }: {
       <button
         ref={btnRef}
         onClick={toggle}
-        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold
-                   border border-dashed border-gray-400 text-gray-500 hover:border-blue-500 hover:text-blue-600 transition-colors"
+          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold
+                     border border-dashed border-gray-400 dark:border-gray-500 text-gray-500 dark:text-gray-400 hover:border-blue-500 dark:hover:border-blue-400 hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
       >
         <Plus size={11} /> Add agent
       </button>
@@ -154,8 +154,8 @@ function HostRow({
   const agents = host.agents ?? [];
   return (
     <div className="flex flex-wrap items-center gap-2 p-2 bg-gray-50 dark:bg-gray-800/60 rounded-lg">
-      <Server size={14} className="text-green-500 flex-shrink-0" />
-      <span className="text-sm font-medium min-w-[100px]">{host.name}</span>
+      <Server size={14} className="text-green-500 dark:text-green-400 flex-shrink-0" />
+      <span className="text-sm font-medium min-w-[100px] max-w-[180px] truncate" title={host.name}>{host.name}</span>
       <span className="text-xs px-2 py-0.5 bg-gray-200 dark:bg-gray-700 rounded-full text-gray-600 dark:text-gray-300">
         {host.type}
       </span>
@@ -334,14 +334,14 @@ export function TopologyPage() {
       <div className="flex items-center justify-between flex-shrink-0">
         <div>
           <h1 className="text-3xl font-bold text-gray-900 dark:text-white">Network Topologies</h1>
-          <p className="text-sm text-gray-500 mt-0.5">Select a topology, assign agents to hosts, then start.</p>
+          <p className="text-sm text-gray-500 dark:text-gray-400 mt-0.5">Select a topology, assign agents to hosts, then start.</p>
         </div>
       </div>
 
       {/* Toast */}
       {toast && (
         <div className={`fixed top-4 right-4 z-50 flex items-center gap-2 px-4 py-2.5 rounded-lg shadow-lg text-sm font-medium
-          ${toast.ok ? 'bg-green-50 text-green-800 border border-green-200' : 'bg-red-50 text-red-800 border border-red-200'}`}
+          ${toast.ok ? 'bg-green-50 dark:bg-green-900/30 text-green-800 dark:text-green-200 border border-green-200 dark:border-green-700' : 'bg-red-50 dark:bg-red-900/30 text-red-800 dark:text-red-200 border border-red-200 dark:border-red-700'}`}
         >
           {toast.ok ? <CheckCircle size={16} /> : <AlertCircle size={16} />}
           {toast.msg}
@@ -352,9 +352,9 @@ export function TopologyPage() {
 
         {/* ── Left: topology list ── */}
         <div className="flex flex-col gap-2 overflow-auto">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-500 flex-shrink-0">Topologies</h2>
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400 flex-shrink-0">Topologies</h2>
           {listLoading ? (
-            <p className="text-sm text-gray-400">Loading…</p>
+            <p className="text-sm text-gray-400 dark:text-gray-500">Loading…</p>
           ) : summaries.map(s => (
             <button
               key={s.id}
@@ -366,13 +366,13 @@ export function TopologyPage() {
               }`}
             >
               <div className="flex items-center justify-between">
-                <h3 className="font-semibold text-sm">{s.name}</h3>
-                <span className={`w-2 h-2 rounded-full flex-shrink-0 ${s.is_running ? 'bg-green-500' : 'bg-gray-300'}`} />
+                <h3 className="font-semibold text-sm truncate" title={s.name}>{s.name}</h3>
+                <span className={`w-2 h-2 rounded-full flex-shrink-0 ${s.is_running ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'}`} />
               </div>
-              <p className="text-xs text-gray-500 mt-0.5">
+              <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
                 {s.network_count} network{s.network_count !== 1 ? 's' : ''} · {s.host_count} host{s.host_count !== 1 ? 's' : ''}
               </p>
-              <p className="text-xs font-medium mt-1 text-gray-400">{s.is_running ? '● running' : '○ stopped'}</p>
+              <p className="text-xs font-medium mt-1 text-gray-400 dark:text-gray-500">{s.is_running ? '● running' : '○ stopped'}</p>
             </button>
           ))}
         </div>
@@ -380,11 +380,11 @@ export function TopologyPage() {
         {/* ── Right: detail + editor ── */}
         <div className="col-span-2 flex flex-col gap-3 overflow-auto">
           {!selectedId ? (
-            <div className="flex items-center justify-center h-full text-gray-400">
+            <div className="flex items-center justify-center h-full text-gray-400 dark:text-gray-500">
               Select a topology to edit agents
             </div>
           ) : detailLoading ? (
-            <div className="flex items-center justify-center h-full gap-2 text-gray-400">
+            <div className="flex items-center justify-center h-full gap-2 text-gray-400 dark:text-gray-500">
               <Loader2 size={18} className="animate-spin" /> Loading…
             </div>
           ) : topology ? (
@@ -392,9 +392,9 @@ export function TopologyPage() {
               {/* Action bar */}
               <div className="flex items-center justify-between flex-shrink-0 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-xl px-4 py-3">
                 <div>
-                  <h2 className="font-bold text-base">{topology.name}</h2>
-                  <p className="text-xs text-gray-500">v{topology.version}
-                    {dirty && <span className="ml-2 text-amber-600 font-semibold">● unsaved changes</span>}
+                  <h2 className="font-bold text-base truncate" title={topology.name}>{topology.name}</h2>
+                  <p className="text-xs text-gray-500 dark:text-gray-400">v{topology.version}
+                    {dirty && <span className="ml-2 text-amber-600 dark:text-amber-400 font-semibold">● unsaved changes</span>}
                   </p>
                 </div>
                 <div className="flex items-center gap-2">
@@ -444,12 +444,12 @@ export function TopologyPage() {
                     >
                       {expandedNetworks.has(network.id) ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
                       <NetworkIcon size={15} className="text-blue-500" />
-                      <span className="font-semibold text-sm">{network.name}</span>
-                      <span className="text-xs text-gray-400">{network.cidr}</span>
+                      <span className="font-semibold text-sm truncate" title={network.name}>{network.name}</span>
+                      <span className="text-xs text-gray-400 dark:text-gray-500">{network.cidr}</span>
                       {network.internet && (
-                        <span className="ml-1 text-xs px-1.5 py-0.5 bg-green-100 text-green-700 rounded-full">internet</span>
+                        <span className="ml-1 text-xs px-1.5 py-0.5 bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300 rounded-full">internet</span>
                       )}
-                      <span className="ml-auto text-xs text-gray-400">
+                      <span className="ml-auto text-xs text-gray-400 dark:text-gray-500">
                         {(network.hosts ?? []).length} host{(network.hosts ?? []).length !== 1 ? 's' : ''}
                       </span>
                     </button>
@@ -458,7 +458,7 @@ export function TopologyPage() {
                     {expandedNetworks.has(network.id) && (
                       <div className="px-4 py-3 space-y-2">
                         {(network.hosts ?? []).length === 0 ? (
-                          <p className="text-xs text-gray-400">No hosts</p>
+                          <p className="text-xs text-gray-400 dark:text-gray-500">No hosts</p>
                         ) : (network.hosts ?? []).map((host: Host) => (
                           <HostRow
                             key={host.id}
@@ -477,7 +477,7 @@ export function TopologyPage() {
 
               {/* Legend */}
               <div className="flex-shrink-0 flex flex-wrap gap-2 pt-1">
-                <p className="text-xs text-gray-400 w-full">Available agents:</p>
+                <p className="text-xs text-gray-400 dark:text-gray-500 w-full">Available agents:</p>
                 {agentTypes.map(k => {
                   const m = metaFor(k, templates);
                   return (

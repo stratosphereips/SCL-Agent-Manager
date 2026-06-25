@@ -44,7 +44,7 @@ export function SessionStream({ messages }: SessionStreamProps) {
 
             {/* Render Content */}
             {msg.content && (
-              <div className="text-sm whitespace-pre-wrap text-trident-text mb-2">
+              <div className="text-sm whitespace-pre-wrap break-words text-trident-text mb-2">
                 {msg.content}
               </div>
             )}

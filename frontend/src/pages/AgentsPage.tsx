@@ -96,30 +96,30 @@ function AgentPanel({ assignment, template }: { assignment: AgentStateAssignment
       <div className="mb-3 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <Radio size={16} className="text-trident-accent" />
-          <h3 className="font-heading text-lg font-bold text-trident-accent">{label} on {assignment.host_name}</h3>
+          <h3 className="font-heading text-lg font-bold text-trident-accent truncate" title={`${label} on ${assignment.host_name}`}>{label} on {assignment.host_name}</h3>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-shrink-0">
           <span className={`badge badge-success`}>
             {assignment.state}
           </span>
         </div>
       </div>
 
-      <p className="mb-3 text-xs text-trident-muted">{desc}</p>
+      <p className="mb-3 text-xs text-trident-muted line-clamp-2" title={desc}>{desc}</p>
       
       {/* Start Goal UI */}
       <div className="mb-4 flex gap-2">
         <input 
           type="text" 
           placeholder="Set a new goal for this agent..." 
-          className="w-full rounded border border-trident-border/50 bg-black/20 p-2 text-sm text-trident-text focus:border-trident-accent focus:outline-none"
+          className="w-full rounded border border-trident-border/50 bg-trident-bg p-2 text-sm text-trident-text focus:border-trident-accent focus:outline-none"
           value={goal}
           onChange={e => setGoal(e.target.value)}
           onKeyDown={e => e.key === 'Enter' && handleStartGoal()}
           disabled={isStarting}
         />
         <button 
-          className="flex items-center gap-1 rounded bg-trident-accent px-4 py-2 text-sm font-bold text-black hover:bg-trident-accent/80 disabled:opacity-50"
+          className="flex items-center gap-1 rounded bg-trident-accent px-4 py-2 text-sm font-bold text-black dark:text-white hover:bg-trident-accent/80 disabled:opacity-50"
           onClick={handleStartGoal}
           disabled={isStarting || !goal.trim()}
         >
@@ -128,7 +128,7 @@ function AgentPanel({ assignment, template }: { assignment: AgentStateAssignment
         </button>
       </div>
 
-      <div className="mb-2 flex gap-1 rounded-lg bg-black/20 p-1">
+      <div className="mb-2 flex gap-1 rounded-lg bg-trident-bg p-1">
         <div className="flex-1 rounded-md px-2 py-1 text-xs font-medium bg-trident-accent/20 text-trident-accent flex items-center justify-center">
           <MessageSquare size={12} className="mr-1" />
           Messages ({messages.length})
@@ -140,7 +140,7 @@ function AgentPanel({ assignment, template }: { assignment: AgentStateAssignment
           {activeSession ? 'Waiting for messages...' : 'No active goal. Set a goal above to start.'}
         </p>
       ) : (
-        <div className="flex-1 overflow-auto border border-trident-border/50 rounded-lg bg-black/10">
+        <div className="flex-1 overflow-auto border border-trident-border/50 rounded-lg bg-trident-bg">
           <SessionStream messages={messages} />
         </div>
       )}

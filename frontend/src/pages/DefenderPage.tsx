@@ -40,8 +40,8 @@ const POLL_ALERTS_MS = 3000;
 function threatTone(alert: DefenderAlert): string {
   const tl = String(alert.threat_level || alert.severity || '').toLowerCase();
   const conf = Number(alert.confidence);
-  if (tl === 'high' || conf >= 0.9) return 'text-red-400 border-red-500/40 bg-red-500/5';
-  if (tl === 'medium' || conf >= 0.7) return 'text-amber-400 border-amber-500/40 bg-amber-500/5';
+  if (tl === 'high' || conf >= 0.9) return 'text-red-400 border-red-500/40 bg-red-500/5 dark:text-red-300 dark:border-red-400/30';
+  if (tl === 'medium' || conf >= 0.7) return 'text-amber-400 border-amber-500/40 bg-amber-500/5 dark:text-amber-300 dark:border-amber-400/30';
   return 'text-trident-muted border-trident-border bg-trident-surface';
 }
 
@@ -243,11 +243,11 @@ export function DefenderPage() {
         </div>
         <div className="text-right text-xs text-trident-muted">
           <div>
-            run_id: <span className="font-mono text-trident-text">{status?.run_id ?? '—'}</span>
+            run_id: <span className="font-mono text-trident-text truncate max-w-[200px] inline-block align-bottom" title={status?.run_id}>{status?.run_id ?? '—'}</span>
           </div>
           <div>
             planner:{' '}
-            <span className="font-mono text-trident-text">{planner?.model ?? '—'}</span>{' '}
+            <span className="font-mono text-trident-text truncate max-w-[160px] inline-block align-bottom" title={planner?.model}>{planner?.model ?? '—'}</span>{' '}
             <span
               className={
                 planner?.llm_configured ? 'text-emerald-400' : 'text-amber-400'
@@ -363,7 +363,7 @@ export function DefenderPage() {
 
             {msg && (
               <div
-                className={`rounded-md px-3 py-2 text-xs ${
+                className={`rounded-md px-3 py-2 text-xs break-words ${
                   msg.kind === 'ok'
                     ? 'bg-emerald-500/10 text-emerald-400'
                     : 'bg-red-500/10 text-red-400'
@@ -444,7 +444,7 @@ export function DefenderPage() {
                 className={`rounded-md border px-3 py-2 text-xs ${threatTone(a)}`}
               >
                 <div className="flex items-center justify-between">
-                  <span className="font-mono font-semibold">
+                  <span className="font-mono font-semibold truncate max-w-[200px] inline-block align-bottom" title={a.attackid || a.attack_type || a.id || 'alert'}>
                     {a.attackid || a.attack_type || a.id || 'alert'}
                   </span>
                   <span className="opacity-70">
@@ -452,7 +452,7 @@ export function DefenderPage() {
                     {a.confidence ? ` · conf ${a.confidence}` : ''}
                   </span>
                 </div>
-                <div className="mt-1 font-mono opacity-80">
+                <div className="mt-1 font-mono opacity-80 break-all">
                   {a.sourceip || a.srcip || '?'} → {a.destip || a.dstip || '?'}
                 </div>
                 {a.description && (

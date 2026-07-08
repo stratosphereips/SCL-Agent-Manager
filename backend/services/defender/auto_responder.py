@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Callable, Dict, Optional
 
@@ -167,6 +168,32 @@ class AutoResponder:
     def stop(self) -> None:
         self.running = False
 
+    # run_id (network-topology resolve_run_id) = "<topology_id>-YYYYMMDD-HHMM".
+    # Strip this trailing timestamp to recover the topology_id for an exact,
+    # unambiguous match against the defended policy key.
+    _RUN_SUFFIX = re.compile(r"-\d{8}-\d{4}$")
+
+    @staticmethod
+    def _match_topology(tid: Optional[str], enabled) -> Optional[str]:
+        """Map an alert's tid (a topology_id OR a run_id) to an enabled topology id.
+
+        SLIPS alerts arrive tagged only with ``run_id``
+        (``"<topology_id>-YYYYMMDD-HHMM"``), but the defended policy is keyed by
+        the bare ``topology_id``. Prefer an exact match, then strip the run
+        timestamp for an exact topology_id match; fall back to the longest
+        enabled prefix only for non-standard tag formats. Returns the matched
+        topology_id (used for all downstream host/container resolution) or None.
+        """
+        if not tid:
+            return None
+        if tid in enabled:
+            return tid
+        stripped = AutoResponder._RUN_SUFFIX.sub("", tid, count=1)
+        if stripped != tid and stripped in enabled:
+            return stripped
+        candidates = [t for t in enabled if tid.startswith(t + "-")]
+        return max(candidates, key=len) if candidates else None
+
     async def run_once(self) -> None:
         # The alert buffer is global; drain once and route each alert by its own
         # topology tag (set by the SLIPS sensor's RUN_ID or the /alerts caller).
@@ -177,12 +204,15 @@ class AutoResponder:
         enabled = set(store.enabled_topologies())
         for alert in alerts:
             tid = alert.get("topology_id") or alert.get("run_id")
-            if not tid or tid not in enabled:
+            # Normalize run_id ("<topo>-<timestamp>") -> topology_id so it matches
+            # the policy key AND downstream container resolution (scl.topology label).
+            topology_id = self._match_topology(tid, enabled)
+            if not topology_id:
                 # Surface the silent drop on /status (not just a debug log).
                 store.incr("alerts_dropped_nondefended")
                 logger.debug("alert topology %r not enabled/routable; dropping", tid)
                 continue
-            await self._process_alert(tid, alert)
+            await self._process_alert(topology_id, alert)
 
     async def _process_alert(self, topology_id: str, alert: Dict[str, Any]) -> None:
         store = self.store

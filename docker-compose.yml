@@ -11,8 +11,9 @@ services:
       - agent_state:/app/state
       # Mount backend for development (optional, remove in production)
       - ./backend:/app/backend
-      # Mount outputs directory for Trident compatibility (optional)
-      - ${OUTPUTS_DIR:-/tmp/outputs}:/outputs:ro
+      # Mount outputs directory for Trident compatibility + Replay persistence.
+      # Read-write: the agent-manager's auto_responder writes soc_god logs + alerts here.
+      - ${OUTPUTS_DIR:-/tmp/outputs}:/outputs:rw
     environment:
       - TOPOLOGY_PLUGIN_URL=http://scl-network-topology:9002
       - SCL_NETWORK_NAME=scl-playground-net

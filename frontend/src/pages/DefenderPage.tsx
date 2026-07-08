@@ -133,6 +133,10 @@ export function DefenderPage() {
   }, []);
 
   // ---- when topology changes, load its hosts + current defended set ----
+  // Keyed on topologyId ONLY. The status poll re-runs every 2s; if this effect
+  // also depended on `status` it would overwrite the user's in-progress host
+  // selection on every poll (the "checkboxes clear themselves after a second"
+  // bug). We fetch status fresh here for a one-time reflection instead.
   useEffect(() => {
     if (!topologyId) {
       setHosts([]);
@@ -140,19 +144,32 @@ export function DefenderPage() {
       setDefended([]);
       return;
     }
+    let alive = true;
     getTopology(topologyId)
       .then((t) => {
+        if (!alive) return;
         const flat = (t.networks || []).flatMap((n) => n.hosts || []);
-        setHosts(flat.map((h) => ({ id: h.id, name: h.name || h.id })));
+        const list = flat.map((h) => ({ id: h.id, name: h.name || h.id }));
+        setHosts(list);
+        // Default to defending EVERY host in the topology so a single Enable
+        // arms soc_god for the whole topology (all hosts then appear under
+        // "Live defended hosts"). Honour an already-saved policy if present.
+        getDefenderStatus()
+          .then((s) => {
+            if (!alive) return;
+            const saved = s.policy?.[topologyId]?.host_ids;
+            setSelectedHosts(new Set(saved?.length ? saved : list.map((h) => h.id)));
+          })
+          .catch(() => alive && setSelectedHosts(new Set(list.map((h) => h.id))));
       })
-      .catch(() => setHosts([]));
-    // Reflect already-saved policy from status.
-    const policy = status?.policy?.[topologyId];
-    if (policy) setSelectedHosts(new Set(policy.host_ids));
+      .catch(() => alive && setHosts([]));
     getDefendedHosts(topologyId)
-      .then((r) => setDefended(r.hosts))
-      .catch(() => setDefended([]));
-  }, [topologyId, status]);
+      .then((r) => alive && setDefended(r.hosts))
+      .catch(() => alive && setDefended([]));
+    return () => {
+      alive = false;
+    };
+  }, [topologyId]);
 
   // ---- best-effort live event stream (raw WS; defender events are {type,data}) ----
   const wsRef = useRef<WebSocket | null>(null);

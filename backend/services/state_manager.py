@@ -59,13 +59,46 @@ class StateManager:
         }
 
     def _read_state(self) -> Dict[str, Any]:
-        """Read and parse the state file."""
+        """Read and parse the state file, normalizing legacy/corrupt shapes."""
         try:
             with open(self.state_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                state = json.load(f)
         except json.JSONDecodeError:
             # File is corrupted, return default state
             return self._get_default_state()
+
+        if not isinstance(state, dict):
+            return self._get_default_state()
+
+        # Sessions must be a dict (session_id -> data). Legacy files may store
+        # an empty list or a list of session records.
+        sessions = state.get("sessions")
+        if isinstance(sessions, list):
+            normalized: Dict[str, Any] = {}
+            for sess in sessions:
+                if isinstance(sess, dict):
+                    sid = sess.get("session_id") or sess.get("id")
+                    if sid:
+                        normalized[sid] = sess
+            state["sessions"] = normalized
+        elif not isinstance(sessions, dict):
+            state["sessions"] = {}
+
+        # Assignments must be a dict (agent:{id} -> data). Legacy files may
+        # store an empty list or a list of assignment records.
+        assignments = state.get("assignments")
+        if isinstance(assignments, list):
+            normalized = {}
+            for assignment in assignments:
+                if isinstance(assignment, dict):
+                    aid = assignment.get("id") or assignment.get("agent_id")
+                    if aid:
+                        normalized[f"agent:{aid}"] = assignment
+            state["assignments"] = normalized
+        elif not isinstance(assignments, dict):
+            state["assignments"] = {}
+
+        return state
 
     def _write_state(self, state: Dict[str, Any]) -> None:
         """Write state to file with atomic update."""

@@ -26,6 +26,7 @@ from .models import (
     ComponentHealth,
     AgentMetrics,
     ContainerMetrics,
+    ContainerState,
     SessionMetrics,
     WebSocketMetrics,
     BackgroundTaskMetrics,
@@ -45,6 +46,7 @@ from .services import (
     # OpenCode client
     check_opencode_ready_async,
 )
+from .routers.reconciliation import get_reconciliation_service
 
 
 # =============================================================================
@@ -191,40 +193,16 @@ class BackgroundTaskManager:
         """Periodically reconcile agent state with running containers."""
         logger.info(f"Starting periodic reconciliation (interval: {RECONCILE_INTERVAL_SECONDS}s)")
 
-        while self.running:
-            try:
-                await asyncio.sleep(RECONCILE_INTERVAL_SECONDS)
-
-                if not self.running:
-                    break
-
-                logger.info("Running periodic reconciliation...")
-
-                # Broadcast reconciliation start event
-                await connection_manager.broadcast({
-                    "type": "reconciliation_started",
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "data": {"trigger": "periodic"}
-                })
-
-                # Perform reconciliation
-                state_manager = get_state_manager()
-                reconcile_result = await state_manager.reconcile_all()
-
-                # Broadcast reconciliation result
-                await connection_manager.broadcast({
-                    "type": "reconciliation_completed",
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "data": reconcile_result.dict() if hasattr(reconcile_result, 'dict') else reconcile_result
-                })
-
-                logger.info(f"Periodic reconciliation completed: {reconcile_result}")
-
-            except asyncio.CancelledError:
-                logger.info("Reconciliation task cancelled")
-                break
-            except Exception as e:
-                logger.error(f"Error in periodic reconciliation: {e}", exc_info=True)
+        service = get_reconciliation_service()
+        try:
+            await service.periodic_reconciliation(
+                interval_seconds=RECONCILE_INTERVAL_SECONDS,
+                enabled=True
+            )
+        except asyncio.CancelledError:
+            logger.info("Reconciliation task cancelled")
+        except Exception as e:
+            logger.error(f"Error in periodic reconciliation: {e}", exc_info=True)
 
     async def _periodic_image_build(self):
         """Periodically check and build OpenCode images."""
@@ -436,15 +414,27 @@ async def health_check():
     overall_status = "healthy"
     components: Dict[str, ComponentHealth] = {}
 
-    # Check OpenCode availability
+    # Check OpenCode availability on running topology containers
     try:
-        opencode_ready = await check_opencode_ready_async()
-        components["opencode"] = ComponentHealth(
-            status="healthy" if opencode_ready else "degraded",
-            ready=opencode_ready
-        )
-        if not opencode_ready:
-            overall_status = "degraded"
+        docker_client = create_docker_client()
+        await docker_client.connect()
+        try:
+            from .services.docker_client import list_containers, check_opencode_ready
+            containers = await list_containers(docker_client, state=ContainerState.RUNNING)
+            opencode_ready = False
+            for container in containers:
+                if await check_opencode_ready(docker_client, container.container_id):
+                    opencode_ready = True
+                    break
+            components["opencode"] = ComponentHealth(
+                status="healthy" if opencode_ready else "degraded",
+                ready=opencode_ready,
+                container_count=len(containers)
+            )
+            if not opencode_ready:
+                overall_status = "degraded"
+        finally:
+            await docker_client.close()
     except Exception as e:
         components["opencode"] = ComponentHealth(
             status="unhealthy",
@@ -455,11 +445,15 @@ async def health_check():
     # Check Docker availability
     try:
         docker_client = create_docker_client()
-        containers = await list_containers(docker_client)
-        components["docker"] = ComponentHealth(
-            status="healthy",
-            container_count=len(containers)
-        )
+        await docker_client.connect()
+        try:
+            containers = await list_containers(docker_client)
+            components["docker"] = ComponentHealth(
+                status="healthy",
+                container_count=len(containers)
+            )
+        finally:
+            await docker_client.close()
     except Exception as e:
         components["docker"] = ComponentHealth(
             status="unhealthy",
@@ -470,10 +464,10 @@ async def health_check():
     # Check State Manager
     try:
         state_manager = get_state_manager()
-        agent_state = await get_agent_state(state_manager)
+        assignments = state_manager.get_all_assignments()
         components["state_manager"] = ComponentHealth(
             status="healthy",
-            assignment_count=len(agent_state.get("assignments", {}))
+            assignment_count=len(assignments)
         )
     except Exception as e:
         components["state_manager"] = ComponentHealth(

@@ -603,6 +603,9 @@ export interface Host {
   username?: string;
   password?: string;
   agents?: string[];
+  /** Opt host into the guardrail/gate. undefined = auto (armed iff a
+   * guarded agent — coder56/soc_god — is present on the host). */
+  guardrail_enabled?: boolean;
   generate_data?: boolean;
   data_prompt?: string;
   data_content?: string;

@@ -44,6 +44,11 @@ class NetworkHost(BaseModel):
     username: Optional[str] = None
     password: Optional[str] = None
     agents: List[str] = Field(default_factory=list)
+    # Opt host into the guardrail/gate. None/absent = auto (armed iff a
+    # guarded agent — coder56/soc_god — is present on the host). Declared here so
+    # it round-trips through the plugin's topology.json (NetworkHost is the detail
+    # sub-model; without this the detail/create response would 500 on the key).
+    guardrail_enabled: Optional[bool] = Field(default=None)
     generate_data: bool = False
     data_prompt: Optional[str] = None
     data_content: Optional[str] = None
@@ -254,6 +259,25 @@ async def list_topologies():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("", response_model=TopologyDetail)
+async def create_topology(payload: Dict[str, Any]):
+    """
+    Create a brand-new topology. The network-topology plugin generates a fresh id
+    (slugified name + uuid suffix) when the payload omits `id`. Minimal body:
+    ``{"name": "...", "networks": [{"name": "lan", "hosts": [{"name": "host1"}]}]}``.
+    Returns the newly created TopologyDetail.
+    """
+    try:
+        saved_data = await post_to_topology_plugin("/api/topologies", payload)
+        saved_topology = saved_data.get("topology", saved_data)
+        return topology_to_detail(saved_topology)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating topology: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/{topology_id}", response_model=TopologyDetail)
 async def get_topology(topology_id: str):
     """
@@ -388,4 +412,25 @@ async def get_topology_status(topology_id: str):
         raise
     except Exception as e:
         logger.error(f"Error getting topology status {topology_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{topology_id}/jobs/{job_id}")
+async def get_topology_job(topology_id: str, job_id: str):
+    """
+    Poll a start/stop background job from the topology plugin.
+
+    The plugin runs start/stop asynchronously and returns a job_id; the job's
+    status ('running' | 'completed' | 'failed') and, on failure, its ``error``
+    (e.g. a docker-compose ``Pool overlaps`` subnet-collision message) are read
+    here so the UI can surface why a start failed instead of silently showing
+    'stopped'. ``topology_id`` is path context only and is not validated.
+    """
+    try:
+        data = await fetch_from_topology_plugin(f"/api/jobs/{job_id}")
+        return data.get("job") or {}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting job {job_id} for topology {topology_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))

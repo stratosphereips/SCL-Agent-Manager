@@ -341,7 +341,7 @@ app.add_middleware(
 # Include Routers
 # =============================================================================
 
-from .routers import agents, containers, sessions, reconciliation, topologies, opencode_compat, timeline_compat, settings
+from .routers import agents, containers, sessions, reconciliation, topologies, opencode_compat, timeline_compat, replay, settings
 
 # Routers already have prefixes defined, include without additional prefixes
 app.include_router(agents.router)
@@ -353,6 +353,8 @@ app.include_router(topologies.router)
 app.include_router(opencode_compat.router)
 # Add Timeline compatibility router for Trident-style agent timeline data
 app.include_router(timeline_compat.router)
+# Add Replay router for historical run playback (select a past run, replay as if live)
+app.include_router(replay.router)
 # Add Settings router for LLM credentials management
 app.include_router(settings.router)
 

@@ -5,6 +5,8 @@ import {
   CheckCircle, XCircle, AlertCircle, Clock, Zap
 } from 'lucide-react';
 import api from '@/api';
+import { useReplayContext } from '@/contexts/ReplayContext';
+import { ReplayHeader } from '@/components/ReplayAgentView';
 import type { Topology, Host, AgentAssignment, AgentTemplate } from '@/types';
 
 interface DashboardStats {
@@ -15,6 +17,7 @@ interface DashboardStats {
 }
 
 export function DashboardPage() {
+  const { replay } = useReplayContext();
   const [selectedTopology, setSelectedTopology] = useState<Topology | null>(null);
   const [topologies, setTopologies] = useState<Topology[]>([]);
   const [agentTemplates, setAgentTemplates] = useState<Record<string, AgentTemplate>>({});
@@ -79,6 +82,65 @@ export function DashboardPage() {
   const selectedHostsData = useMemo(() => {
     return allHosts.filter(({ host }) => selectedHosts.has(host.id));
   }, [allHosts, selectedHosts]);
+
+  // Replay mode: overview of the replayed run instead of the live topology dashboard.
+  if (replay.replayId) {
+    const evs = replay.events;
+    const counts = {
+      total: evs.length,
+      timeline: evs.filter((e) => e.source_type === 'timeline').length,
+      messages: evs.filter((e) => e.source_type === 'opencode').length,
+      alerts: evs.filter((e) => e.source_type === 'alert').length,
+    };
+    const byAgent = (p: string) => evs.filter((e) => (e.source_file || '').includes(p)).length;
+    const pct = replay.durationMs > 0
+      ? Math.min(100, Math.round(((replay.positionMs - replay.startTimeMs) / replay.durationMs) * 100))
+      : 0;
+    const statCards = [
+      { label: 'Total events', value: counts.total, tone: 'text-trident-text' },
+      { label: 'Timeline', value: counts.timeline, tone: 'text-blue-700 dark:text-blue-400' },
+      { label: 'Messages', value: counts.messages, tone: 'text-purple-700 dark:text-purple-400' },
+      { label: 'Alerts', value: counts.alerts, tone: 'text-red-700 dark:text-red-400' },
+    ];
+    const agents = [
+      { label: 'coder56', n: byAgent('coder56/'), color: 'text-red-700 dark:text-red-400' },
+      { label: 'db_admin', n: byAgent('benign_agent/'), color: 'text-green-700 dark:text-green-400' },
+      { label: 'soc_god', n: byAgent('soc_god/'), color: 'text-sky-700 dark:text-sky-400' },
+    ];
+    return (
+      <div className="space-y-6">
+        <ReplayHeader title="Dashboard" subtitle="Run overview" />
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+          {statCards.map((s) => (
+            <div key={s.label} className="rounded-lg border border-trident-border bg-trident-surface p-4">
+              <div className="text-xs uppercase tracking-wide text-trident-muted">{s.label}</div>
+              <div className={`mt-2 font-heading text-2xl font-bold ${s.tone}`}>{s.value}</div>
+            </div>
+          ))}
+        </div>
+        <div className="card">
+          <h3 className="mb-3 font-heading text-lg font-bold text-trident-text">Events by agent</h3>
+          <div className="grid grid-cols-3 gap-3">
+            {agents.map((a) => (
+              <div key={a.label} className="rounded-lg bg-black/5 dark:bg-black/30 p-3 text-center">
+                <p className={`text-2xl font-bold ${a.color}`}>{a.n}</p>
+                <p className="text-[10px] uppercase tracking-wider text-trident-muted">{a.label}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="card">
+          <div className="mb-2 flex items-center justify-between text-sm">
+            <span className="text-trident-muted">Playback position</span>
+            <span className="font-mono text-trident-text">{pct}%</span>
+          </div>
+          <div className="h-2 w-full rounded bg-trident-bg">
+            <div className="h-2 rounded bg-trident-accent" style={{ width: `${pct}%` }} />
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   // Toggle host selection
   const toggleHost = (hostId: string) => {

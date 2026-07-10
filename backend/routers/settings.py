@@ -87,10 +87,27 @@ PROVIDER_PRESETS: dict[str, dict[str, str]] = {
 
 
 def _read_env() -> dict[str, str | None]:
-    """Read credentials .env file, returning all key-value pairs."""
+    """Read credentials .env file, returning all key-value pairs.
+
+    Falls back to process environment variables when the credentials file
+    does not exist or does not contain a variable. This allows the plugin
+    to validate and test connections out of the box when credentials are
+    injected via docker-compose environment variables.
+    """
+    env: dict[str, str | None] = {}
+
+    # Start with process environment for all known variables.
+    for var in VARIABLE_SCHEMA:
+        env[var["key"]] = os.getenv(var["key"])
+
+    # Credentials saved through the UI take precedence over env vars.
     if CREDENTIALS_PATH.exists():
-        return dict(dotenv_values(CREDENTIALS_PATH))
-    return {}
+        file_values = dict(dotenv_values(CREDENTIALS_PATH))
+        for key, val in file_values.items():
+            if key in env:
+                env[key] = val
+
+    return env
 
 
 def _write_env(updates: dict[str, str | None]) -> None:

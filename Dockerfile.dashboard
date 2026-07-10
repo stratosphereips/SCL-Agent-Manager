@@ -21,6 +21,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy backend
 COPY backend/ ./backend/
 
+# Copy hardcoded topologies
+COPY topologies/ ./topologies/
+
 # Copy frontend build
 COPY --from=builder /app/dist /app/frontend/dist
 

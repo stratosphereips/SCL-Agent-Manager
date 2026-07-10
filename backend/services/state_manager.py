@@ -458,6 +458,24 @@ class StateManager:
         state = self._read_state()
         return state.get("sessions", {})
 
+    async def reconcile_all(self) -> Dict[str, Any]:
+        """
+        Periodic reconciliation placeholder.
+
+        Agent assignments are derived directly from topology.json via the
+        network-topology plugin, so no separate registry reconciliation is
+        required. This method keeps the background task contract alive and
+        refreshes the last-sync timestamp.
+        """
+        self.update_sync_status("completed")
+        return {
+            "status": "completed",
+            "containers_checked": 0,
+            "containers_reconciled": 0,
+            "mismatches_found": 0,
+            "message": "Assignments derived from topology.json; no action needed."
+        }
+
 
 # Singleton instance
 _state_manager_instance: Optional[StateManager] = None

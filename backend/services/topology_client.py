@@ -9,10 +9,14 @@ no local topology file store. Agent assignments live in topology.json as
 separately.
 """
 
+import asyncio
+import logging
 import os
 from typing import Any, Dict, Optional
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 # The topology plugin owns topology.json and serves it over HTTP.
 TOPOLOGY_PLUGIN_URL = os.environ.get(
@@ -146,6 +150,29 @@ def regenerate_compose(topology_id: Optional[str] = None, compose_path: Optional
         'success': True,
         'message': 'Topology updated (agent assignment persisted to topology.json)'
     }
+
+
+async def restart_topology_async(topology_id: str) -> Dict[str, Any]:
+    """Ask the network-topology plugin to (re)start a topology.
+
+    The plugin owns docker-compose.yml and the container lifecycle, so the
+    agent-manager must not try to run docker-compose itself. A restart applies
+    any agent assignment changes that were saved to topology.json.
+
+    Args:
+        topology_id: The ID of the topology to restart.
+
+    Returns:
+        Plugin response dict (usually {'status': 'started'}).
+
+    Raises:
+        httpx.HTTPError: On transport/HTTP errors.
+    """
+    logger.info(f"Requesting topology restart from plugin: {topology_id}")
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(f"{TOPOLOGY_PLUGIN_URL}/api/topologies/{topology_id}/start")
+        resp.raise_for_status()
+        return resp.json()
 
 
 def get_service_name(topology_id: str, host_id: str, topology_path: Optional[str] = None) -> Optional[str]:

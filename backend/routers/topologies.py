@@ -3,10 +3,13 @@ Topology Management Router
 
 Provides API endpoints for integrating with the network-topology plugin.
 Allows listing, viewing, starting, and stopping topologies.
+Also loads hardcoded topologies from /app/topologies/ directory.
 """
 
+import json
 import logging
 import os
+from pathlib import Path
 import httpx
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, HTTPException, Query
@@ -14,6 +17,7 @@ from pydantic import BaseModel, Field
 
 # Configuration — resolved via env vars set in docker-compose.yml
 TOPOLOGY_PLUGIN_URL = os.getenv("TOPOLOGY_PLUGIN_URL", "http://scl-network-topology:9002")
+TOPOLOGIES_DIR = Path(os.getenv("TOPOLOGIES_DIR", "/app/topologies"))
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +36,7 @@ class RouterInfo(BaseModel):
     ssh_enabled: bool = False
     username: Optional[str] = None
     password: Optional[str] = None
+    agents: List[str] = Field(default_factory=list)
 
 
 class NetworkHost(BaseModel):
@@ -227,6 +232,45 @@ def topology_to_detail(topology: Dict[str, Any]) -> TopologyDetail:
     )
 
 
+def load_local_topologies() -> List[Dict[str, Any]]:
+    """Load hardcoded topologies from the local topologies directory."""
+    topologies = []
+    if not TOPOLOGIES_DIR.exists():
+        logger.warning(f"Topologies directory does not exist: {TOPOLOGIES_DIR}")
+        return topologies
+
+    for json_file in TOPOLOGIES_DIR.glob("*.json"):
+        try:
+            with open(json_file, 'r', encoding='utf-8') as f:
+                topology = json.load(f)
+                topology['_source'] = 'local'  # Mark as local topology
+                topologies.append(topology)
+                logger.info(f"Loaded local topology: {topology.get('id', json_file.stem)}")
+        except Exception as e:
+            logger.error(f"Failed to load topology from {json_file}: {e}")
+
+    return topologies
+
+
+def load_local_topology(topology_id: str) -> Optional[Dict[str, Any]]:
+    """Load a specific local topology by ID."""
+    if not TOPOLOGIES_DIR.exists():
+        return None
+
+    json_file = TOPOLOGIES_DIR / f"{topology_id}.json"
+    if not json_file.exists():
+        return None
+
+    try:
+        with open(json_file, 'r', encoding='utf-8') as f:
+            topology = json.load(f)
+            topology['_source'] = 'local'
+            return topology
+    except Exception as e:
+        logger.error(f"Failed to load local topology {topology_id}: {e}")
+        return None
+
+
 # =============================================================================
 # API Endpoints
 # =============================================================================
@@ -238,20 +282,29 @@ async def list_topologies():
 
     Returns a list of topology summaries including id, name, version,
     network/host counts, and running status.
+    Includes both topologies from the network-topology plugin and local hardcoded topologies.
     """
+    all_summaries = []
+
+    # Load topologies from the network-topology plugin
     try:
         data = await fetch_from_topology_plugin("/api/topologies")
-        topologies = data.get("topologies", [])
+        plugin_topologies = data.get("topologies", [])
+        all_summaries.extend([topology_to_summary(t) for t in plugin_topologies])
+    except HTTPException as e:
+        if e.status_code != 503:
+            raise
+        logger.warning("Topology plugin unavailable, using local topologies only")
 
-        summaries = [topology_to_summary(t) for t in topologies]
+    # Load local hardcoded topologies
+    local_topologies = load_local_topologies()
+    local_ids = {s.id for s in all_summaries}  # Avoid duplicates
 
-        return TopologyListResponse(topologies=summaries)
+    for t in local_topologies:
+        if t.get("id") not in local_ids:
+            all_summaries.append(topology_to_summary(t))
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error listing topologies: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    return TopologyListResponse(topologies=all_summaries)
 
 
 @router.get("/{topology_id}", response_model=TopologyDetail)
@@ -260,19 +313,24 @@ async def get_topology(topology_id: str):
     Get detailed information about a specific topology.
 
     Includes full network, router, and host configuration.
+    First checks the network-topology plugin, then falls back to local topologies.
     """
+    # Try to get from the network-topology plugin first
     try:
         data = await fetch_from_topology_plugin(f"/api/topologies/{topology_id}")
-        # Network-topology plugin wraps the response as {"topology": {...}, "running": bool}
-        # Unwrap the "topology" key before parsing
         topology_data = data.get("topology", data)
         return topology_to_detail(topology_data)
+    except HTTPException as e:
+        if e.status_code != 404 and e.status_code != 503:
+            raise
+        logger.info(f"Topology {topology_id} not found in plugin, checking local topologies")
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting topology {topology_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    # Fall back to local topologies
+    local_topology = load_local_topology(topology_id)
+    if local_topology:
+        return topology_to_detail(local_topology)
+
+    raise HTTPException(status_code=404, detail=f"Topology {topology_id} not found")
 
 
 @router.put("/{topology_id}", response_model=TopologyDetail)
@@ -283,11 +341,22 @@ async def update_topology(topology_id: str, payload: Dict[str, Any]):
     Fetches the current full topology (preserving firewall rules, infrastructure, etc.),
     merges in the updated networks (which carry the new agents lists per host),
     then saves back to the network-topology plugin.
+    If the topology is local-only, it will be saved to the plugin first.
     """
     try:
-        # Fetch full current topology to preserve firewall/infrastructure/router fields
-        current_data = await fetch_from_topology_plugin(f"/api/topologies/{topology_id}")
-        current_topology = current_data.get("topology", current_data)
+        # Try to fetch from plugin first
+        try:
+            current_data = await fetch_from_topology_plugin(f"/api/topologies/{topology_id}")
+            current_topology = current_data.get("topology", current_data)
+        except HTTPException as e:
+            if e.status_code == 404 or e.status_code == 503:
+                # Topology not in plugin, load from local
+                local_topology = load_local_topology(topology_id)
+                if not local_topology:
+                    raise HTTPException(status_code=404, detail=f"Topology {topology_id} not found")
+                current_topology = local_topology
+            else:
+                raise
 
         # Merge in the updated networks (agents may have changed)
         if "networks" in payload:
@@ -296,7 +365,10 @@ async def update_topology(topology_id: str, payload: Dict[str, Any]):
         # Ensure the ID is always set correctly
         current_topology["id"] = topology_id
 
-        # Save back to network-topology plugin
+        # Remove internal fields before saving
+        current_topology.pop('_source', None)
+
+        # Save to network-topology plugin
         saved_data = await post_to_topology_plugin("/api/topologies", current_topology)
         saved_topology = saved_data.get("topology", saved_data)
         return topology_to_detail(saved_topology)
@@ -314,13 +386,29 @@ async def start_topology(topology_id: str):
     Start a topology by launching its Docker containers.
 
     This will:
-    1. Ensure OpenCode images are built for hosts with agents
+    1. Ensure the topology exists in the network-topology plugin (save if local-only)
     2. Generate docker-compose.yml
     3. Start containers with docker-compose up
 
     Returns a message and optional job_id for tracking progress.
     """
     try:
+        # Check if topology exists in plugin, if not save it first
+        try:
+            await fetch_from_topology_plugin(f"/api/topologies/{topology_id}")
+        except HTTPException as e:
+            if e.status_code == 404 or e.status_code == 503:
+                # Topology not in plugin, load from local and save
+                local_topology = load_local_topology(topology_id)
+                if not local_topology:
+                    raise HTTPException(status_code=404, detail=f"Topology {topology_id} not found")
+                local_topology.pop('_source', None)
+                await post_to_topology_plugin("/api/topologies", local_topology)
+                logger.info(f"Saved local topology {topology_id} to plugin before starting")
+            else:
+                raise
+
+        # Now start the topology
         data = await post_to_topology_plugin(f"/api/topologies/{topology_id}/start")
 
         return TopologyStartResponse(

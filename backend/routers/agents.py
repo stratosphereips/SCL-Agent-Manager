@@ -221,9 +221,15 @@ async def run_agent_assignment(
         # Execute the full assignment flow
         result = await assign_agent(assignment)
 
-        # Update job tracker with result
+        # Update job tracker with result.
+        # READY, ASSIGNED and REMOVED are terminal success states; only FAILED
+        # is treated as an error.
+        successful_states = {
+            AgentAssignmentState.READY,
+            AgentAssignmentState.ASSIGNED,
+        }
         _job_tracker.update_job(job_id, {
-            "status": "completed" if result.status == AgentAssignmentState.READY else "failed",
+            "status": "completed" if result.status in successful_states else "failed",
             "result": result.dict(),
             "completed_at": datetime.utcnow().isoformat()
         })
@@ -333,7 +339,7 @@ async def run_agent_removal(
             agent_type=agent_type
         )
 
-        # Update job tracker with result
+        # Update job tracker with result. REMOVED is a terminal success state.
         _job_tracker.update_job(job_id, {
             "status": "completed" if result.status == AgentAssignmentState.REMOVED else "failed",
             "result": result.dict(),

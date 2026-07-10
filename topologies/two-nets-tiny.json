@@ -1,0 +1,210 @@
+{
+  "id": "two-nets-tiny",
+  "name": "Two Networks Tiny",
+  "created_at": "2026-07-03T00:00:00Z",
+  "updated_at": "2026-07-03T00:00:00Z",
+  "routers": [
+    {
+      "id": "router1",
+      "name": "core",
+      "parent_router_id": "",
+      "ssh_enabled": true,
+      "username": "admin",
+      "password": "admin123",
+      "agents": [],
+      "vulnerabilities": [
+        {
+          "id": "router_weak_creds",
+          "type": "weak_credentials",
+          "service": "ssh",
+          "description": "Router admin interface accessible via SSH with weak credentials (admin:admin123)",
+          "severity": "high",
+          "exploit_path": "SSH brute force or credential stuffing"
+        }
+      ]
+    },
+    {
+      "id": "internet",
+      "name": "internet",
+      "parent_router_id": "",
+      "ssh_enabled": false,
+      "username": "",
+      "password": "",
+      "is_external": true
+    }
+  ],
+  "router": {
+    "ssh_enabled": true,
+    "username": "admin",
+    "password": "admin123",
+    "firewall": {
+      "allowed": ["client-net->server-net", "client-net->internet", "server-net->internet"]
+    }
+  },
+  "infrastructure": {
+    "hackerlab_network_id": "client-net"
+  },
+  "networks": [
+    {
+      "id": "server-net",
+      "name": "server-net",
+      "cidr": "192.168.1.0/24",
+      "internet": false,
+      "router_ids": ["router1"],
+      "default_router_id": "router1",
+      "router_id": "router1",
+      "hosts": [
+        {
+          "id": "smb-server",
+          "name": "smb-server",
+          "type": "file-server",
+          "image": "ubuntu:24.04",
+          "ssh_enabled": true,
+          "username": "admin",
+          "password": "strato",
+          "generate_data": false,
+          "data_prompt": "",
+          "data_content": "",
+          "agents": [],
+          "services": [
+            {
+              "name": "samba",
+              "port": 445,
+              "protocol": "tcp",
+              "version": "4.15.13",
+              "description": "SMB file sharing service"
+            },
+            {
+              "name": "xrdp",
+              "port": 3389,
+              "protocol": "tcp",
+              "version": "0.9.18",
+              "description": "Remote Desktop Protocol service"
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "smb_rce",
+              "type": "remote_code_execution",
+              "service": "samba",
+              "cve": "CVE-2017-7494",
+              "description": "Samba remote code execution vulnerability in SMB protocol",
+              "severity": "critical",
+              "exploit_path": "Crafted SMB packet triggers buffer overflow in samba handling",
+              "exploit_command": "use exploit/linux/samba/is_known_pipename"
+            }
+          ],
+          "private_data": [
+            {
+              "owner": "User1",
+              "description": "DataFromServer1",
+              "path": "/etc/sensitive/"
+            },
+            {
+              "owner": "User2",
+              "description": "Data2FromServer1",
+              "path": "/etc/sensitive/"
+            }
+          ],
+          "users": [
+            {"username": "User1", "password": "user1pass", "access_level": "limited"},
+            {"username": "User2", "password": "user2pass", "access_level": "limited"},
+            {"username": "Administrator", "password": "Admin123!", "access_level": "elevated"}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "client-net",
+      "name": "client-net",
+      "cidr": "192.168.2.0/24",
+      "internet": false,
+      "router_ids": ["router1"],
+      "default_router_id": "router1",
+      "router_id": "router1",
+      "hosts": [
+        {
+          "id": "client-1",
+          "name": "client-1",
+          "type": "normal-user",
+          "image": "ubuntu:24.04",
+          "ssh_enabled": true,
+          "username": "user1",
+          "password": "strato",
+          "generate_data": false,
+          "data_prompt": "",
+          "data_content": "",
+          "agents": [],
+          "is_attacker_foothold": true,
+          "services": [
+            {
+              "name": "xrdp",
+              "port": 3389,
+              "protocol": "tcp",
+              "version": "0.9.18",
+              "description": "Remote Desktop Protocol service"
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "rdp_weak_creds",
+              "type": "weak_credentials",
+              "service": "xrdp",
+              "description": "RDP service with weak credentials allowing unauthorized access",
+              "severity": "high",
+              "exploit_path": "Brute force RDP login with common credentials"
+            }
+          ],
+          "users": [
+            {"username": "User1", "password": "user1pass", "access_level": "limited"},
+            {"username": "Administrator", "password": "Admin123!", "access_level": "elevated"}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "internet-net",
+      "name": "internet-net",
+      "cidr": "10.99.0.0/24",
+      "internet": true,
+      "router_ids": ["internet"],
+      "default_router_id": "internet",
+      "router_id": "internet",
+      "hosts": [
+        {
+          "id": "outside-node",
+          "name": "outside-node",
+          "type": "jump-box",
+          "image": "ubuntu:24.04",
+          "ssh_enabled": true,
+          "username": "attacker",
+          "password": "attacker123",
+          "generate_data": false,
+          "data_prompt": "",
+          "data_content": "",
+          "agents": [],
+          "is_attacker_controlled": true,
+          "services": [
+            {
+              "name": "listener",
+              "port": 4444,
+              "protocol": "tcp",
+              "version": "1.0",
+              "description": "Netcat listener for data exfiltration"
+            }
+          ],
+          "exfil_endpoint": {
+            "enabled": true,
+            "port": 4444,
+            "storage_path": "/tmp/exfil_data/",
+            "description": "Attacker-controlled endpoint for receiving exfiltrated data"
+          }
+        }
+      ]
+    }
+  ],
+  "visual": {
+    "routers": {},
+    "networks": {}
+  }
+}

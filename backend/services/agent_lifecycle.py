@@ -37,20 +37,14 @@ from .topology_client import (
     load_topology,
     save_topology,
     find_host,
-    regenerate_compose,
-    get_service_name,
     list_topology_ids,
+    restart_topology_async,
 )
 
 from .docker_client import (
-    DockerClient,
     create_docker_client,
-    recreate_container,
     wait_for_opencode,
-    check_opencode_ready,
     get_container_by_host_id,
-    ContainerRecreationError,
-    DockerComposeError,
 )
 
 
@@ -225,31 +219,26 @@ async def assign_agent(
         # Step 2: Add agent to host
         logger.info(f"Step 2: Adding agent {request.agent_type} to host {request.host_id}")
 
-        # Find the host in the loaded topology
+        # Find the host in the *already loaded* topology so mutations are
+        # reflected when we save it back.  find_host() reloads the topology,
+        # so we cannot use it here.
         host = None
-        host_found = False
-
-        # Search in top-level hosts
-        if 'hosts' in topology:
-            for h in topology['hosts']:
-                if h.get('id') == request.host_id:
-                    host = h
-                    host_found = True
+        for search_key in ('hosts', 'networks', 'subnets'):
+            section = topology.get(search_key, [])
+            if isinstance(section, dict):
+                section = [section]
+            for item in section:
+                candidates = item.get('hosts', []) if isinstance(item, dict) else []
+                for h in candidates:
+                    if h.get('id') == request.host_id:
+                        host = h
+                        break
+                if host:
                     break
+            if host:
+                break
 
-        # Search in subnets if not found
-        if not host_found and 'subnets' in topology:
-            for subnet in topology['subnets']:
-                if 'hosts' in subnet:
-                    for h in subnet['hosts']:
-                        if h.get('id') == request.host_id:
-                            host = h
-                            host_found = True
-                            break
-                if host_found:
-                    break
-
-        if not host_found:
+        if not host:
             return AgentAssignmentResponse(
                 status=AgentAssignmentState.FAILED,
                 message=f"Host {request.host_id} not found in topology",
@@ -275,14 +264,23 @@ async def assign_agent(
         logger.info("Step 3: Saving updated topology")
         save_topology(request.topology_id, topology, topology_path)
 
-        # Step 4: Regenerate compose
-        logger.info("Step 4: Regenerating docker-compose")
-        compose_result = regenerate_compose(request.topology_id)
-
-        if not compose_result.get('success'):
+        # Step 4: Ask the network-topology plugin to apply the change.
+        # The plugin owns docker-compose.yml and the container lifecycle.  The
+        # agent-manager container does not have access to the compose files, so
+        # it must delegate the restart to the plugin instead of running
+        # docker-compose itself.
+        logger.info("Step 4: Restarting topology through network-topology plugin")
+        try:
+            restart_result = await restart_topology_async(request.topology_id)
+            logger.info(f"Topology restart result: {restart_result}")
+        except Exception as e:
+            logger.error(f"Topology restart failed: {e}", exc_info=True)
             return AgentAssignmentResponse(
                 status=AgentAssignmentState.FAILED,
-                message=f"Compose regeneration failed: {compose_result.get('message')}",
+                message=(
+                    f"Agent saved to topology but topology restart failed: {str(e)}. "
+                    "Start the topology manually from the Topologies page."
+                ),
                 topology_id=request.topology_id,
                 network_id=request.network_id,
                 host_id=request.host_id,
@@ -291,72 +289,45 @@ async def assign_agent(
                 estimated_completion_seconds=0
             )
 
-        # Step 5: Recreate container
-        logger.info("Step 5: Recreating container with agent")
-        service_name = get_service_name(request.topology_id, request.host_id, topology_path)
-
-        if not service_name:
-            return AgentAssignmentResponse(
-                status=AgentAssignmentState.FAILED,
-                message=f"Could not determine service name for host {request.host_id}",
-                topology_id=request.topology_id,
-                network_id=request.network_id,
-                host_id=request.host_id,
-                agent_type=request.agent_type,
-                job_id=job_id,
-                estimated_completion_seconds=0
-            )
-
+        # Step 5: Verify the recreated container is running and OpenCode is ready.
+        logger.info("Step 5: Verifying OpenCode readiness")
+        opencode_ready = False
+        expected_container_name = (
+            f"scl-topology-{request.topology_id}-"
+            f"{request.network_id}-{request.host_id}"
+        )
         async with create_docker_client() as docker:
             try:
-                new_container_id = await recreate_container(
+                container = await docker.docker.containers.get(expected_container_name)
+                container_info = await container.show()
+                container_id = container_info['Id']
+                opencode_ready = await wait_for_opencode(
                     docker,
-                    request.topology_id,
-                    service_name,
-                    compose_project=request.topology_id
+                    container_id,
+                    timeout=OPENCODE_READY_TIMEOUT
                 )
-                logger.info(f"Container recreated: {new_container_id[:12]}")
+                if not opencode_ready:
+                    logger.warning(f"OpenCode not ready after {OPENCODE_READY_TIMEOUT}s")
+            except Exception as e:
+                logger.warning(f"Could not verify OpenCode readiness: {e}")
 
-            except (ContainerRecreationError, DockerComposeError) as e:
-                return AgentAssignmentResponse(
-                    status=AgentAssignmentState.FAILED,
-                    message=f"Container recreation failed: {str(e)}",
-                    topology_id=request.topology_id,
-                    network_id=request.network_id,
-                    host_id=request.host_id,
-                    agent_type=request.agent_type,
-                    job_id=job_id,
-                    estimated_completion_seconds=0
-                )
+        # Agent assignment is persisted in topology.json (Step 3 save_topology);
+        # assignments are derived from topology.json as the single source of truth,
+        # so there is no separate registry to update.
 
-            # Step 6: Wait for OpenCode
-            logger.info("Step 6: Waiting for OpenCode server to be ready")
-            opencode_ready = await wait_for_opencode(
-                docker,
-                new_container_id,
-                timeout=OPENCODE_READY_TIMEOUT
-            )
+        logger.info(f"Agent assignment completed: {job_id}")
 
-            if not opencode_ready:
-                logger.warning(f"OpenCode not ready after {OPENCODE_READY_TIMEOUT}s")
-
-            # Agent assignment is persisted in topology.json (Step 3 save_topology);
-            # assignments are derived from topology.json as the single source of truth,
-            # so there is no separate registry to update.
-
-            logger.info(f"Agent assignment completed: {job_id}")
-
-            return AgentAssignmentResponse(
-                status=AgentAssignmentState.READY if opencode_ready else AgentAssignmentState.ASSIGNED,
-                message=f"Agent {request.agent_type} assigned to {request.host_id}" +
-                       (". OpenCode ready." if opencode_ready else ". OpenCode not ready."),
-                topology_id=request.topology_id,
-                network_id=request.network_id,
-                host_id=request.host_id,
-                agent_type=request.agent_type,
-                job_id=job_id,
-                estimated_completion_seconds=0
-            )
+        return AgentAssignmentResponse(
+            status=AgentAssignmentState.READY if opencode_ready else AgentAssignmentState.ASSIGNED,
+            message=f"Agent {request.agent_type} assigned to {request.host_id}" +
+                   (". OpenCode ready." if opencode_ready else ". OpenCode not ready."),
+            topology_id=request.topology_id,
+            network_id=request.network_id,
+            host_id=request.host_id,
+            agent_type=request.agent_type,
+            job_id=job_id,
+            estimated_completion_seconds=0
+        )
 
     except Exception as e:
         logger.error(f"Agent assignment failed: {e}", exc_info=True)
@@ -411,7 +382,23 @@ async def remove_agent(
 
         # Step 2: Remove agent from host
         logger.info(f"Step 2: Removing agent {agent_type} from host {host_id}")
-        host = find_host(topology_id, host_id, topology_path)
+
+        # Search inside the already loaded topology so mutations are saved.
+        host = None
+        for search_key in ('hosts', 'networks', 'subnets'):
+            section = topology.get(search_key, [])
+            if isinstance(section, dict):
+                section = [section]
+            for item in section:
+                candidates = item.get('hosts', []) if isinstance(item, dict) else []
+                for h in candidates:
+                    if h.get('id') == host_id:
+                        host = h
+                        break
+                if host:
+                    break
+            if host:
+                break
 
         if not host:
             return AgentAssignmentResponse(
@@ -436,14 +423,21 @@ async def remove_agent(
         logger.info("Step 3: Saving updated topology")
         save_topology(topology_id, topology, topology_path)
 
-        # Step 4: Regenerate compose
-        logger.info("Step 4: Regenerating docker-compose")
-        compose_result = regenerate_compose(topology_id)
-
-        if not compose_result.get('success'):
+        # Step 4: Ask the network-topology plugin to apply the change.
+        # The plugin owns docker-compose.yml and the container lifecycle, so the
+        # agent-manager must delegate the restart to the plugin.
+        logger.info("Step 4: Restarting topology through network-topology plugin")
+        try:
+            restart_result = await restart_topology_async(topology_id)
+            logger.info(f"Topology restart result: {restart_result}")
+        except Exception as e:
+            logger.error(f"Topology restart failed: {e}", exc_info=True)
             return AgentAssignmentResponse(
                 status=AgentAssignmentState.FAILED,
-                message=f"Compose regeneration failed: {compose_result.get('message')}",
+                message=(
+                    f"Agent removed from topology but topology restart failed: {str(e)}. "
+                    "Restart the topology manually from the Topologies page."
+                ),
                 topology_id=topology_id,
                 network_id=network_id,
                 host_id=host_id,
@@ -452,59 +446,21 @@ async def remove_agent(
                 estimated_completion_seconds=0
             )
 
-        # Step 5: Recreate container
-        logger.info("Step 5: Recreating container without agent")
-        service_name = get_service_name(topology_id, host_id, topology_path)
+        # Agent removal is persisted in topology.json (Step 3 save_topology);
+        # assignments are derived from topology.json, so no registry to update.
 
-        if not service_name:
-            return AgentAssignmentResponse(
-                status=AgentAssignmentState.FAILED,
-                message=f"Could not determine service name for host {host_id}",
-                topology_id=topology_id,
-                network_id=network_id,
-                host_id=host_id,
-                agent_type=agent_type,
-                job_id=job_id,
-                estimated_completion_seconds=0
-            )
+        logger.info(f"Agent removal completed: {job_id}")
 
-        async with create_docker_client() as docker:
-            try:
-                new_container_id = await recreate_container(
-                    docker,
-                    topology_id,
-                    service_name,
-                    compose_project=topology_id
-                )
-                logger.info(f"Container recreated: {new_container_id[:12]}")
-
-            except (ContainerRecreationError, DockerComposeError) as e:
-                return AgentAssignmentResponse(
-                    status=AgentAssignmentState.FAILED,
-                    message=f"Container recreation failed: {str(e)}",
-                    topology_id=topology_id,
-                    network_id=network_id,
-                    host_id=host_id,
-                    agent_type=agent_type,
-                    job_id=job_id,
-                    estimated_completion_seconds=0
-                )
-
-            # Agent removal is persisted in topology.json (Step 3 save_topology);
-            # assignments are derived from topology.json, so no registry to update.
-
-            logger.info(f"Agent removal completed: {job_id}")
-
-            return AgentAssignmentResponse(
-                status=AgentAssignmentState.REMOVED,
-                message=f"Agent {agent_type} removed from {host_id}",
-                topology_id=topology_id,
-                network_id=network_id,
-                host_id=host_id,
-                agent_type=agent_type,
-                job_id=job_id,
-                estimated_completion_seconds=0
-            )
+        return AgentAssignmentResponse(
+            status=AgentAssignmentState.REMOVED,
+            message=f"Agent {agent_type} removed from {host_id}",
+            topology_id=topology_id,
+            network_id=network_id,
+            host_id=host_id,
+            agent_type=agent_type,
+            job_id=job_id,
+            estimated_completion_seconds=0
+        )
 
     except Exception as e:
         logger.error(f"Agent removal failed: {e}", exc_info=True)

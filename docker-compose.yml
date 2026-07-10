@@ -11,6 +11,7 @@ services:
       - agent_state:/app/state
       # Mount backend for development (optional, remove in production)
       - ./backend:/app/backend
+      - ./topologies:/app/topologies
       # Mount outputs directory for Trident compatibility (optional)
       - ${OUTPUTS_DIR:-/tmp/outputs}:/outputs:ro
     environment:
@@ -26,6 +27,7 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       # LLM config for the defender planner (and reused by soc_god via the topology)
       - LLM_URL=${LLM_URL:-https://llm.ai.e-infra.cz/v1}
+      - LLM_MODEL=${LLM_MODEL:-gemma4}
       - OPENCODE_API_KEY=${OPENCODE_API_KEY}
       - DEFENDER_LLM_API_KEY=${OPENCODE_API_KEY}
       - PLANNER_MODEL=${PLANNER_MODEL:-gpt-oss-120b}

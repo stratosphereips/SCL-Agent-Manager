@@ -29,6 +29,7 @@ from ..models import (
 )
 from ..services.container_addr import get_container_address, ContainerAddressError
 from ..services.opencode_client import create_session_async, send_prompt_async, get_session_messages_async, _ensure_network_connectivity
+from ..services.session_capture import resolve_run_id, capture_session_messages, OUTPUTS_DIR
 from ..services.state_manager import get_state_manager
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
@@ -52,6 +53,40 @@ async def _get_container_address(container_id: str) -> str:
         if "not found" in msg:
             raise HTTPException(status_code=404, detail=msg)
         raise HTTPException(status_code=500, detail=msg)
+
+async def _capture_turn(container_id: str, agent_type: str, session_id: str, host_addr: str) -> None:
+    """Best-effort: after a prompt turn, fetch the session's messages from the
+    OpenCode server and persist them to OUTPUTS_DIR/<run_id>/<agent>/opencode_api_messages.json
+    so dashboard-driven runs produce the same per-agent artifacts (and Replay-readable
+    state) as the standalone experiment runners. Never raises."""
+    try:
+        msgs_result = await get_session_messages_async(session_id=session_id, host=host_addr, port=4096)
+        messages = msgs_result.get("messages", []) if msgs_result.get("success") else []
+        run_id = await resolve_run_id(container_id)
+        capture_session_messages(run_id, agent_type, session_id, messages)
+    except Exception as exc:
+        logger.debug("session capture skipped for %s: %s", session_id[:12], exc)
+
+async def _forward_goal_to_guardrail(container_id: str, agent_type: str, goal_text: str) -> None:
+    """Append the operator's prompt to the coder56 guardrail's live goal file.
+
+    The ClawKeeper guardrail (scope mode) reads /outputs/<run_id>/guardrail/goal.txt on
+    every command and keeps the red-teamer in scope of it. We accumulate every
+    coder56 session prompt so the goal is the full directive history (later
+    directives refine/extend earlier ones). Best-effort: never raises into the
+    prompt path. Only coder56 — soc_god keeps its baked-in GUARDRAIL_GOAL.
+    """
+    if agent_type != "coder56" or not (goal_text and goal_text.strip()):
+        return
+    try:
+        run_id = await resolve_run_id(container_id)
+        goal_dir = OUTPUTS_DIR / run_id / "guardrail"
+        goal_dir.mkdir(parents=True, exist_ok=True)
+        # OS append is write-race-free; '--- directive ---' delimits cumulative goals.
+        with open(goal_dir / "goal.txt", "a") as f:
+            f.write(f"\n--- directive ---\n{goal_text.strip()}\n")
+    except Exception as exc:
+        logger.warning("Could not forward guardrail goal for %s: %s", container_id[:12], exc)
 
 def _transform_opencode_message(opencode_msg: Dict[str, Any]) -> SessionMessage:
     """Transform OpenCode message format to SessionMessage format.
@@ -208,6 +243,9 @@ async def create_session(request: SessionCreateRequest) -> SessionInfo:
     # Agent is specified here (in the prompt), not during session creation
     if request.initial_prompt:
         try:
+            # Arm the coder56 guardrail with the operator's goal before the agent's
+            # first commands run.
+            await _forward_goal_to_guardrail(request.container_id, request.agent_type.value, request.initial_prompt)
             result = await send_prompt_async(
                 session_id=session_id,
                 prompt=request.initial_prompt,
@@ -222,9 +260,17 @@ async def create_session(request: SessionCreateRequest) -> SessionInfo:
                 # Continue anyway - session is created, prompt can be resent later
             else:
                 logger.info(f"Initial prompt sent successfully to session {session_id[:12]}")
+            # Always persist whatever messages the session has so far (best-effort),
+            # even if the prompt timed out or failed — autonomous agents (e.g. soc_god)
+            # routinely exceed the 120s sync timeout, and we still want the per-agent
+            # opencode_api_messages.json written under the run id.
+            await _capture_turn(request.container_id, request.agent_type.value, session_id, host_addr)
             sm.update_session(session_id, {"state": SessionState.RUNNING.value})
         except Exception as e:
             logger.error(f"Error sending initial prompt: {e}")
+            # Best-effort capture even on exception (e.g. timeout) so a long-running
+            # autonomous agent still gets its accumulated messages persisted.
+            await _capture_turn(request.container_id, request.agent_type.value, session_id, host_addr)
             # Continue anyway - session is created, prompt can be resent later
             sm.update_session(session_id, {"state": SessionState.RUNNING.value})
 
@@ -306,6 +352,10 @@ async def send_prompt(
 
     host_addr = await _get_container_address(session.get("container_id"))
 
+    # Refresh the coder56 guardrail's live goal with this latest directive (appended
+    # to the cumulative goal) before the agent acts on the prompt.
+    await _forward_goal_to_guardrail(session.get("container_id"), session.get("agent_type"), request.prompt)
+
     result = await send_prompt_async(
         session_id=session_id,
         prompt=request.prompt,
@@ -321,6 +371,10 @@ async def send_prompt(
         
     # Update state
     sm.update_session(session_id, {"state": SessionState.RUNNING.value, "updated_at": datetime.utcnow().isoformat()})
+
+    # Persist this turn's messages to the per-agent opencode_api_messages.json
+    # (best-effort; never blocks the response).
+    await _capture_turn(session.get("container_id"), session.get("agent_type"), session_id, host_addr)
     
     resp_data = result.get("response", {})
     return PromptResponse(

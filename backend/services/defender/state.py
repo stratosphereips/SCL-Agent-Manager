@@ -123,7 +123,12 @@ class DefenderStore:
 
     def _append_alert_log(self, alert: Dict[str, Any]) -> None:
         try:
-            path = OUTPUTS_DIR / defender_run_id() / "soc_god" / "defender_alerts.ndjson"
+            # Route each alert to its OWN run's dir (real SLIPS alerts carry
+            # run_id = the topology run, set by the sensor). Only fall back to
+            # the process-wide defender_run_id() for un-tagged manual alerts,
+            # so alerts never land under a stale "test-run" default.
+            run_id = alert.get("run_id") or defender_run_id()
+            path = OUTPUTS_DIR / run_id / "soc_god" / "defender_alerts.ndjson"
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(alert) + "\n")
@@ -155,7 +160,7 @@ class DefenderStore:
                     tid: {"enabled": v.get("enabled", False), "host_ids": v.get("host_ids", [])}
                     for tid, v in self._policy.items()
                 },
-                "run_id": RUN_ID,
+                "run_id": defender_run_id(),
             }
 
 

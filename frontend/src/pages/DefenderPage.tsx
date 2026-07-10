@@ -16,6 +16,8 @@ import {
   Loader2,
   AlertTriangle,
 } from 'lucide-react';
+import { useReplayContext } from '@/contexts/ReplayContext';
+import { ReplayAgentView, ReplayHeader } from '@/components/ReplayAgentView';
 import {
   getDefenderStatus,
   enableDefender,
@@ -68,6 +70,7 @@ function Counter({
 }
 
 export function DefenderPage() {
+  const { replay } = useReplayContext();
   const [status, setStatus] = useState<DefenderStatus | null>(null);
   const [alerts, setAlerts] = useState<DefenderAlert[]>([]);
   const [planner, setPlanner] = useState<PlannerHealth | null>(null);
@@ -130,6 +133,10 @@ export function DefenderPage() {
   }, []);
 
   // ---- when topology changes, load its hosts + current defended set ----
+  // Keyed on topologyId ONLY. The status poll re-runs every 2s; if this effect
+  // also depended on `status` it would overwrite the user's in-progress host
+  // selection on every poll (the "checkboxes clear themselves after a second"
+  // bug). We fetch status fresh here for a one-time reflection instead.
   useEffect(() => {
     if (!topologyId) {
       setHosts([]);
@@ -137,19 +144,32 @@ export function DefenderPage() {
       setDefended([]);
       return;
     }
+    let alive = true;
     getTopology(topologyId)
       .then((t) => {
+        if (!alive) return;
         const flat = (t.networks || []).flatMap((n) => n.hosts || []);
-        setHosts(flat.map((h) => ({ id: h.id, name: h.name || h.id })));
+        const list = flat.map((h) => ({ id: h.id, name: h.name || h.id }));
+        setHosts(list);
+        // Default to defending EVERY host in the topology so a single Enable
+        // arms soc_god for the whole topology (all hosts then appear under
+        // "Live defended hosts"). Honour an already-saved policy if present.
+        getDefenderStatus()
+          .then((s) => {
+            if (!alive) return;
+            const saved = s.policy?.[topologyId]?.host_ids;
+            setSelectedHosts(new Set(saved?.length ? saved : list.map((h) => h.id)));
+          })
+          .catch(() => alive && setSelectedHosts(new Set(list.map((h) => h.id))));
       })
-      .catch(() => setHosts([]));
-    // Reflect already-saved policy from status.
-    const policy = status?.policy?.[topologyId];
-    if (policy) setSelectedHosts(new Set(policy.host_ids));
+      .catch(() => alive && setHosts([]));
     getDefendedHosts(topologyId)
-      .then((r) => setDefended(r.hosts))
-      .catch(() => setDefended([]));
-  }, [topologyId, status]);
+      .then((r) => alive && setDefended(r.hosts))
+      .catch(() => alive && setDefended([]));
+    return () => {
+      alive = false;
+    };
+  }, [topologyId]);
 
   // ---- best-effort live event stream (raw WS; defender events are {type,data}) ----
   const wsRef = useRef<WebSocket | null>(null);
@@ -225,6 +245,56 @@ export function DefenderPage() {
 
   const c = status?.counters;
   const policyEntry = topologyId ? status?.policy?.[topologyId] : undefined;
+
+  // Replay mode: show the soc_god defender's replayed activity + the run's alerts,
+  // synced to playback, instead of the live control surface.
+  if (replay.replayId) {
+    const replayAlerts = replay.events
+      .filter((e) => e.source_type === 'alert' && e.timestamp_ms <= replay.positionMs)
+      .sort((a, b) => a.timestamp_ms - b.timestamp_ms);
+    return (
+      <div className="space-y-6">
+        <ReplayHeader title="Defender" subtitle="Autonomous blue-team (soc_god)" />
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+          <ReplayAgentView
+            agentKey="soc_god"
+            label="soc_god"
+            desc="Autonomous defender — threat analysis & remediation"
+            color="text-sky-700 dark:text-sky-400"
+          />
+          <section className="rounded-lg border border-trident-border bg-trident-surface p-5">
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className="font-heading text-lg font-semibold text-trident-text">Replayed alerts</h2>
+              <span className="text-xs text-trident-muted">{replayAlerts.length} total</span>
+            </div>
+            <div className="max-h-[28rem] space-y-2 overflow-auto">
+              {replayAlerts.length === 0 ? (
+                <div className="py-6 text-center text-sm text-trident-muted">No alerts at this point in the replay.</div>
+              ) : (
+                replayAlerts.map((a, i) => {
+                  const d = (a.data ?? {}) as Record<string, any>;
+                  return (
+                    <div key={i} className={`rounded-md border px-3 py-2 text-xs ${threatTone(d as any)}`}>
+                      <div className="flex items-center justify-between">
+                        <span className="font-mono font-semibold truncate max-w-[200px] inline-block align-bottom" title={d.attackid || d.attack_type || d.id || 'alert'}>
+                          {d.attackid || d.attack_type || d.id || 'alert'}
+                        </span>
+                        <span className="opacity-70">{d.threat_level || d.severity || ''}{d.confidence ? ` · conf ${d.confidence}` : ''}</span>
+                      </div>
+                      <div className="mt-1 font-mono opacity-80 break-all">
+                        {d.sourceip || d.srcip || '?'} → {d.destip || d.dstip || '?'}
+                      </div>
+                      {d.description && <div className="mt-1 line-clamp-2 opacity-80">{d.description}</div>}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </section>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">

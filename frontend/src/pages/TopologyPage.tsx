@@ -28,6 +28,20 @@ function metaFor(type: string, templates: TemplateMap) {
   };
 }
 
+// ─── Start-error friendly messages ──────────────────────────────────────────
+// docker-compose failures arrive verbatim as stderr; add a one-line hint for the
+// cases we can diagnose so the user knows what to do, not just what broke.
+function friendlyStartError(message?: string): string {
+  const msg = (message ?? 'Unknown error').trim();
+  if (/Pool overlaps with other one/i.test(msg)) {
+    return `${msg}  (subnet collision — another running topology already uses the same 10.77.x.x CIDR; stop it first)`;
+  }
+  if (/no such image|manifest unknown/i.test(msg)) {
+    return `${msg}  (an image is missing — rebuild the topology/SCL base images)`;
+  }
+  return msg;
+}
+
 // ─── List summary type (what /api/topologies returns) ───────────────────────
 interface TopologySummary {
   id: string;
@@ -143,11 +157,13 @@ function AddAgentButton({ currentAgents, agentTypes, templates, onAdd }: {
 
 // ─── Host row ────────────────────────────────────────────────────────────────
 function HostRow({
-  host, agentTypes, templates, onAgentAdd, onAgentRemove,
+  host, agentTypes, templates, guardrailOn, onToggleGuardrail, onAgentAdd, onAgentRemove,
 }: {
   host: Host;
   agentTypes: string[];
   templates: TemplateMap;
+  guardrailOn: boolean;
+  onToggleGuardrail: () => void;
   onAgentAdd: (agentType: string) => void;
   onAgentRemove: (agentType: string) => void;
 }) {
@@ -159,6 +175,19 @@ function HostRow({
       <span className="text-xs px-2 py-0.5 bg-gray-200 dark:bg-gray-700 rounded-full text-gray-600 dark:text-gray-300">
         {host.type}
       </span>
+      {/* Guardrail/gate toggle. Auto-on when a guarded agent (coder56/
+          soc_god) is present; persists via saveTopology round-trip. */}
+      <label
+        title="Guardrail/gate: audit this host's bash via a second opencode agent (auto-on for coder56/soc_god)"
+        className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded-full cursor-pointer select-none ${
+          guardrailOn
+            ? 'bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300'
+            : 'bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400'
+        }`}
+      >
+        <input type="checkbox" checked={guardrailOn} onChange={onToggleGuardrail} className="accent-amber-500" />
+        🛡 guardrail
+      </label>
       <div className="flex flex-wrap items-center gap-1.5 ml-auto">
         {agents.map(a => (
           <AgentChip key={a} agent={a} templates={templates} onRemove={() => onAgentRemove(a)} />
@@ -188,6 +217,12 @@ export function TopologyPage() {
   // to the AGENT_STYLE keys below until the fetch resolves or if it fails).
   const [agentTypes, setAgentTypes] = useState<string[]>(Object.keys(AGENT_STYLE));
   const [templates, setTemplates] = useState<TemplateMap>({});
+  // Last start-failure message for the selected topology (shown as a banner until
+  // dismissed / a new start / a topology switch). Empty when the last start worked.
+  const [startError, setStartError] = useState<string | null>(null);
+  // Bumped on each Start attempt and topology switch so an in-flight job poll can
+  // detect it's stale and bail out (no setState after unmount / on a different topo).
+  const pollToken = useRef(0);
 
   const showToast = (msg: string, ok = true) => {
     setToast({ msg, ok });
@@ -223,6 +258,9 @@ export function TopologyPage() {
     setDirty(false);
     setDetailLoading(true);
     setExpandedNetworks(new Set());
+    // Switching topology invalidates any in-flight start poll and its banner.
+    pollToken.current += 1;
+    setStartError(null);
     try {
       const detail = await api.getTopology(id);
       setTopology(detail);
@@ -274,6 +312,35 @@ export function TopologyPage() {
     }));
   };
 
+  // Guardrail/gate membership — MUST mirror the plugin's GUARDED_AGENTS (app.py)
+  // so the checkbox auto-default matches what compose-generation produces.
+  const hasGuardedAgent = (h: Host) =>
+    !!(h.agents ?? []).some(a => a === 'coder56' || a === 'soc_god');
+
+  const toggleGuardrail = (networkId: string, hostId: string) => {
+    mutateHost(networkId, hostId, h => ({
+      ...h,
+      guardrail_enabled: !(h.guardrail_enabled ?? hasGuardedAgent(h)),
+    }));
+  };
+
+  // ── Create a brand-new topology (plugin mints a fresh id) ──────────────────
+  const createTopology = async () => {
+    const name = window.prompt('New topology name', `lab-${new Date().toISOString().slice(0, 10)}`);
+    if (!name) return;
+    try {
+      const created = await api.createTopology({
+        name,
+        networks: [{ id: 'lan', name: 'lan', hosts: [{ id: 'host1', name: 'host1' }] } as unknown as Network],
+      });
+      await loadList();
+      await selectTopology(created.id);
+      showToast(`Created topology “${created.name}”`);
+    } catch (e) {
+      showToast('Failed to create topology', false);
+    }
+  };
+
   // ── Save ───────────────────────────────────────────────────────────────────
   const save = async () => {
     if (!topology || !selectedId) return;
@@ -297,15 +364,48 @@ export function TopologyPage() {
     if (!selectedId) return;
     // Auto-save first if dirty
     if (dirty) await save();
+    // Invalidate any prior poll and clear the previous failure banner.
+    const token = (pollToken.current += 1);
+    const id = selectedId;
+    setStartError(null);
     setStarting(true);
     try {
-      const r = await api.startTopology(selectedId);
-      showToast(r.message ?? 'Topology started');
+      const r = await api.startTopology(id);
+      // No job_id (older plugin) → keep the old optimistic behaviour.
+      if (!r.job_id) {
+        showToast(r.message ?? 'Topology started');
+        loadList();
+        return;
+      }
+      // Poll the async start job so we can report real failures (e.g. a
+      // docker-compose subnet collision) instead of a silent "stopped".
+      const POLL_MS = 1500;
+      const MAX_ATTEMPTS = 200; // ~5 min, to cover first-run image builds
+      for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+        if (pollToken.current !== token) return; // superseded by another start/switch
+        const job = await api.getTopologyJob(id, r.job_id);
+        if (pollToken.current !== token) return;
+        if (job.status === 'completed') {
+          showToast('Topology started ✓');
+          loadList();
+          return;
+        }
+        if (job.status === 'failed') {
+          const msg = friendlyStartError(job.error);
+          setStartError(msg);
+          showToast(`Start failed: ${msg}`, false);
+          loadList();
+          return;
+        }
+        await new Promise(resolve => setTimeout(resolve, POLL_MS));
+      }
+      // Timed out while still building/starting — don't claim failure.
+      showToast('Still starting — first run may build images; check the list shortly.');
       loadList();
     } catch (e: any) {
       showToast(e?.message ?? 'Start failed', false);
     } finally {
-      setStarting(false);
+      if (pollToken.current === token) setStarting(false);
     }
   };
 
@@ -352,7 +452,16 @@ export function TopologyPage() {
 
         {/* ── Left: topology list ── */}
         <div className="flex flex-col gap-2 overflow-auto">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400 flex-shrink-0">Topologies</h2>
+          <div className="flex items-center gap-2 flex-shrink-0">
+            <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Topologies</h2>
+            <button
+              onClick={createTopology}
+              title="Create a new topology"
+              className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg bg-blue-500 hover:bg-blue-600 text-white font-medium transition-colors"
+            >
+              <Plus size={12} /> New
+            </button>
+          </div>
           {listLoading ? (
             <p className="text-sm text-gray-400 dark:text-gray-500">Loading…</p>
           ) : summaries.map(s => (
@@ -389,6 +498,23 @@ export function TopologyPage() {
             </div>
           ) : topology ? (
             <>
+              {/* Start-failure banner (from the most recent start attempt) */}
+              {startError && (
+                <div className="flex items-start gap-2 flex-shrink-0 bg-red-50 dark:bg-red-900/30 text-red-800 dark:text-red-200 border border-red-200 dark:border-red-700 rounded-xl px-4 py-3 text-sm">
+                  <AlertCircle size={16} className="flex-shrink-0 mt-0.5" />
+                  <div className="min-w-0">
+                    <p className="font-semibold">Topology failed to start</p>
+                    <p className="break-words whitespace-pre-wrap">{startError}</p>
+                  </div>
+                  <button
+                    onClick={() => setStartError(null)}
+                    title="Dismiss"
+                    className="ml-auto flex-shrink-0 hover:opacity-60 transition-opacity"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+              )}
               {/* Action bar */}
               <div className="flex items-center justify-between flex-shrink-0 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-xl px-4 py-3">
                 <div>
@@ -465,6 +591,8 @@ export function TopologyPage() {
                             host={host}
                             agentTypes={agentTypes}
                             templates={templates}
+                            guardrailOn={host.guardrail_enabled ?? hasGuardedAgent(host)}
+                            onToggleGuardrail={() => toggleGuardrail(network.id, host.id)}
                             onAgentAdd={a => addAgent(network.id, host.id, a)}
                             onAgentRemove={a => removeAgent(network.id, host.id, a)}
                           />

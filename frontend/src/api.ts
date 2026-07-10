@@ -180,9 +180,28 @@ export async function getTopology(topologyId: string): Promise<Topology> {
 
 /**
  * Start a topology (launch docker containers)
+ *
+ * The backend runs start asynchronously in the topology plugin and returns a
+ * ``job_id``; poll it via {@link getTopologyJob} to learn whether the start
+ * actually succeeded or failed (e.g. a subnet-collision at docker-compose up).
  */
-export async function startTopology(topologyId: string): Promise<{ message: string }> {
-  const response = await apiClient.post<{ message: string }>(`/api/topologies/${topologyId}/start`);
+export async function startTopology(topologyId: string): Promise<{ message: string; job_id?: string | null }> {
+  const response = await apiClient.post<{ message: string; job_id?: string | null }>(`/api/topologies/${topologyId}/start`);
+  return response.data;
+}
+
+/**
+ * Poll a start/stop background job. Mirrors the topology plugin's own
+ * waitForJob(): status is 'running' | 'completed' | 'failed'; on failure
+ * ``error`` holds the underlying message (e.g. docker-compose stderr).
+ */
+export async function getTopologyJob(
+  topologyId: string,
+  jobId: string,
+): Promise<{ id?: string; status: string; result?: unknown; error?: string }> {
+  const response = await apiClient.get<{ id?: string; status: string; result?: unknown; error?: string }>(
+    `/api/topologies/${topologyId}/jobs/${jobId}`,
+  );
   return response.data;
 }
 
@@ -201,6 +220,16 @@ export async function stopTopology(topologyId: string): Promise<{ message: strin
  */
 export async function saveTopology(topologyId: string, networks: Network[]): Promise<Topology> {
   const response = await apiClient.put<Topology>(`/api/topologies/${topologyId}`, { networks });
+  return response.data;
+}
+
+/**
+ * Create a brand-new topology. Backend forwards to the plugin, which generates a
+ * fresh id (slugified name + uuid suffix). Minimal body:
+ * { name, networks: [{ name, hosts: [{ name }] }] } — the plugin defaults the rest.
+ */
+export async function createTopology(payload: { name: string; networks: Network[] }): Promise<Topology> {
+  const response = await apiClient.post<Topology>('/api/topologies', payload);
   return response.data;
 }
 
@@ -885,6 +914,8 @@ export default {
   startTopology,
   stopTopology,
   saveTopology,
+  createTopology,
+  getTopologyJob,
 
   // Agent Management
   getAgentTemplates,

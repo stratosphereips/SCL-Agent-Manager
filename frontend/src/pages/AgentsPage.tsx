@@ -1,12 +1,14 @@
-import { useState, useEffect } from 'react';
-import { Radio, MessageSquare, PlayCircle, Loader2 } from 'lucide-react';
+import { useState, useEffect, useMemo } from 'react';
+import { Radio, MessageSquare, PlayCircle, Loader2, Shield } from 'lucide-react';
 import { SessionStream } from '@/components/SessionStream';
+import { ReplayAgentView, ReplayHeader } from '@/components/ReplayAgentView';
+import { useReplayContext } from '@/contexts/ReplayContext';
 import api, { APIError } from '@/api';
-import type { AgentStateAssignment, SessionMessage, AgentTemplate, SessionInfo, AgentType, ContainerInfo } from '@/types';
+import type { AgentStateAssignment, SessionMessage, AgentTemplate, SessionInfo, AgentType, ContainerInfo, Topology, Host } from '@/types';
 import { ContainerState } from '@/types';
 
 // Agent Panel Component
-function AgentPanel({ assignment, template }: { assignment: AgentStateAssignment, template?: AgentTemplate }) {
+function AgentPanel({ assignment, template, isGuarded }: { assignment: AgentStateAssignment, template?: AgentTemplate, isGuarded?: boolean }) {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeSession, setActiveSession] = useState<SessionInfo | null>(null);
   const [messages, setMessages] = useState<SessionMessage[]>([]);
@@ -99,7 +101,13 @@ function AgentPanel({ assignment, template }: { assignment: AgentStateAssignment
           <h3 className="font-heading text-lg font-bold text-trident-accent truncate" title={`${label} on ${assignment.host_name}`}>{label} on {assignment.host_name}</h3>
         </div>
         <div className="flex items-center gap-2 flex-shrink-0">
-          <span className={`badge badge-success`}>
+          {isGuarded && (
+            <span className="badge badge-warning flex items-center gap-1" title="Guarded by ClawKeeper (bash commands audited)">
+              <Shield size={12} />
+              guarded
+            </span>
+          )}
+          <span className={`badge ${assignment.state === 'ready' ? 'badge-success' : assignment.state === 'failed' ? 'badge-danger' : 'badge-info'}`}>
             {assignment.state}
           </span>
         </div>
@@ -149,12 +157,15 @@ function AgentPanel({ assignment, template }: { assignment: AgentStateAssignment
 }
 
 export function AgentsPage() {
+  const { replay } = useReplayContext();
   const [assignments, setAssignments] = useState<AgentStateAssignment[]>([]);
   const [templates, setTemplates] = useState<Record<string, AgentTemplate>>({});
   const [runningTopologyIds, setRunningTopologyIds] = useState<Set<string>>(new Set());
+  const [topologyDetails, setTopologyDetails] = useState<Record<string, Topology>>({});
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    if (replay.replayId) return; // don't poll live management data while a replay is loaded
     async function loadData() {
       try {
         const [assigns, tpls, containersResp] = await Promise.all([
@@ -164,9 +175,22 @@ export function AgentsPage() {
         ]);
         setAssignments(assigns);
         setTemplates(tpls.agents);
-        setRunningTopologyIds(
-          new Set(containersResp.containers.map((c: ContainerInfo) => c.topology_id).filter(Boolean))
+        const runningIds = new Set(containersResp.containers.map((c: ContainerInfo) => c.topology_id).filter(Boolean));
+        setRunningTopologyIds(runningIds);
+
+        // Fetch full topology details for running topologies so we can read guardrail_enabled per host.
+        const details: Record<string, Topology> = {};
+        await Promise.all(
+          Array.from(runningIds).map(async (tid) => {
+            try {
+              const topo = await api.getTopology(tid);
+              details[tid] = topo;
+            } catch (e) {
+              console.error(`Failed to load topology ${tid}`, e);
+            }
+          })
         );
+        setTopologyDetails(details);
       } catch (err) {
         console.error("Failed to load agent data", err);
       } finally {
@@ -176,9 +200,49 @@ export function AgentsPage() {
     loadData();
     const interval = setInterval(loadData, 10000);
     return () => clearInterval(interval);
-  }, []);
+  }, [replay.replayId]);
 
   const activeAssignments = assignments.filter(a => runningTopologyIds.has(a.topology_id));
+
+  // Map topology_id:host_id -> guarded status.
+  // guardrail_enabled undefined/null means auto-armed when a guarded agent (coder56/soc_god) is present.
+  const hostGuardedMap = useMemo(() => {
+    const map: Record<string, boolean> = {};
+    const guardedAgents = new Set<string>(['coder56', 'soc_god']);
+    Object.values(topologyDetails).forEach((topo) => {
+      (topo.networks || []).forEach((net) => {
+        (net.hosts || []).forEach((host: Host) => {
+          const hasGuarded = (host.agents || []).some((a) => guardedAgents.has(a));
+          const guardrailOn = host.guardrail_enabled ?? hasGuarded;
+          map[`${topo.id}:${host.id}`] = guardrailOn;
+        });
+      });
+    });
+    return map;
+  }, [topologyDetails]);
+
+  // Replay mode: show replayed agent activity synced to playback, instead of the live management UI.
+  if (replay.replayId) {
+    return (
+      <div className="flex h-full flex-col gap-6 overflow-auto">
+        <ReplayHeader title="Agents" subtitle="Agent execution" />
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-2 pb-6">
+          <ReplayAgentView
+            agentKey="coder56"
+            label="coder56"
+            desc="Red-team attacker — recon, exploitation, persistence"
+            color="text-red-700 dark:text-red-400"
+          />
+          <ReplayAgentView
+            agentKey="db_admin"
+            label="db_admin"
+            desc='Benign DBA persona "John Scott" — routine DB tasks'
+            color="text-green-700 dark:text-green-400"
+          />
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-full flex-col gap-6 overflow-auto">
@@ -207,6 +271,7 @@ export function AgentsPage() {
               key={a.id}
               assignment={a}
               template={templates[a.agent_type]}
+              isGuarded={hostGuardedMap[`${a.topology_id}:${a.host_id}`] ?? false}
             />
           ))}
         </div>

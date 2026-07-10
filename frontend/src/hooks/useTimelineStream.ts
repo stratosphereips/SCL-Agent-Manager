@@ -7,6 +7,7 @@ import { useReplayContext } from '@/contexts/ReplayContext';
 const AGENT_SOURCE_PATTERNS: Record<string, string[]> = {
   coder56: ['coder56/'],
   db_admin: ['benign_agent/db_admin'],
+  soc_god: ['soc_god/'],
 };
 
 /** Convert replay events to TimelineEntry format */

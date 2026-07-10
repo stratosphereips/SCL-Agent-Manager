@@ -8,10 +8,15 @@ import {
   Network,
   Search,
   Shield,
+  Play,
+  Pause,
+  SkipBack,
+  SkipForward,
+  X,
 } from 'lucide-react';
 import { ContainerStatusBar } from './ContainerStatusBar';
 import { ReplayProvider, useReplayContext } from '@/contexts/ReplayContext';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 
 const navItems = [
   { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
@@ -19,11 +24,280 @@ const navItems = [
   { to: '/topology', icon: Network, label: 'Topologies' },
   { to: '/discovery', icon: Search, label: 'Host Discovery' },
   { to: '/defender', icon: Shield, label: 'Defender' },
+  { to: '/replay', icon: Play, label: 'Replay' },
   { to: '/settings', icon: Settings, label: 'Settings' },
 ];
 
+// Replay Control Bar - shown on every page except /replay so playback keeps
+// running and stays controllable while the user navigates elsewhere.
+function ReplayControlBar() {
+  const { replay, controls, error } = useReplayContext();
+  const [showRunSelector, setShowRunSelector] = useState(false);
+  const [runs, setRuns] = useState<Array<{ run_id: string; path: string; is_current: boolean; created: string }>>([]);
+  const [loadingRuns, setLoadingRuns] = useState(false);
+  const [timeInput, setTimeInput] = useState('');
+  const [inputError, setInputError] = useState(false);
+  const [isUserEditing, setIsUserEditing] = useState(false);
+
+  const formatTime = useCallback((ms: number): string => {
+    if (ms < 0) ms = 0;
+    let displayMs = ms;
+    if (replay.startTimeMs > 0 && ms > 1000000000000) {  // Absolute timestamp detected
+      displayMs = ms - replay.startTimeMs;
+    }
+    const totalSeconds = Math.floor(displayMs / 1000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+
+    if (hours > 0) {
+      return `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+    }
+    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+  }, [replay.startTimeMs]);
+
+  useEffect(() => {
+    if (!isUserEditing) {
+      setTimeInput(formatTime(replay.positionMs));
+    }
+  }, [replay.positionMs, isUserEditing, formatTime]);
+
+  const fetchRuns = async () => {
+    setLoadingRuns(true);
+    try {
+      const res = await fetch('/api/replay/runs');
+      const data = await res.json();
+      setRuns(data.runs || []);
+    } catch (e) {
+      console.error('Failed to fetch runs', e);
+    } finally {
+      setLoadingRuns(false);
+    }
+  };
+
+  const handleLoadRun = (path: string, runId: string) => {
+    controls.loadReplay(path, runId);
+    setShowRunSelector(false);
+  };
+
+  const parseTimeToMs = useCallback((timeStr: string): number | null => {
+    if (!timeStr.trim()) return null;
+    let offsetMs = 0;
+    const secondsOnly = parseFloat(timeStr);
+    if (!isNaN(secondsOnly)) {
+      offsetMs = secondsOnly * 1000;
+    } else {
+      const parts = timeStr.split(':').map(p => parseInt(p, 10));
+      if (parts.length === 2 && parts.every(p => !isNaN(p))) {
+        const [mins, secs] = parts;
+        offsetMs = (mins * 60 + secs) * 1000;
+      } else if (parts.length === 3 && parts.every(p => !isNaN(p))) {
+        const [hrs, mins, secs] = parts;
+        offsetMs = (hrs * 3600 + mins * 60 + secs) * 1000;
+      } else {
+        return null;
+      }
+    }
+    const absoluteMs = replay.startTimeMs + offsetMs;
+    return Math.min(replay.startTimeMs + replay.durationMs, Math.max(replay.startTimeMs, absoluteMs));
+  }, [replay.startTimeMs, replay.durationMs]);
+
+  const handleTimeInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setIsUserEditing(true);
+    setTimeInput(e.target.value);
+    setInputError(false);
+  };
+
+  const handleTimeInputSubmit = () => {
+    const ms = parseTimeToMs(timeInput);
+    if (ms !== null) {
+      controls.seek(ms);
+      controls.play(replay.speed); // Auto-play when seeking via text input
+      setInputError(false);
+      setIsUserEditing(false);
+    } else {
+      setInputError(true);
+    }
+  };
+
+  const handleTimeInputBlur = () => {
+    setIsUserEditing(false);
+    setInputError(false);
+    setTimeInput(formatTime(replay.positionMs));
+  };
+
+  const handleTimeInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      handleTimeInputSubmit();
+    } else if (e.key === 'Escape') {
+      setIsUserEditing(false);
+      setInputError(false);
+      setTimeInput(formatTime(replay.positionMs));
+    }
+  };
+
+  // Idle: show a "Load Replay" button with a run selector
+  if (!replay.replayId) {
+    return (
+      <div className="border-t border-trident-border bg-trident-surface px-4 py-2">
+        <button
+          onClick={() => {
+            setShowRunSelector(!showRunSelector);
+            if (!showRunSelector && runs.length === 0) fetchRuns();
+          }}
+          className="flex items-center gap-2 text-sm text-trident-muted hover:text-trident-text transition-colors"
+        >
+          <Play size={14} />
+          Load Replay
+        </button>
+
+        {showRunSelector && (
+          <div className="mt-3 border border-trident-border rounded-lg bg-black/30 dark:bg-black/30 p-2 max-h-48 overflow-auto">
+            {loadingRuns ? (
+              <div className="text-xs text-trident-muted py-2">Loading runs...</div>
+            ) : runs.length === 0 ? (
+              <div className="text-xs text-trident-muted py-2">No runs found</div>
+            ) : (
+              runs.map((run) => (
+                <button
+                  key={run.run_id}
+                  onClick={() => handleLoadRun(run.path, run.run_id)}
+                  className="w-full text-left px-2 py-1 text-xs text-trident-text hover:bg-black/10 dark:hover:bg-white/10 rounded flex items-center justify-between"
+                >
+                  <span className="font-mono truncate">{run.run_id}</span>
+                  {run.is_current && <span className="text-[10px] text-trident-accent">current</span>}
+                </button>
+              ))
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // replay.positionMs is an ABSOLUTE epoch-ms; the slider/skip/progress work in
+  // an OFFSET from the run start, converting back to absolute on seek (matches
+  // the ReplayPage/TimelineControls convention).
+  const posOffset = Math.max(0, Math.min(replay.durationMs, replay.positionMs - replay.startTimeMs));
+  const progress = replay.durationMs > 0 ? (posOffset / replay.durationMs) * 100 : 0;
+
+  return (
+    <div className="border-t border-trident-border bg-trident-surface px-4 py-2">
+      <div className="flex items-center gap-3">
+        {/* Stop button */}
+        <button
+          onClick={controls.stop}
+          className="flex h-7 w-7 items-center justify-center rounded text-trident-muted hover:text-trident-text hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
+          title="Stop replay"
+        >
+          <X size={14} />
+        </button>
+
+        {/* Replay name + controls */}
+        <div className="flex-1 min-w-0">
+          <div className="text-xs font-mono text-trident-text truncate">{replay.replayId}</div>
+          <div className="flex items-center gap-2 mt-1">
+            {/* Play/Pause */}
+            <button
+              onClick={controls.togglePlay}
+              className="flex h-7 w-7 items-center justify-center rounded bg-trident-accent text-white hover:bg-trident-accent/80 transition-colors"
+              title={replay.isPlaying ? 'Pause' : 'Play'}
+            >
+              {replay.isPlaying ? <Pause size={12} /> : <Play size={12} />}
+            </button>
+
+            {/* Skip buttons */}
+            <button
+              onClick={() => controls.seek(replay.startTimeMs + Math.max(0, posOffset - 10000))}
+              className="flex h-6 w-6 items-center justify-center rounded text-trident-muted hover:text-trident-text hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
+              title="Back 10s"
+            >
+              <SkipBack size={12} />
+            </button>
+            <button
+              onClick={() => controls.seek(replay.startTimeMs + Math.min(replay.durationMs, posOffset + 10000))}
+              className="flex h-6 w-6 items-center justify-center rounded text-trident-muted hover:text-trident-text hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
+              title="Forward 10s"
+            >
+              <SkipForward size={12} />
+            </button>
+
+            {/* Timeline slider */}
+            <div className="flex-1">
+              <input
+                type="range"
+                min={0}
+                max={replay.durationMs}
+                value={posOffset}
+                onChange={(e) => controls.seek(replay.startTimeMs + Number(e.target.value))}
+                className="w-full h-1.5 bg-trident-border rounded-lg appearance-none cursor-pointer accent-trident-accent"
+                style={{
+                  background: `linear-gradient(to right, var(--trident-accent) ${progress}%, var(--trident-border) ${progress}%)`,
+                }}
+              />
+            </div>
+
+            {/* Speed selector */}
+            <select
+              value={replay.speed}
+              onChange={(e) => {
+                const newSpeed = Number(e.target.value);
+                controls.setSpeed(newSpeed);
+                if (replay.isPlaying) controls.play(newSpeed);
+              }}
+              className="px-1 py-0.5 text-xs bg-trident-bg border border-trident-border rounded text-trident-text focus:outline-none"
+            >
+              <option value={0.5}>0.5x</option>
+              <option value={1}>1x</option>
+              <option value={2}>2x</option>
+              <option value={5}>5x</option>
+              <option value={10}>10x</option>
+              <option value={25}>25x</option>
+              <option value={50}>50x</option>
+              <option value={100}>100x</option>
+            </select>
+
+            {/* Time display */}
+            <span className="text-xs font-mono text-trident-muted min-w-[70px] text-right">
+              {formatTime(replay.positionMs)} / {formatTime(replay.durationMs)}
+            </span>
+
+            {/* Time input */}
+            <div className="relative">
+              <input
+                type="text"
+                value={timeInput}
+                onChange={handleTimeInputChange}
+                onKeyDown={handleTimeInputKeyDown}
+                onBlur={handleTimeInputBlur}
+                placeholder="MM:SS"
+                className={`w-20 px-2 py-0.5 text-xs font-mono bg-trident-bg border rounded text-trident-text focus:outline-none ${
+                  inputError
+                    ? 'border-red-500 focus:border-red-500'
+                    : 'border-trident-border focus:border-trident-accent'
+                }`}
+                title="Enter time as MM:SS, HH:MM:SS, or seconds, then press Enter to jump and play"
+              />
+              {inputError && (
+                <span className="absolute -bottom-4 left-0 text-[9px] text-red-700 dark:text-red-400 whitespace-nowrap">
+                  Invalid time
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {error && (
+        <div className="mt-2 text-xs text-red-700 dark:text-red-400">{error}</div>
+      )}
+    </div>
+  );
+}
+
 function LayoutContent() {
   const location = useLocation();
+  const isReplayPage = location.pathname === '/replay';
 
   // Theme management
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
@@ -104,6 +378,9 @@ function LayoutContent() {
         <div className="flex-1 overflow-auto p-6">
           <Outlet />
         </div>
+
+        {/* Replay Control Bar - hidden on the Replay page (it has its own controls) */}
+        {!isReplayPage && <ReplayControlBar />}
       </main>
     </div>
   );

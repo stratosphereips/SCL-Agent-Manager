@@ -837,6 +837,417 @@ class MetricsResponse(BaseModel):
 
 
 # =============================================================================
+# Coder56 Pentest Console — human-in-the-loop guardrail + goal builder
+# =============================================================================
+# These models are the SINGLE contract shared by:
+#   - guardrail.ts (writes ApprovalReq JSON files, reads ApprovalDecision files)
+#   - backend/routers/coder56.py (REST surface for the standalone console)
+#   - the standalone React frontend (coder56-console/)
+# Field names must stay in lock-step across all three.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Per-phase orchestration (MITRE engagement chain)
+#
+# Defined before Criticality/LaunchRequest because LaunchRequest references
+# PhaseSpec/PhaseMode (annotations are evaluated eagerly at class-definition
+# time). A launch may carry a structured phase chain; when non-empty the run
+# executes ONE phase at a time (each phase = its own coder56 opencode session)
+# instead of sending the whole directive as a single prompt. The backend
+# phase-driver polls the active session's message stream to detect turn-end
+# (= phase completion), then auto-advances or pauses for operator review.
+# Empty `phases` => legacy single-shot.
+# -----------------------------------------------------------------------------
+
+class PhaseSpec(BaseModel):
+    """One operator-defined phase in the engagement chain.
+
+    `objective` is the primary, free-text input (what the operator wants this
+    phase to achieve). tactic_id/technique_ids are optional MITRE tags carried
+    through for catalog/guardrail context.
+    """
+    objective: str = Field(default="", description="Free-text objective for this phase")
+    tactic_id: str = Field(default="", description="Optional ATT&CK tactic ID, e.g. TA0043")
+    technique_ids: List[str] = Field(default_factory=list)
+    note: str = Field(default="", description="Optional operator note / detail")
+    tools: List[str] = Field(default_factory=list, description="Recommended tools for this phase")
+    checklist: List[str] = Field(default_factory=list, description="Goals/tasks checklist for this phase")
+
+
+class PhaseMode(str, Enum):
+    """How the run behaves at each phase boundary."""
+    AUTO_CONTINUE = "auto_continue"   # on phase completion, auto-start the next phase
+    REVIEW_EACH = "review_each"       # pause at every phase boundary for operator review
+
+
+class PhaseStatus(str, Enum):
+    """Lifecycle state of a single phase's execution."""
+    PENDING = "pending"
+    RUNNING = "running"
+    AWAITING_REVIEW = "awaiting_review"
+    COMPLETED = "completed"
+    TIMEOUT = "timeout"
+    FAILED = "failed"
+
+
+class Orchestration(str, Enum):
+    """How a phased run's phases are coordinated/executed.
+
+    BACKEND_SESSIONS (default): the agent-manager backend creates one fresh
+    coder56 opencode session per phase, injects prior-phase findings, and gates
+    between phases (the original, robust path — no regression).
+
+    NATIVE_SUBAGENTS: a single coder56_lead (primary) session coordinates the
+    engagement, spawning a coder56_phase subagent per phase via opencode's Task
+    tool. Subagents run in child sessions of the Lead and report back; the
+    backend watches the Lead session's Task-tool I/O to derive phase_runtime.
+    phase_mode (review_each / auto_continue) still governs whether the Lead
+    pauses between phases."""
+    BACKEND_SESSIONS = "backend_sessions"
+    NATIVE_SUBAGENTS = "native_subagents"
+
+
+
+class PhaseRuntime(BaseModel):
+    """Mutable per-phase execution state, persisted in the run manifest."""
+    index: int
+    status: PhaseStatus = PhaseStatus.PENDING
+    objective: str = ""
+    tactic_id: str = ""
+    technique_ids: List[str] = Field(default_factory=list)
+    session_id: str = ""
+    result: str = Field(default="", description="Captured phase summary (last assistant text)")
+    started_at: str = ""
+    completed_at: str = ""
+
+
+class AdvanceRequest(BaseModel):
+    """Operator action at a phase boundary (start the next phase)."""
+    revised_objective: Optional[str] = Field(default=None, description="Override the next phase's objective (review & correct)")
+    mode: Optional[PhaseMode] = Field(default=None, description="Optionally flip the run phase_mode too")
+
+
+class PhaseModeRequest(BaseModel):
+    mode: PhaseMode
+
+
+class Criticality(str, Enum):
+    """Operator-selected criticality for a coder56 pentest run.
+
+    Maps to the guardrail's runtime behavior via /outputs/<run_id>/guardrail/mode.txt:
+      low    -> pass-through (no judge, no approvals)
+      medium -> judge every command; auto-execute safe verdicts; PAUSE on
+                refuse/sanitize/escalate/parse-fail for operator review
+      high   -> judge for a recommendation, then PAUSE EVERY command for approval
+      auto   -> ACTIVE guardrail, FULLY AUTONOMOUS: judge every command and apply
+                the verdict with NO human in the loop — execute/sanitize run,
+                refuse/escalate/parse-fail refuse and return guardrail feedback.
+                No approvals are ever created (no HITL pause, no global halt).
+    """
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    AUTO = "auto"
+
+
+class MitreTechnique(BaseModel):
+    """A single ATT&CK technique/sub-technique in the goal-builder catalog."""
+    id: str = Field(..., description="ATT&CK technique ID, e.g. T1190 or T1110.001")
+    name: str
+    description: str = ""
+    typical_commands: List[str] = Field(default_factory=list)
+    scope_notes: str = Field(default="", description="In/out-of-scope guidance for the guardrail")
+
+
+class MitreTactic(BaseModel):
+    """An ATT&CC tactic in the goal-builder catalog."""
+    id: str = Field(..., description="ATT&CK tactic ID, e.g. TA0001")
+    name: str
+    phase: int = Field(..., description="Kill-chain ordering (1..n)")
+    description: str = ""
+    guidance: str = Field(default="", description="Phase-specific guidance for the agent")
+    techniques: List[MitreTechnique] = Field(default_factory=list)
+
+
+class MitrePhaseSelection(BaseModel):
+    """An operator-selected phase in the engagement chain."""
+    tactic_id: str
+    technique_ids: List[str] = Field(default_factory=list)
+    note: str = Field(default="", description="Operator free-text for this phase")
+    tools: List[str] = Field(default_factory=list, description="Recommended tools for this phase")
+    checklist: List[str] = Field(default_factory=list, description="Goals/tasks checklist for this phase")
+
+
+class GoalDraftRequest(BaseModel):
+    """Request an LLM-authored draft of a scoped engagement directive."""
+    objective: str = Field(..., description="Free-text operator objective")
+    target: str = Field(default="", description="Authorized target IP/CIDR/host")
+    rules_of_engagement: str = Field(default="", description="Optional RoE / constraints")
+    depth: str = Field(default="standard", description="brief | standard | thorough")
+
+
+class GoalCompileRequest(BaseModel):
+    """Compile a structured engagement into the directive string sent to coder56
+    AND forwarded to the guardrail goal (so the agent's plan and the scope-keeper's
+    authorized scope are identical)."""
+    objective: str
+    target: str = Field(default="")
+    rules_of_engagement: str = Field(default="")
+    phases: List[MitrePhaseSelection] = Field(default_factory=list)
+    stop_conditions: str = Field(default="")
+
+
+class GoalDirective(BaseModel):
+    """Compiled engagement directive + the structured view of it."""
+    directive: str = Field(..., description="The full text sent to coder56 + guardrail goal")
+    summary: str = Field(default="")
+
+
+class LaunchRequest(BaseModel):
+    """Launch a coder56 pentest run with a chosen criticality."""
+    # topology_id/host_id are REQUIRED for the SCL topology path, but OPTIONAL for
+    # an isolated launch (isolated=True) which spins up/reuses a standalone coder56
+    # sandbox with no topology and no host selection. See routers/coder56.py launch().
+    topology_id: Optional[str] = Field(default=None, description="Topology identifier (required unless isolated)")
+    host_id: Optional[str] = Field(default=None, description="Host identifier within network (required unless isolated)")
+    isolated: bool = Field(default=False, description="Topology-free launch into the persistent coder56 sandbox")
+    criticality: Criticality = Criticality.MEDIUM
+    directive: str = Field(..., description="Compiled engagement directive (the agent goal)")
+    timeout_seconds: int = Field(default=600, description="Initial-prompt sync timeout")
+    auto_start_topology: bool = Field(default=True, description="Start the topology if not running")
+    # Per-phase orchestration (optional). When non-empty the run executes one
+    # phase at a time (one coder56 session per phase) with a review gate between
+    # phases; the whole `directive` above is still written to goal.txt as the
+    # guardrail's authoritative engagement scope. Empty => legacy single-shot.
+    phases: List[PhaseSpec] = Field(default_factory=list)
+    phase_mode: PhaseMode = Field(default=PhaseMode.REVIEW_EACH)
+    # How phases are coordinated: backend-driven session-per-phase vs a single
+    # coder56_lead session that spawns coder56_phase subagents via the Task tool.
+    # P2-6: backend session-per-phase REMOVED — native_subagents is now the only
+    # active path (default forced + pinned at finalize). BACKEND_SESSIONS is kept
+    # only for back-compat with old manifests; the launch path no longer selects it.
+    # Only meaningful when `phases` is non-empty.
+    orchestration: Orchestration = Field(default=Orchestration.NATIVE_SUBAGENTS)
+    # Optional link to an Engagement (a grouped pentest project). When set, the
+    # run is registered under OUTPUTS_DIR/engagements/<engagement_id>.json and
+    # the run manifest carries engagement_id back so the UI can scope to it.
+    # Absent => a standalone (legacy) run, still listed under /api/coder56/runs.
+    engagement_id: Optional[str] = Field(default=None, description="Group this run under an Engagement")
+
+
+class LaunchResponse(BaseModel):
+    """Result of launching a run."""
+    run_id: str
+    session_id: str
+    container_id: str
+    topology_id: str
+    host_id: str
+    criticality: Criticality
+    message: str = Field(default="")
+
+
+class SandboxStatus(BaseModel):
+    """Status of the persistent isolated coder56 sandbox container.
+
+    The sandbox is a single long-lived coder56 container (no topology, no host
+    selection) reused across launches. One sandbox == one fixed RUN_ID, so each
+    isolated launch writes a fresh directive/mode + starts a new opencode session
+    into the same container (same reuse semantics as a long-lived topology host).
+    """
+    exists: bool
+    running: bool
+    container_id: str = Field(default="")
+    name: str = Field(default="")
+    run_id: str = Field(default="")
+    image: str = Field(default="")
+    created_at: str = Field(default="")
+    status_text: str = Field(default="missing")
+
+
+class ApprovalGuardrailVerdict(BaseModel):
+    """The guardrail judge's verdict on the command (the operator's recommendation)."""
+    decision: str = Field(default="", description="execute|refuse|sanitize|escalate")
+    reason: str = ""
+    feedback: str = ""
+    executed: bool = False
+    exit_code: int = 0
+
+
+class ApprovalReq(BaseModel):
+    """A pending/approval request written by guardrail.ts and surfaced to the operator."""
+    id: str
+    ts: str
+    run_id: str
+    session_id: str = ""
+    container_id: str = ""
+    command: str
+    profile: str = "coder56"
+    mode: str = Field(default="medium", description="low|medium|high")
+    trigger: str = Field(default="flagged", description="flagged|always")
+    guardrail_verdict: ApprovalGuardrailVerdict = Field(default_factory=ApprovalGuardrailVerdict)
+    goal: str = ""
+    trace: str = ""
+    parsed_via: str = Field(default="", description="How the verdict was parsed (json-fence|json-object|regex-fallback|none)")
+    failure_reason: str = Field(default="", description="Why the guardrail produced no/weak verdict (transport/parse failure)")
+    status: str = Field(default="pending", description="pending|decided|expired")
+    seq: int = 0
+    # Populated when a decision file exists:
+    decision: Optional["ApprovalDecision"] = None
+
+
+class ApprovalDecision(BaseModel):
+    """An operator decision written as <id>.dec.json for guardrail.ts to read."""
+    id: str
+    ts: str
+    action: str = Field(..., description="approve|reject|modify|guide")
+    modified_command: Optional[str] = None
+    feedback: Optional[str] = None
+    decided_by: str = "operator"
+    decided_ts: str = ""
+
+
+class DecideRequest(BaseModel):
+    """Operator decision on a pending approval."""
+    action: str = Field(..., description="approve|reject|modify|guide")
+    modified_command: Optional[str] = None
+    feedback: Optional[str] = None
+    run_id: Optional[str] = Field(default=None, description="If known, scopes the req lookup")
+
+
+class GuideRequest(BaseModel):
+    """A free-form operator follow-up prompt to the agent session."""
+    prompt: str
+
+
+# -----------------------------------------------------------------------------
+# Engagements + Findings (grouped executions + curated pentest report data)
+#
+# An Engagement is a pentest project: it groups many Runs (executions) and holds
+# a curated Findings list. The professional report is generated per Engagement.
+# These models use only primitives + plain-string ids (engagement_id,
+# discovered_via_run_id) so they carry NO forward references and can be defined
+# here after GuideRequest without disturbing the eager-eval ordering rule above.
+# Persisted as OUTPUTS_DIR/engagements/<engagement_id>.json (findings stored
+# inside the engagement JSON for atomic single-file writes + trivial reporting).
+# -----------------------------------------------------------------------------
+
+class EngagementStatus(str, Enum):
+    """Lifecycle state of an engagement."""
+    PLANNING = "planning"      # objective/scope being defined; no runs yet
+    ACTIVE = "active"          # runs in progress / being executed
+    REPORTING = "reporting"    # runs done; findings being curated
+    CLOSED = "closed"          # delivered / archived
+
+
+class Severity(str, Enum):
+    """Finding severity (ordered, critical -> info)."""
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    INFO = "info"
+
+
+class FindingStatus(str, Enum):
+    """Remediation status of a finding."""
+    OPEN = "open"
+    REMEDIATING = "remediating"
+    FIXED = "fixed"
+    ACCEPTED = "accepted"      # risk-accepted, won't fix
+
+
+class FindingCreate(BaseModel):
+    """Operator/LLM fields for a finding."""
+    title: str
+    severity: Severity = Severity.MEDIUM
+    cvss: Optional[float] = Field(default=None, description="Optional CVSS v3.1 base score 0.0-10.0")
+    affected_asset: str = Field(default="", description="Affected host/service/asset")
+    description: str = ""
+    impact: str = ""
+    evidence: str = Field(default="", description="Evidence (markdown): commands, output, run refs")
+    recommendation: str = Field(default="", description="Remediation guidance")
+    status: FindingStatus = FindingStatus.OPEN
+    discovered_via_run_id: Optional[str] = Field(default=None, description="Run the evidence came from")
+    # Verifier provenance: populated by the findings-draft pipeline from the
+    # agent's own verdict write-ups (coder56_verifier output). `verified` is True
+    # only when the verifier independently CONFIRMED the claim; `verifier_verdict`
+    # carries the verdict line (e.g. "CONFIRMED by coder56_verifier — OK TO
+    # REPORT: YES", or "NOT_A_VULN — false positive"); `commands` are the exact
+    # repro commands the verifier/agent used to prove the finding.
+    verified: bool = Field(default=False, description="Independently confirmed by the coder56_verifier subagent")
+    verifier_verdict: str = Field(default="", description="Verifier verdict line (CONFIRMED / NOT_A_VULN / refuted)")
+    commands: List[str] = Field(default_factory=list, description="Exact repro commands that prove the finding")
+
+
+# Defined BEFORE Engagement because Engagement.findings references Finding
+# (annotations are evaluated eagerly at class-definition time — no forward refs).
+class Finding(FindingCreate):
+    """A persisted finding within an engagement."""
+    id: str
+    engagement_id: str
+    created_at: str
+    updated_at: str
+
+
+class EngagementCreate(BaseModel):
+    """Operator fields for creating an engagement."""
+    name: str
+    client: str = Field(default="", description="Client / business unit")
+    target_scope: str = Field(default="", description="Authorized target scope (CIDR/host/app)")
+    objective: str = Field(default="", description="Engagement objective")
+    roe: str = Field(default="", description="Rules of engagement")
+    status: EngagementStatus = EngagementStatus.PLANNING
+
+
+class Engagement(EngagementCreate):
+    """A persisted engagement. `run_ids` links to run manifests; `findings` is
+    the curated list (kept in the same JSON for atomic writes)."""
+    id: str
+    created_at: str
+    updated_at: str
+    run_ids: List[str] = Field(default_factory=list)
+    findings: List[Finding] = Field(default_factory=list)
+
+
+class EngagementUpdate(BaseModel):
+    """PATCH fields for an engagement (all optional)."""
+    name: Optional[str] = None
+    client: Optional[str] = None
+    target_scope: Optional[str] = None
+    objective: Optional[str] = None
+    roe: Optional[str] = None
+    status: Optional[EngagementStatus] = None
+
+
+class FindingUpdate(BaseModel):
+    """PATCH fields for a finding (all optional)."""
+    title: Optional[str] = None
+    severity: Optional[Severity] = None
+    cvss: Optional[float] = None
+    affected_asset: Optional[str] = None
+    description: Optional[str] = None
+    impact: Optional[str] = None
+    evidence: Optional[str] = None
+    recommendation: Optional[str] = None
+    status: Optional[FindingStatus] = None
+    discovered_via_run_id: Optional[str] = None
+    verified: Optional[bool] = None
+    verifier_verdict: Optional[str] = None
+    commands: Optional[List[str]] = None
+
+
+class AddRunRequest(BaseModel):
+    """Link an existing run to an engagement."""
+    run_id: str
+
+
+class FindingsDraftRequest(BaseModel):
+    """Ask the LLM to draft findings from an engagement's on-disk run artifacts."""
+    engagement_id: str
+
+
+# =============================================================================
 # Forward references for circular dependencies
 # =============================================================================
 NetworkInfo.update_forward_refs()
+ApprovalReq.update_forward_refs()

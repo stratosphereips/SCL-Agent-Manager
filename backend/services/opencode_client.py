@@ -963,6 +963,68 @@ async def list_sessions_async(
     return result
 
 
+async def list_session_objects_async(
+    host: str = None,
+    port: int = None,
+    timeout: int = DEFAULT_OPENCODE_TIMEOUT
+) -> Dict[str, Any]:
+    """Async GET /session — full session objects (incl. parentID, agent, time).
+
+    Unlike list_sessions_async (which hits /session/status and returns only
+    {id: {type}}), this returns the rich session list opencode exposes, where
+    each child/subagent session carries a `parentID` pointing at the session
+    that spawned it via the Task tool. Used to discover a running subagent's
+    session id before its parent's task-tool output is populated.
+
+    Returns:
+        Dictionary with:
+            - success (bool)
+            - sessions (list): full session objects
+            - session_count (int)
+            - error (str, optional)
+    """
+    base_url = _get_base_url(host, port)
+    list_url = _build_endpoint(base_url, OPENCODE_SESSION_ENDPOINT)
+
+    result = {
+        "success": False,
+        "sessions": [],
+        "session_count": 0,
+        "error": None,
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                list_url,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+                headers={"Accept": "application/json"},
+            ) as response:
+                if response.status == 200:
+                    try:
+                        data = await response.json()
+                        sessions = data if isinstance(data, list) else []
+                        result["sessions"] = sessions
+                        result["session_count"] = len(sessions)
+                        result["success"] = True
+                    except (json.JSONDecodeError, ValueError):
+                        result["error"] = "Invalid JSON response"
+                else:
+                    text = await response.text()
+                    result["error"] = f"HTTP {response.status}: {text[:200]}"
+
+    except asyncio.TimeoutError:
+        result["error"] = f"Request timed out after {timeout}s"
+
+    except aiohttp.ClientConnectorError as e:
+        result["error"] = f"Connection failed: {str(e)[:200]}"
+
+    except Exception as e:
+        result["error"] = f"Unexpected error: {str(e)[:200]}"
+
+    return result
+
+
 # =============================================================================
 # Log Streaming Functions (WebSocket)
 # =============================================================================

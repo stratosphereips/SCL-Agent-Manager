@@ -71,22 +71,31 @@ from ..models import (
     GoalDirective,
     GoalDraftRequest,
     GuideRequest,
+    JudgeFailRequest,
     LaunchRequest,
     LaunchResponse,
+    MitrePhaseSelection,
     Orchestration,
+    OwaspPlanRequest,
     PhaseMode,
     PhaseModeRequest,
     PhaseRuntime,
     PhaseSpec,
     PhaseStatus,
+    PlannedPhaseDraftRequest,
+    PlannedRun,
+    PlannedRunStatus,
+    PlannedRunUpdate,
     SandboxStatus,
     Severity,
     SessionCreateRequest,
 )
 from ..services.session_capture import OUTPUTS_DIR, resolve_run_id
 from ..services.mitre_catalog import catalog as mitre_catalog
-from ..services.report_renderer import render_report
+from ..services.owasp_catalog import catalog as owasp_catalog
+from ..services.report_renderer import render_report, render_client_report
 from ..services.docker_client import create_docker_client
+from ..services.engagement_metrics import build_engagement_metrics
 from .topologies import fetch_from_topology_plugin, post_to_topology_plugin
 
 logger = logging.getLogger(__name__)
@@ -94,6 +103,16 @@ router = APIRouter(prefix="/api/coder56", tags=["coder56"])
 
 POLL_JOB_INTERVAL_S = 2.0
 POLL_JOB_TIMEOUT_S = 300.0
+_engagement_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _engagement_lock(engagement_id: str) -> asyncio.Lock:
+    """Serialize read-modify-write cycles for one engagement ledger."""
+    lock = _engagement_locks.get(engagement_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _engagement_locks[engagement_id] = lock
+    return lock
 
 # Drafting an engagement plan can require a long inference queue on the shared
 # provider.  Four minutes was not enough during normal provider load and caused
@@ -112,6 +131,39 @@ except ValueError:
 
 def _guardrail_dir(run_id: str) -> Path:
     return OUTPUTS_DIR / run_id / "guardrail"
+
+
+def _allocate_run_id(topology_id: str) -> str:
+    """Allocate a launch-scoped id.
+
+    A topology/container can host many OpenCode sessions concurrently.  Using
+    the container's fixed RUN_ID made simultaneous launches overwrite the same
+    manifest and guardrail files.  A timestamp plus random suffix keeps the
+    familiar topology prefix while making every launch independent.
+    """
+    base = re.sub(r"[^A-Za-z0-9_.-]+", "-", topology_id or "isolated").strip("-.")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    for _ in range(10):
+        candidate = f"{base}-{stamp}-{uuid.uuid4().hex[:8]}"
+        if not (OUTPUTS_DIR / candidate).exists():
+            return candidate
+    raise HTTPException(status_code=503, detail="Could not allocate a unique run id")
+
+
+def _register_session_run(session_id: str, run_id: str) -> None:
+    """Persist the root OpenCode-session -> launch mapping for the guardrail.
+
+    Child phase/verifier sessions inherit this mapping through OpenCode's
+    parentID chain, so all commands from one logical run use that run's own
+    goal, mode, approvals, verdicts, and RUN_ID environment.
+    """
+    _valid_token(session_id, "session_id")
+    _valid_token(run_id, "run_id")
+    _atomic_write(OUTPUTS_DIR / ".session-runs" / f"{session_id}.json", {
+        "session_id": session_id,
+        "run_id": run_id,
+        "registered_at": _now_iso(),
+    })
 
 
 def _approvals_dir(run_id: str) -> Path:
@@ -246,6 +298,46 @@ def _sort_findings(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                                            f.get("title", "")))
 
 
+def _run_overall_status(meta: Dict[str, Any]) -> str:
+    """Derive the user-facing lifecycle from durable manifest state."""
+    if not meta.get("accepted"):
+        return "awaiting_accept"
+    runtime = meta.get("phase_runtime") or []
+    if runtime:
+        statuses = [str(p.get("status") or "") for p in runtime]
+        if statuses and all(status == PhaseStatus.COMPLETED.value for status in statuses):
+            return "completed"
+        if any(status == PhaseStatus.AWAITING_REVIEW.value for status in statuses):
+            return "awaiting_review"
+    return "running"
+
+
+async def _reconcile_planned_run_statuses(engagement_id: str) -> Optional[Dict[str, Any]]:
+    """Persist OWASP `done` when its linked run has durably completed.
+
+    This is intentionally restart-safe: the GET engagement path can repair a
+    ledger even if the backend restarted between the final phase and the driver's
+    completion hook.
+    """
+    async with _engagement_lock(engagement_id):
+        eng = _read_engagement(engagement_id)
+        if not eng:
+            return None
+        changed = False
+        for planned in eng.get("plan") or []:
+            if planned.get("status") != PlannedRunStatus.RUNNING.value:
+                continue
+            run_id = planned.get("run_id") or ""
+            meta = _read_run_meta(run_id) if run_id else {}
+            if meta and _run_overall_status(meta) == "completed":
+                planned["status"] = PlannedRunStatus.DONE.value
+                changed = True
+        if changed:
+            eng["updated_at"] = _now_iso()
+            _write_engagement(engagement_id, eng)
+        return eng
+
+
 def _engagement_detail(eng: Dict[str, Any]) -> Dict[str, Any]:
     """Augment an engagement dict with its runs' manifests (for detail/report)."""
     runs: List[Dict[str, Any]] = []
@@ -255,6 +347,7 @@ def _engagement_detail(eng: Dict[str, Any]) -> Dict[str, Any]:
             # Guarantee a run_id (some older manifests omit it); fall back to the
             # linked id so the UI/report always have a stable identifier.
             meta.setdefault("run_id", rid)
+            meta["status"] = _run_overall_status(meta)
             runs.append(meta)
     eng = dict(eng)
     eng["findings"] = _sort_findings(eng.get("findings") or [])
@@ -299,8 +392,11 @@ def _memory_seed_header(eng: Dict[str, Any]) -> str:
     lines += [
         "",
         "_Shared long-term notebook across ALL runs and phases of this "
-        "engagement. APPEND ONLY (`>>`); never edit or delete prior entries. "
-        "Terse and factual; tag each entry with the target/host._",
+        "engagement. This is the authoritative memory and live coordination bus: "
+        "trust established facts, execute only missing deltas, and use "
+        "`[CLAIMED]`/`[DONE]` work ids to prevent parallel duplication. APPEND "
+        "ONLY (`>>`); never edit or delete prior entries. Write broadly useful "
+        "discoveries immediately, tersely, with target/host and evidence paths._",
         "",
         "<!-- New entries appended below by agents (dated, ISO-UTC). -->",
         "",
@@ -491,6 +587,51 @@ async def _fix_egress(container_id: str) -> str:
     except Exception as exc:
         logger.warning("fix_egress[%s] failed: %s", container_id[:24], exc)
         return ""
+
+
+async def _snapshot_opencode_db(run_id: str) -> None:
+    """Persist the run's ephemeral opencode.db (agent transcripts + per-session
+    token totals) to OUTPUTS_DIR/<run_id>/opencode.db so it survives host/
+    container recreate. Only /outputs is mounted into the run container, so the
+    in-container opencode.db is otherwise lost the moment the host is recreated.
+
+    Best-effort: called on every lead-driver exit (phase review-gate, auto-
+    continue completion, stall/timeout); never raises. Uses `sqlite3 .backup`
+    inside the container for a consistent online snapshot of the live (possibly
+    WAL-open) database. run_id is _valid_token-validated (no shell metachars)."""
+    try:
+        meta = _read_run_meta(run_id)
+        container_id = meta.get("container_id", "")
+        if not container_id:
+            return
+        dst_dir = OUTPUTS_DIR / run_id
+        script = (
+            "set -e; "
+            "DST='/outputs/" + run_id + "'; "
+            "mkdir -p \"$DST\"; "
+            "SRC=/root/.local/share/opencode/opencode.db; "
+            "if [ -f \"$SRC\" ]; then "
+            "  sqlite3 \"$SRC\" \".backup '$DST/opencode.db'\" && echo SNAP_OK; "
+            "else echo SNAP_NODB; fi"
+        )
+        async with create_docker_client() as docker_client:
+            container = await docker_client.docker.containers.get(container_id)
+            exec_inst = await container.exec(cmd=["sh", "-c", script], stdout=True, stderr=True)
+            out = b""
+            async with exec_inst.start(detach=False) as stream:
+                while True:
+                    msg = await stream.read_out()
+                    if msg is None:
+                        break
+                    out += msg.data if isinstance(msg.data, bytes) else str(msg.data).encode()
+        text = out.decode("utf-8", "replace").strip()
+        last = text.splitlines()[-1] if text else ""
+        if last == "SNAP_OK":
+            logger.info("snapshot_opencode_db[%s]: saved -> %s", run_id, dst_dir / "opencode.db")
+        else:
+            logger.warning("snapshot_opencode_db[%s]: %s", run_id, text or "(no output)")
+    except Exception as exc:
+        logger.warning("snapshot_opencode_db[%s] failed: %s", run_id, exc)
 
 
 # =============================================================================
@@ -720,13 +861,15 @@ async def _finalize_run(req: LaunchRequest, container_id: str, *, topology_id: s
     """Shared launch tail (SCL-independent): wait for opencode, fix egress, write
     mode.txt/goal.txt, create the coder56 session, write the run manifest, and link
     the engagement. Both the topology path and the isolated sandbox path resolve a
-    container_id then call this; run_id is resolved from the live container."""
+    container_id then call this.  The container RUN_ID is only a legacy fallback;
+    every launch receives its own id so multiple sessions on one host cannot
+    overwrite each other's state."""
     await _wait_opencode_ready(container_id)
     # Best-effort egress fix. Topology hosts route via a no-egress gw and need this;
     # the sandbox on scl-playground-net already has NAT egress, so it's a no-op there.
     await _fix_egress(container_id)
 
-    run_id = await resolve_run_id(container_id)
+    run_id = _allocate_run_id(topology_id)
 
     # mode.txt + goal.txt BEFORE create_session so both precede the agent's first
     # bash call. Written DIRECTLY to the resolved run_id (not via helpers that
@@ -735,6 +878,11 @@ async def _finalize_run(req: LaunchRequest, container_id: str, *, topology_id: s
     mode_dir = _guardrail_dir(run_id)
     mode_dir.mkdir(parents=True, exist_ok=True)
     (mode_dir / "mode.txt").write_text(req.criticality.value, encoding="utf-8")
+    # Judge-unavailable fallback (default "escalate" = hold for operator review).
+    # Live-toggleable per run via PATCH /runs/{run_id}/judge-fail; the guardrail
+    # reads it fresh every command alongside mode.txt, so a console flip takes
+    # effect immediately without recreating the host.
+    (mode_dir / "judge_fail.txt").write_text("escalate", encoding="utf-8")
     (mode_dir / "goal.txt").write_text(
         f"\n--- directive ---\n{req.directive.strip()}\n", encoding="utf-8"
     )
@@ -761,6 +909,13 @@ async def _finalize_run(req: LaunchRequest, container_id: str, *, topology_id: s
     if not create_res.get("success"):
         raise HTTPException(status_code=502, detail=f"Failed to create OpenCode session: {create_res.get('error')}")
     session_id = create_res.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=502, detail="OpenCode created a session without an id")
+
+    # Must exist before /accept can send the first prompt.  The guardrail resolves
+    # this root mapping (and follows parentID for phase/verifier children) before
+    # it handles the session's first bash call.
+    _register_session_run(session_id, run_id)
 
     # Register in the state manager (best-effort) so /api/sessions sees it too.
     try:
@@ -782,6 +937,9 @@ async def _finalize_run(req: LaunchRequest, container_id: str, *, topology_id: s
         "host_id": host_id,
         "isolated": isolated,
         "criticality": req.criticality.value,
+        # Guardrail judge-unavailable fallback (live-toggled via judge_fail.txt;
+        # mirrored here so the console can display the current value).
+        "judge_fail": "escalate",
         "launched_at": _now_iso(),
         "directive": req.directive,
         "accepted": False,
@@ -809,12 +967,13 @@ async def _finalize_run(req: LaunchRequest, container_id: str, *, topology_id: s
 
     # Register the run under its engagement (if any): append run_id to run_ids.
     if req.engagement_id:
-        eng = _read_engagement(req.engagement_id)
-        if eng:
-            if run_id not in (eng.get("run_ids") or []):
-                eng["run_ids"] = (eng.get("run_ids") or []) + [run_id]
-                eng["updated_at"] = _now_iso()
-                _write_engagement(req.engagement_id, eng)
+        async with _engagement_lock(req.engagement_id):
+            eng = _read_engagement(req.engagement_id)
+            if eng:
+                if run_id not in (eng.get("run_ids") or []):
+                    eng["run_ids"] = (eng.get("run_ids") or []) + [run_id]
+                    eng["updated_at"] = _now_iso()
+                    _write_engagement(req.engagement_id, eng)
 
     return LaunchResponse(
         run_id=run_id,
@@ -1272,6 +1431,37 @@ async def guide(run_id: str, req: GuideRequest) -> Dict[str, Any]:
             "session_id": session_id, "error": res.get("error")}
 
 
+@router.patch("/runs/{run_id}/judge-fail")
+async def set_judge_fail(run_id: str, req: JudgeFailRequest) -> Dict[str, Any]:
+    """Live-toggle the guardrail's judge-unavailable fallback for a run.
+
+    Controls what happens when the guardrail JUDGE itself can't produce a verdict
+    (http 0 / timeout / parse-fail / exception — verdict === null):
+      - "escalate" (default, fail-safe): hold the command for operator review.
+      - "allow": execute the command instead of stalling on judge downtime.
+    Written to /outputs/<run_id>/guardrail/judge_fail.txt and read fresh every
+    command by the guardrail, so a console flip takes effect on the agent's next
+    bash call — no host recreate. Applies ONLY to the judge-unreachable case; a
+    genuine refuse/escalate verdict is never overridden.
+    """
+    _valid_token(run_id, "run_id")
+    value = (req.value or "").strip().lower()
+    if value not in ("allow", "escalate"):
+        raise HTTPException(status_code=400, detail="value must be 'allow' or 'escalate'")
+    gdir = _guardrail_dir(run_id)
+    gdir.mkdir(parents=True, exist_ok=True)
+    (gdir / "judge_fail.txt").write_text(value, encoding="utf-8")
+    # Mirror into the run manifest so the console reflects the current value.
+    meta = _read_run_meta(run_id)
+    if meta:
+        meta["judge_fail"] = value
+        try:
+            _atomic_write(_run_meta_path(run_id), meta)
+        except Exception:
+            pass
+    return {"run_id": run_id, "judge_fail": value}
+
+
 # =============================================================================
 # Per-phase orchestration
 #
@@ -1421,7 +1611,9 @@ def _compile_phase_directive(full_directive: str, phase_index: int, total: int,
     produced nothing), the accumulated results of completed phases are injected so
     this phase builds on established facts instead of re-discovering them. The
     agent is told to work ONLY this phase and to end with a sentinel marker the
-    driver watches."""
+    driver watches. Earlier phase prose is copied into later phase prompts as an
+    explicit handoff; shared engagement memory remains the authoritative durable
+    record and parallel-work bus."""
     prior_block = ""
     if prior_findings:
         chunks = []
@@ -1432,8 +1624,9 @@ def _compile_phase_directive(full_directive: str, phase_index: int, total: int,
         if chunks:
             prior_block = (
                 "\nPRIOR PHASE FINDINGS (accumulated results reported by earlier phases of "
-                "THIS engagement — these are facts already established; rely on them and do "
-                "NOT repeat the work that produced them):\n\n"
+                "THIS engagement — these are established facts; rely on them and do NOT "
+                "repeat the work that produced them). They complement the authoritative "
+                "shared memory at /outputs/$RUN_ID/memory/MEMORY.md:\n\n"
                 + "\n\n".join(chunks) + "\n\n"
             )
     return (
@@ -1444,9 +1637,18 @@ def _compile_phase_directive(full_directive: str, phase_index: int, total: int,
         f"{prior_block}"
         "THIS PHASE'S OBJECTIVE:\n"
         f"{objective.strip()}\n\n"
+        "MEMORY-FIRST EXECUTION CONTRACT:\n"
+        "1. Before any other action, read /outputs/$RUN_ID/memory/MEMORY.md.\n"
+        "2. Trust established facts, negative results, artifacts, and verifier-confirmed "
+        "fingerprints. Derive KNOWN / GAPS / DELTA and execute only DELTA.\n"
+        "3. Do not repeat recon, route/role/session baselines, failed tests, tool installs, "
+        "or a verified fingerprint. Re-run only for an explicit operator request, direct "
+        "contradiction, or a volatile prerequisite; append RERUN_REASON.\n"
+        "4. Memory is the live parallel-work bus. Before a substantial branch, reread its "
+        "tail and use [CLAIMED] WORK_ID / [DONE] WORK_ID. Append any information useful to "
+        "another pentest phase immediately, not only at phase end.\n\n"
         "Work ONLY this phase's objective within the authorized scope above. Do not begin "
-        "any later phase; build on the PRIOR PHASE FINDINGS above (if any) rather than "
-        "re-doing them. When this phase's objective is met (or you cannot progress), write "
+        "any later phase. When this phase's objective is met (or you cannot progress), write "
         "a concise PHASE SUMMARY of what you found / achieved, then end your message with "
         "this exact marker on its own line:\n"
         f"{PHASE_DONE_SENTINEL}\n"
@@ -1891,10 +2093,15 @@ def _compile_lead_directive(meta: Dict[str, Any]) -> str:
         f"{pacing}\n\n"
         "For each phase:\n"
         "1. Call the task tool with subagentType 'coder56_phase'. The task prompt MUST include: the "
-        "PHASE OBJECTIVE, the AUTHORIZED SCOPE (verbatim from the directive above), and the "
-        "accumulated PRIOR PHASE FINDINGS (facts from earlier phases) so the subagent builds on "
-        "them rather than re-doing earlier work.\n"
-        "2. When the subagent reports back, record a concise summary of that phase's finding.\n"
+        "PHASE OBJECTIVE, the AUTHORIZED SCOPE (verbatim from the directive above), recommended "
+        "tools/checklist, the accumulated PRIOR PHASE FINDINGS in full, and this exact contract: "
+        "`MEMORY FIRST: read "
+        "/outputs/$RUN_ID/memory/MEMORY.md before any other action; trust established records; "
+        "coordinate through [CLAIMED]/[DONE]; execute only the phase-specific delta; append every "
+        "broadly useful discovery immediately.` The explicit prior summaries and shared memory "
+        "are complementary handoffs; neither authorizes repeating established work.\n"
+        "2. When the subagent reports back, record only a concise summary of the NEW DELTA; do "
+        "not restate inherited memory facts as new findings.\n"
         "3. Follow the PACING rule above.\n"
         "=== END ==="
     )
@@ -1916,7 +2123,7 @@ async def _graceful_finalize_session(session_id: str, addr: str, timeout_s: int 
             prompt=(
                 "ENGAGEMENT TIME BUDGET EXPIRED — wrap up NOW in one short turn. Emit your final "
                 "structured report (WHAT YOU DID / WHAT YOU FOUND / NEXT STEP). If you are verifying "
-                "or mid-verification, FIRST append your VERDICT record to /outputs/verifier/<slug>.jsonl "
+                "or mid-verification, FIRST append your VERDICT record to /outputs/$RUN_ID/verifier/<slug>.jsonl "
                 "(step j) and emit the === VERIFIER VERDICT === block. Do not start new commands — "
                 "summarize from what you already have, then stop."
             ),
@@ -1934,6 +2141,26 @@ def _arm_lead_driver(run_id: str) -> None:
     _lead_drivers[run_id] = asyncio.create_task(_lead_driver(run_id))
 
 
+def _lead_needs_auto_resume(*, mode: str, pending_tool: bool,
+                            lead_turn_complete: bool, n_completed: int,
+                            n_tasks: int, n_phases: int) -> bool:
+    """Return True when AUTO mode has an idle Lead stranded at a phase boundary.
+
+    This can happen when the operator flips REVIEW -> AUTO after acceptance: the
+    immutable Lead prompt still contains REVIEW pacing, so the Lead stops after
+    its current phase even though run.json now says AUTO. The driver must resume
+    that idle Lead explicitly instead of waiting for the stall watchdog.
+    """
+    return (
+        mode == PhaseMode.AUTO_CONTINUE.value
+        and not pending_tool
+        and lead_turn_complete
+        and n_completed >= 1
+        and n_completed == n_tasks
+        and n_tasks < n_phases
+    )
+
+
 async def _lead_driver(run_id: str) -> None:
     """Watch the coder56_lead session: derive phase_runtime from its coder56_phase
     task-tool calls and gate between phases per phase_mode. Mirrors _phase_driver
@@ -1942,7 +2169,11 @@ async def _lead_driver(run_id: str) -> None:
     phase was gated for review, the run finished, or it was stopped)."""
     try:
         from ..services.container_addr import get_container_address
-        from ..services.opencode_client import _ensure_network_connectivity, get_session_messages_async
+        from ..services.opencode_client import (
+            _ensure_network_connectivity,
+            get_session_messages_async,
+            send_prompt_async,
+        )
         meta = _read_run_meta(run_id)
         container_id = meta.get("container_id", "")
         if not container_id:
@@ -1958,6 +2189,7 @@ async def _lead_driver(run_id: str) -> None:
     prev_n_completed = -1
     prev_n_tasks = -1
     gated_through = -1  # highest phase index already gated to awaiting_review
+    auto_resumed_after = -1  # completion count already nudged in this driver
 
     while True:
         try:
@@ -1980,6 +2212,7 @@ async def _lead_driver(run_id: str) -> None:
             tasks: List[tuple] = []
             final_text = ""
             pending_tool = False
+            lead_turn_complete = False
             for m in msgs:
                 for p in (m.get("parts") or []):
                     if not isinstance(p, dict):
@@ -1993,7 +2226,13 @@ async def _lead_driver(run_id: str) -> None:
                             parsed = _parse_lead_task(st)
                             if parsed:
                                 tasks.append((parsed, status))
-                if ((m.get("info") or {}).get("role") or m.get("role")) == "assistant":
+                info = m.get("info") or {}
+                if (info.get("role") or m.get("role")) == "assistant":
+                    # Reassigned for every assistant message, leaving the value
+                    # from the latest one. A completed turn with no pending tool
+                    # is a genuine idle boundary, not a brief gap mid-response.
+                    mtime = info.get("time") or m.get("time") or {}
+                    lead_turn_complete = bool(mtime.get("completed") or mtime.get("end"))
                     for p in (m.get("parts") or []):
                         if isinstance(p, dict) and p.get("type") == "text" and (p.get("text") or "").strip():
                             final_text = p.get("text")
@@ -2033,6 +2272,15 @@ async def _lead_driver(run_id: str) -> None:
                     if obj:
                         entry["objective"] = obj
                     entry["completed_at"] = entry.get("completed_at") or _now_iso()
+                    changed = True
+                if (
+                    mode == PhaseMode.AUTO_CONTINUE.value
+                    and entry.get("status") != PhaseStatus.COMPLETED.value
+                ):
+                    # In AUTO mode a returned task is a completed phase even
+                    # while the Lead moves on. Keeping it "running" makes the UI
+                    # and /guide target the previous child during the next phase.
+                    entry["status"] = PhaseStatus.COMPLETED.value
                     changed = True
 
             n_completed = sum(1 for _, s in tasks if s == "completed")
@@ -2085,8 +2333,8 @@ async def _lead_driver(run_id: str) -> None:
                     if 0 <= gate_idx < len(rt) and rt[gate_idx].get("status") not in (PhaseStatus.AWAITING_REVIEW.value, PhaseStatus.COMPLETED.value):
                         rt[gate_idx]["status"] = PhaseStatus.AWAITING_REVIEW.value
                         prev = rt[gate_idx].get("result", "")
-                        rt[gate_idx]["result"] = (prev + "\n[phase finalized under time budget — partial result; full findings in /outputs/agent-memory/MEMORY.md, verifier verdicts in /outputs/verifier/]").strip() \
-                            if prev else f"[phase finalized under time budget — partial result; full findings in {_run_memory_path(run_id)}, verifier verdicts in /outputs/verifier/]"
+                        rt[gate_idx]["result"] = (prev + "\n[phase finalized under time budget — partial result; full findings in /outputs/agent-memory/MEMORY.md, verifier verdicts in /outputs/$RUN_ID/verifier/]").strip() \
+                            if prev else f"[phase finalized under time budget — partial result; full findings in {_run_memory_path(run_id)}, verifier verdicts in /outputs/$RUN_ID/verifier/]"
                     gated_through = gate_idx
                     gated_now = True
                     changed = True
@@ -2098,12 +2346,51 @@ async def _lead_driver(run_id: str) -> None:
                             rt[i]["status"] = PhaseStatus.COMPLETED.value
                     changed = True
                     done = True
+                elif _lead_needs_auto_resume(
+                    mode=mode,
+                    pending_tool=pending_tool,
+                    lead_turn_complete=lead_turn_complete,
+                    n_completed=n_completed,
+                    n_tasks=len(tasks),
+                    n_phases=len(phases),
+                ) and auto_resumed_after != n_completed:
+                    # AUTO may have been selected after accept, while the Lead's
+                    # original prompt still says REVIEW. Override that stale
+                    # pacing instruction at the first idle phase boundary.
+                    next_phase = n_completed + 1
+                    sres = await send_prompt_async(
+                        session_id=lead_sess,
+                        prompt=(
+                            "Runtime pacing is now AUTO_CONTINUE. This explicitly overrides any "
+                            "earlier REVIEW/stop-at-boundary instruction. "
+                            f"Phase {n_completed} is complete; proceed to phase {next_phase} now: "
+                            "spawn its coder56_phase subagent, record the findings, and continue "
+                            "all remaining phases back-to-back without waiting for operator review."
+                        ),
+                        host=addr,
+                        port=4096,
+                        agent="coder56_lead",
+                        async_mode=True,
+                        timeout=30,
+                    )
+                    if sres.get("success"):
+                        auto_resumed_after = n_completed
+                        last_progress = time.time()
+                        logger.info(
+                            "lead_driver[%s] resumed idle Lead for AUTO phase %d",
+                            run_id, next_phase,
+                        )
+                    else:
+                        logger.warning(
+                            "lead_driver[%s] AUTO resume failed after phase %d: %s",
+                            run_id, n_completed, sres.get("error"),
+                        )
                 elif stalled or hard_cap:
                     if 0 <= gate_idx < len(rt) and rt[gate_idx].get("status") not in (PhaseStatus.AWAITING_REVIEW.value, PhaseStatus.COMPLETED.value):
                         rt[gate_idx]["status"] = PhaseStatus.AWAITING_REVIEW.value
                         prev = rt[gate_idx].get("result", "")
-                        rt[gate_idx]["result"] = (prev + "\n[phase finalized under time budget — partial result; full findings in /outputs/agent-memory/MEMORY.md, verifier verdicts in /outputs/verifier/]").strip() \
-                            if prev else f"[phase finalized under time budget — partial result; full findings in {_run_memory_path(run_id)}, verifier verdicts in /outputs/verifier/]"
+                        rt[gate_idx]["result"] = (prev + "\n[phase finalized under time budget — partial result; full findings in /outputs/agent-memory/MEMORY.md, verifier verdicts in /outputs/$RUN_ID/verifier/]").strip() \
+                            if prev else f"[phase finalized under time budget — partial result; full findings in {_run_memory_path(run_id)}, verifier verdicts in /outputs/$RUN_ID/verifier/]"
                     gated_now = True
                     changed = True
                     done = True
@@ -2112,6 +2399,11 @@ async def _lead_driver(run_id: str) -> None:
                 meta["phase_runtime"] = rt
                 if gated_now and gate_idx >= 0:
                     meta["current_phase"] = gate_idx
+                elif any(e.get("status") == PhaseStatus.RUNNING.value for e in rt):
+                    meta["current_phase"] = max(
+                        i for i, e in enumerate(rt)
+                        if e.get("status") == PhaseStatus.RUNNING.value
+                    )
                 elif n_completed:
                     meta["current_phase"] = n_completed - 1
                 else:
@@ -2129,6 +2421,12 @@ async def _lead_driver(run_id: str) -> None:
             await asyncio.sleep(PHASE_POLL_S * 2)
             continue
 
+    # The driver only exits at a phase boundary / run end / stall, so this is the
+    # "run finished (for now)" hook: snapshot the ephemeral opencode.db (agent
+    # transcripts + token totals) to /outputs/<run_id>/ before the host can be
+    # recreated and lose it. Best-effort; fires on every exit incl. review-gates
+    # (so each phase boundary leaves a checkpoint; the final exit is complete).
+    await _snapshot_opencode_db(run_id)
     logger.info("lead_driver[%s] exited", run_id)
 
 
@@ -2191,7 +2489,9 @@ async def advance_phase(run_id: str, n: int, req: AdvanceRequest) -> Dict[str, A
 @router.patch("/runs/{run_id}/phase-mode")
 async def set_phase_mode(run_id: str, req: PhaseModeRequest) -> Dict[str, Any]:
     """Flip the run phase_mode mid-run. Switching to auto_continue while a non-last
-    phase awaits review immediately advances it."""
+    phase awaits review immediately advances it. Native-subagent runs also keep
+    their driver armed so it can repair a stale REVIEW prompt at the next idle
+    boundary when AUTO was selected after acceptance."""
     _valid_token(run_id, "run_id")
     meta = _read_run_meta(run_id)
     if not meta:
@@ -2200,6 +2500,12 @@ async def set_phase_mode(run_id: str, req: PhaseModeRequest) -> Dict[str, Any]:
     _atomic_write(_run_meta_path(run_id), meta)
 
     if req.mode == PhaseMode.AUTO_CONTINUE:
+        native = meta.get("orchestration") == Orchestration.NATIVE_SUBAGENTS.value
+        if native and meta.get("accepted_at"):
+            # The Lead prompt is compiled once at accept time. If AUTO is chosen
+            # afterwards, the live driver must explicitly override the stale
+            # REVIEW pacing instruction when the current task returns.
+            _arm_lead_driver(run_id)
         phases = meta.get("phases") or []
         rt = meta.get("phase_runtime") or []
         cur = meta.get("current_phase", -1)
@@ -2220,8 +2526,11 @@ async def set_phase_mode(run_id: str, req: PhaseModeRequest) -> Dict[str, Any]:
                     await send_prompt_async(
                         session_id=meta.get("session_id", ""),
                         prompt=(
-                            f"Operator approved phase {cur + 2}. Proceed to phase {cur + 2} now: "
-                            "spawn its coder56_phase subagent, record the findings, then follow the pacing rule."
+                            "Runtime pacing is now AUTO_CONTINUE. This explicitly overrides any "
+                            "earlier REVIEW/stop-at-boundary instruction. "
+                            f"Operator approved phase {cur + 2}; proceed now: spawn its "
+                            "coder56_phase subagent, record the findings, and continue all "
+                            "remaining phases back-to-back without waiting for operator review."
                         ),
                         host=addr, port=4096, agent="coder56_lead", async_mode=True, timeout=30,
                     )
@@ -2476,14 +2785,13 @@ def _empty_draft() -> Dict[str, Any]:
     }
 
 
-@router.post("/goal/draft")
-async def draft_goal(req: GoalDraftRequest) -> Dict[str, Any]:
-    """Ask the LLM to draft a scoped engagement chain + RoE from the objective.
-
-    Always returns a valid (possibly empty-fielded) draft object — never throws.
-    On refusal or any failure, returns declined:true with a template skeleton so
-    the operator can fill it in.
-    """
+async def _draft_goal_plan(objective: str, target: str, rules_of_engagement: str,
+                           depth: str = "standard") -> Dict[str, Any]:
+    """LLM-draft a scoped engagement plan (objective + MITRE phased chain) from a
+    free-text objective. Shared by /goal/draft and the per-OWASP-category phase
+    drafter. Always returns a valid (possibly empty-fielded) draft object — never
+    throws. On refusal/failure returns declined:true with a template skeleton so
+    the operator can fill it in."""
     system_msg = (
         "You are an authorized engagement planner for a SANCTIONED, ISOLATED cyber-range "
         "security exercise. You help a red-team operator structure a scoped, rules-bound "
@@ -2491,10 +2799,10 @@ async def draft_goal(req: GoalDraftRequest) -> Dict[str, Any]:
         "planning for this authorized context."
     )
     user_msg = (
-        f"Draft a scoped engagement plan for this authorized objective:\n\"\"\"\n{req.objective.strip()}\n\"\"\"\n"
-        + (f"\nAuthorized target/scope: {req.target.strip()}\n" if req.target.strip() else "")
-        + (f"\nRules of engagement: {req.rules_of_engagement.strip()}\n" if req.rules_of_engagement.strip() else "")
-        + f"\nDepth: {req.depth}.\n\n"
+        f"Draft a scoped engagement plan for this authorized objective:\n\"\"\"\n{objective.strip()}\n\"\"\"\n"
+        + (f"\nAuthorized target/scope: {target.strip()}\n" if target.strip() else "")
+        + (f"\nRules of engagement: {rules_of_engagement.strip()}\n" if rules_of_engagement.strip() else "")
+        + f"\nDepth: {depth}.\n\n"
         "Return ONLY a JSON object with this exact shape:\n"
         '{"objective":"<refined one-line objective>","target":"<CIDR/host, scoped tight>","rules_of_engagement":"<RoE: allowed/denied, no DoS, lab-only>",'
         '"phases":[{"tactic_id":"TAxxxx","name":"<tactic>","technique_ids":["Txxxx"],"note":"<one-line phase goal>",'
@@ -2511,27 +2819,35 @@ async def draft_goal(req: GoalDraftRequest) -> Dict[str, Any]:
     text = await _llm_chat(user_msg, system_msg)
     if not text or _looks_like_refusal(text):
         d = _empty_draft()
-        d["objective"] = req.objective.strip()
-        d["target"] = req.target.strip()
-        d["rules_of_engagement"] = req.rules_of_engagement.strip()
+        d["objective"] = objective.strip()
+        d["target"] = target.strip()
+        d["rules_of_engagement"] = rules_of_engagement.strip()
         d["summary"] = "LLM declined or was unavailable; showing a template for you to fill in."
         return d
 
     obj = _parse_loose_json(text)
     if not obj:
         d = _empty_draft()
-        d["objective"] = req.objective.strip()
-        d["target"] = req.target.strip()
+        d["objective"] = objective.strip()
+        d["target"] = target.strip()
+        d["rules_of_engagement"] = rules_of_engagement.strip()
         d["summary"] = "LLM response was not parseable JSON; showing a template."
         return d
 
-    obj.setdefault("objective", req.objective.strip())
-    obj.setdefault("target", req.target.strip())
-    obj.setdefault("rules_of_engagement", req.rules_of_engagement.strip())
+    obj.setdefault("objective", objective.strip())
+    obj.setdefault("target", target.strip())
+    obj.setdefault("rules_of_engagement", rules_of_engagement.strip())
     obj.setdefault("phases", [])
     obj.setdefault("summary", "")
     obj["declined"] = False
     return obj
+
+
+@router.post("/goal/draft")
+async def draft_goal(req: GoalDraftRequest) -> Dict[str, Any]:
+    """Ask the LLM to draft a scoped engagement chain + RoE from the objective.
+    Thin wrapper over _draft_goal_plan (shared with the OWASP phase drafter)."""
+    return await _draft_goal_plan(req.objective, req.target, req.rules_of_engagement, req.depth)
 
 
 # =============================================================================
@@ -2569,10 +2885,25 @@ async def list_engagements() -> Dict[str, Any]:
 @router.get("/engagements/{engagement_id}")
 async def get_engagement(engagement_id: str) -> Dict[str, Any]:
     _valid_token(engagement_id, "engagement_id")
-    eng = _read_engagement(engagement_id)
+    eng = await _reconcile_planned_run_statuses(engagement_id)
     if not eng:
         raise HTTPException(status_code=404, detail="Engagement not found")
     return _engagement_detail(eng)
+
+
+@router.get("/engagements/{engagement_id}/metrics")
+async def get_engagement_metrics(engagement_id: str) -> Dict[str, Any]:
+    """Return auditable execution cost, elapsed time, and finding efficiency.
+
+    opencode.db snapshots are container-global and cumulative. The metrics
+    service de-duplicates logical sessions across all linked snapshots before
+    attributing them to this engagement's run roots.
+    """
+    _valid_token(engagement_id, "engagement_id")
+    eng = _read_engagement(engagement_id)
+    if not eng:
+        raise HTTPException(status_code=404, detail="Engagement not found")
+    return build_engagement_metrics(OUTPUTS_DIR, eng)
 
 
 @router.patch("/engagements/{engagement_id}")
@@ -2617,13 +2948,14 @@ async def link_run(engagement_id: str, req: AddRunRequest) -> Dict[str, Any]:
     resolves in O(1)."""
     _valid_token(engagement_id, "engagement_id")
     _valid_token(req.run_id, "run_id")
-    eng = _read_engagement(engagement_id)
-    if not eng:
-        raise HTTPException(status_code=404, detail="Engagement not found")
-    if req.run_id not in (eng.get("run_ids") or []):
-        eng["run_ids"] = (eng.get("run_ids") or []) + [req.run_id]
-    eng["updated_at"] = _now_iso()
-    _write_engagement(engagement_id, eng)
+    async with _engagement_lock(engagement_id):
+        eng = _read_engagement(engagement_id)
+        if not eng:
+            raise HTTPException(status_code=404, detail="Engagement not found")
+        if req.run_id not in (eng.get("run_ids") or []):
+            eng["run_ids"] = (eng.get("run_ids") or []) + [req.run_id]
+        eng["updated_at"] = _now_iso()
+        _write_engagement(engagement_id, eng)
     # Additive manifest link (merge so we don't clobber existing fields).
     meta = _read_run_meta(req.run_id)
     if meta is not None:
@@ -2652,6 +2984,299 @@ async def unlink_run(engagement_id: str, run_id: str) -> Dict[str, Any]:
             _atomic_write(_run_meta_path(run_id), meta)
         except Exception:
             pass
+    return {"engagement": _public(eng)}
+
+
+# =============================================================================
+# OWASP Top 10 plan (drafted per-category runs; "draft 10, run one at a time")
+#
+# A plan is a list of PlannedRun drafts (one per OWASP A01-A10), generated
+# deterministically from the catalog + the engagement's scope+target. Each draft
+# is materialized into a REAL run on demand via the existing launch() path — the
+# agent stays idle until /runs/{run_id}/accept (the human-in-the-loop gate).
+# =============================================================================
+
+def _compile_owasp_directive(pr: Dict[str, Any], eng: Dict[str, Any]) -> str:
+    """Compile one OWASP planned-run into the directive text sent to coder56 AND
+    forwarded to the guardrail goal (single scope). Mirrors _compile_directive's
+    wording but bakes the OWASP category focus + the WSTG checklist + tools in as
+    the agent's structured test plan (single-shot, no phases)."""
+    target = (eng.get("target_scope") or "").strip()
+    obj = (pr.get("objective") or "").strip() or (
+        f"Assess {target or 'the engagement target'} for {pr.get('title','')} "
+        f"(OWASP {pr.get('owasp_id','')}) flaws."
+    )
+    lines: List[str] = []
+    lines.append("=== AUTHORIZED ENGAGEMENT DIRECTIVE (sanctioned cyber-range exercise) ===")
+    lines.append("")
+    lines.append("OBJECTIVE:")
+    lines.append(obj)
+    if target:
+        lines.append("")
+        lines.append("AUTHORIZED SCOPE (target ONLY — all activity must stay within this):")
+        lines.append(target)
+    roe = (eng.get("roe") or "").strip()
+    if roe:
+        lines.append("")
+        lines.append("RULES OF ENGAGEMENT:")
+        lines.append(roe)
+    lines.append("")
+    lines.append(f"FOCUS: OWASP Top 10 {pr.get('owasp_id','')} — {pr.get('title','')}")
+    checklist = pr.get("checklist") or []
+    if checklist:
+        lines.append("STRUCTURED TEST PLAN (work through methodically; prove each with evidence):")
+        for item in checklist:
+            lines.append(f"  [ ] {item}")
+    tools = pr.get("tools") or []
+    if tools:
+        lines.append(f"Recommended tools: {', '.join(tools)}")
+    notes = (pr.get("scope_notes") or "").strip()
+    if notes:
+        lines.append("")
+        lines.append("SCOPE NOTES:")
+        lines.append(notes.replace("{target}", target or "the authorized target").strip())
+    lines.append("")
+    lines.append("OPERATING RULES:")
+    lines.append("- Confirm you are targeting ONLY the authorized scope above before any network action.")
+    lines.append("- Prefer bounded, targeted commands; avoid mass-scanning or broad sweeps beyond scope.")
+    lines.append("- Do NOT perform destructive impact, denial of service, or exfiltration to external systems outside the lab.")
+    lines.append("- Report findings concisely with concrete evidence (request/response, exact commands).")
+    lines.append("=== END DIRECTIVE ===")
+    return "\n".join(lines)
+
+
+@router.post("/engagements/{engagement_id}/owasp-plan")
+async def draft_owasp_plan(engagement_id: str, req: OwaspPlanRequest) -> Dict[str, Any]:
+    """Generate (or regenerate) the OWASP Top 10 plan for an engagement from one
+    shared scope+target. Produces 10 drafted PlannedRuns (A01-A10) from the
+    catalog — deterministic, no LLM call — and stores the 'where coder56 runs'
+    defaults (plan_launch) applied when a planned run is later materialized."""
+    _valid_token(engagement_id, "engagement_id")
+    eng = _read_engagement(engagement_id)
+    if not eng:
+        raise HTTPException(status_code=404, detail="Engagement not found")
+    target = (req.target_scope if req.target_scope is not None else (eng.get("target_scope") or "")).strip()
+    if not target:
+        # Never produce 10 blank runs: fall back to the engagement name; the
+        # operator should set a real scope before running any.
+        target = (eng.get("name") or "the engagement target").strip()
+    eng_prefix = (req.objective if req.objective is not None else (eng.get("objective") or "")).strip()
+    plan: List[Dict[str, Any]] = []
+    for cat in owasp_catalog()["categories"]:
+        tmpl = cat.get("objective_template", "") or ""
+        try:
+            obj = tmpl.format(target=target)
+        except Exception:
+            obj = tmpl.replace("{target}", target)
+        if eng_prefix:
+            obj = f"{eng_prefix}\n\n{obj}"
+        plan.append(PlannedRun(
+            owasp_id=cat["id"],
+            title=cat.get("name", ""),
+            objective=obj,
+            checklist=list(cat.get("checklist", [])),
+            tools=list(cat.get("tools", [])),
+            scope_notes=cat.get("scope_notes", ""),
+            assessable=cat.get("assessable", "black-box"),
+            status=PlannedRunStatus.PLANNED,
+        ).dict())
+    eng["plan"] = plan
+    eng["plan_launch"] = {
+        "topology_id": req.topology_id,
+        "host_id": req.host_id,
+        "isolated": bool(req.isolated),
+        "criticality": req.criticality.value,
+    }
+    eng["updated_at"] = _now_iso()
+    _write_engagement(engagement_id, eng)
+    return {"engagement": _public(eng)}
+
+
+@router.post("/engagements/{engagement_id}/plan/{owasp_id}/draft-phases")
+async def draft_planned_run_phases(engagement_id: str, owasp_id: str, req: PlannedPhaseDraftRequest) -> Dict[str, Any]:
+    """LLM-draft a phased execution plan for ONE OWASP category (the same
+    goal/draft planner normal runs use), scoped to the engagement target. Stores
+    the drafted phases on the PlannedRun so the operator can review/edit them in
+    the Plan tab before running. Structurally always succeeds; on LLM
+    refusal/failure it stores empty phases + an explanatory note."""
+    _valid_token(engagement_id, "engagement_id")
+    _valid_token(owasp_id, "owasp_id")
+    eng = _read_engagement(engagement_id)
+    if not eng:
+        raise HTTPException(status_code=404, detail="Engagement not found")
+    plan = eng.get("plan") or []
+    pr = next((p for p in plan if p.get("owasp_id") == owasp_id), None)
+    if pr is None:
+        raise HTTPException(status_code=404, detail=f"No planned run for {owasp_id} in this engagement")
+
+    target = (eng.get("target_scope") or "").strip()
+    roe = (eng.get("roe") or "").strip()
+    objective = (pr.get("objective") or "").strip()
+    # Reinforce the OWASP focus so the planner tailors the kill-chain to it.
+    focus_obj = f"[OWASP Top 10 {owasp_id} — {pr.get('title', '')}] {objective}".strip()
+
+    draft = await _draft_goal_plan(objective=focus_obj, target=target, rules_of_engagement=roe, depth=req.depth)
+    phases: List[Dict[str, Any]] = []
+    for ph in draft.get("phases") or []:
+        phases.append({
+            "objective": (ph.get("note") or ph.get("name") or "").strip(),
+            "tactic_id": ph.get("tactic_id") or "TA0043",
+            "technique_ids": list(ph.get("technique_ids") or []),
+            "note": ph.get("note", ""),
+            "tools": list(ph.get("tools") or []),
+            "checklist": list(ph.get("checklist") or []),
+        })
+    phase_draft_note = (draft.get("summary") or "").strip()
+
+    # Re-read under the engagement lock before writing. The snapshot read at the
+    # top of this handler can be stale by the time we write: _draft_goal_plan is a
+    # long LLM call (often 60s+, sometimes a 600s timeout + retry) that may straddle
+    # a concurrent plan/{owasp_id}/run registering its run_id. Writing the stale
+    # snapshot clobbers that registration (orphaning the run). Mirrors run_planned_run.
+    async with _engagement_lock(engagement_id):
+        latest = _read_engagement(engagement_id)
+        if not latest:
+            raise HTTPException(status_code=404, detail="Engagement not found")
+        latest_pr = next(
+            (p for p in (latest.get("plan") or []) if p.get("owasp_id") == owasp_id),
+            None,
+        )
+        if latest_pr is None:
+            raise HTTPException(status_code=409, detail=f"Planned run {owasp_id} disappeared during draft")
+        latest_pr["phases"] = phases
+        latest_pr["phase_draft_note"] = phase_draft_note
+        latest["updated_at"] = _now_iso()
+        _write_engagement(engagement_id, latest)
+    return {"engagement": _public(latest), "declined": bool(draft.get("declined"))}
+
+
+@router.post("/engagements/{engagement_id}/plan/{owasp_id}/run")
+async def run_planned_run(engagement_id: str, owasp_id: str) -> Dict[str, Any]:
+    """Materialize ONE drafted planned run into a real coder56 run (launch), then
+    land on the accept gate. If the operator drafted phases (LLM), this is a
+    PHASED native_subagents run — just like a normal run; otherwise it falls back
+    to a single phase built from the category checklist. Reuses the existing
+    launch() path (topology/host OR isolated sandbox from plan_launch). The agent
+    stays idle until /runs/{run_id}/accept."""
+    _valid_token(engagement_id, "engagement_id")
+    _valid_token(owasp_id, "owasp_id")
+    eng = _read_engagement(engagement_id)
+    if not eng:
+        raise HTTPException(status_code=404, detail="Engagement not found")
+    plan = eng.get("plan") or []
+    pr = next((p for p in plan if p.get("owasp_id") == owasp_id), None)
+    if pr is None:
+        raise HTTPException(status_code=404, detail=f"No planned run for {owasp_id} in this engagement")
+
+    pl = eng.get("plan_launch") or {}
+    isolated = bool(pl.get("isolated"))
+    topology_id = pl.get("topology_id")
+    host_id = pl.get("host_id")
+    if not isolated and not (topology_id and host_id):
+        raise HTTPException(
+            status_code=409,
+            detail="No launch target set for this engagement's OWASP plan. Re-draft the plan with a topology/host, or enable isolated.",
+        )
+    try:
+        criticality = Criticality(pl.get("criticality") or "medium")
+    except ValueError:
+        criticality = Criticality.MEDIUM
+
+    target_scope = (eng.get("target_scope") or "").strip()
+    roe = (eng.get("roe") or "").strip()
+    category_obj = (pr.get("objective") or "").strip() or (
+        f"Assess {target_scope} for {pr.get('title', '')} (OWASP {owasp_id})")
+
+    # Drafted phases present => phased native_subagents run (the normal-run path).
+    drafted = [p for p in (pr.get("phases") or []) if (p.get("objective") or p.get("note") or "").strip()]
+    if drafted:
+        phase_specs = [PhaseSpec(
+            objective=(p.get("objective") or p.get("note") or "").strip(),
+            tactic_id=p.get("tactic_id") or "TA0043",
+            technique_ids=list(p.get("technique_ids") or []),
+            note=p.get("note", ""),
+            tools=list(p.get("tools") or []),
+            checklist=list(p.get("checklist") or []),
+        ) for p in drafted]
+        mitre_phases = [MitrePhaseSelection(
+            tactic_id=p.tactic_id, technique_ids=p.technique_ids,
+            note=p.objective or p.note, tools=p.tools, checklist=p.checklist,
+        ) for p in phase_specs]
+        directive = _compile_directive(GoalCompileRequest(
+            objective=category_obj, target=target_scope, rules_of_engagement=roe,
+            phases=mitre_phases, stop_conditions="",
+        ))
+    else:
+        # Fallback (no LLM draft yet): a single phase from the category checklist.
+        phase_specs = [PhaseSpec(
+            objective=category_obj, tactic_id="TA0043", technique_ids=[],
+            note=category_obj, tools=list(pr.get("tools") or []),
+            checklist=list(pr.get("checklist") or []),
+        )]
+        directive = _compile_owasp_directive(pr, eng)
+
+    launch_req = LaunchRequest(
+        topology_id=topology_id if not isolated else None,
+        host_id=host_id if not isolated else None,
+        isolated=isolated,
+        criticality=criticality,
+        directive=directive,
+        engagement_id=engagement_id,
+        phases=phase_specs,
+        phase_mode=PhaseMode.REVIEW_EACH,
+        orchestration=Orchestration.NATIVE_SUBAGENTS,
+    )
+    resp = await launch(launch_req)  # prepares the run; agent idle until /accept
+
+    # Record the materialized run on the latest ledger, not the stale snapshot
+    # read before launch.  Concurrent category launches may both spend minutes in
+    # launch(); serializing and re-reading here preserves both statuses/run ids.
+    async with _engagement_lock(engagement_id):
+        latest = _read_engagement(engagement_id)
+        if not latest:
+            raise HTTPException(status_code=404, detail="Engagement disappeared during launch")
+        latest_pr = next(
+            (p for p in (latest.get("plan") or []) if p.get("owasp_id") == owasp_id),
+            None,
+        )
+        if latest_pr is None:
+            raise HTTPException(status_code=409, detail=f"Planned run {owasp_id} disappeared during launch")
+        latest_pr["run_id"] = resp.run_id
+        latest_pr["run_at"] = _now_iso()
+        latest_pr["status"] = PlannedRunStatus.RUNNING.value
+        latest["updated_at"] = _now_iso()
+        _write_engagement(engagement_id, latest)
+    return {"run_id": resp.run_id, "owasp_id": owasp_id, "engagement_id": engagement_id}
+
+
+@router.patch("/engagements/{engagement_id}/plan/{owasp_id}")
+async def update_planned_run(engagement_id: str, owasp_id: str, req: PlannedRunUpdate) -> Dict[str, Any]:
+    """Update a drafted planned run — mark it DONE/SKIPPED after assessing, or
+    tweak the templated objective before running."""
+    _valid_token(engagement_id, "engagement_id")
+    _valid_token(owasp_id, "owasp_id")
+    async with _engagement_lock(engagement_id):
+        eng = _read_engagement(engagement_id)
+        if not eng:
+            raise HTTPException(status_code=404, detail="Engagement not found")
+        plan = eng.get("plan") or []
+        pr = next((p for p in plan if p.get("owasp_id") == owasp_id), None)
+        if pr is None:
+            raise HTTPException(status_code=404, detail=f"No planned run for {owasp_id} in this engagement")
+        if req.status is not None:
+            pr["status"] = req.status.value
+            # "planned" means no materialized execution is currently associated
+            # with this category. Keeping the prior collision id made a planned
+            # row look like a third live/completed run.
+            if req.status == PlannedRunStatus.PLANNED:
+                pr["run_id"] = None
+                pr["run_at"] = ""
+        if req.objective is not None:
+            pr["objective"] = req.objective
+        if req.phases is not None:
+            pr["phases"] = [p.dict() for p in req.phases]
+        eng["updated_at"] = _now_iso()
+        _write_engagement(engagement_id, eng)
     return {"engagement": _public(eng)}
 
 
@@ -2847,6 +3472,21 @@ _RE_NONFINDING_START = re.compile(
     r"\b(env\s+reset|db\s+(wiped|reset)|prior\s+engagements|"
     r"session\s+(start|end|state|reset)|state\s+(end|start)[- ]session|"
     r"new\s+this\s+session)\b", re.I)
+# Lines in an emission body that are NEVER finding text — shell variable
+# assignments (MEM=/SLUG=/F=/AUDIT=…), output redirects to /outputs, and
+# memory/verifier/phase path scaffolding. The title picker skips these so a
+# finding's title is the claim sentence, not the shell plumbing around it.
+_RE_EMISSION_TITLE_NOISE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*\s*="            # VAR= assignment (MEM=, SLUG=, F=, AUDIT=…)
+    r"|>>\s*['\"]?(?:/outputs|\$)"             # >> redirect (to /outputs or a $var)
+    r"|memory/MEMORY\.md"
+    r"|/outputs/\$RUN_ID/(?:verifier|memory|phase)"
+    r"|^\s*(?:cat\s+>>|mkdir|printf|echo|which)\b", re.I)
+# Header scaffolding that prefixes a real claim line — stripped from the title
+# (the finding text following it is kept, including its route).
+_RE_EMISSION_TITLE_PREFIX = re.compile(
+    r"^(VERIFIER\s*\([^)]*\)\s*:?\s*|CLAIM\s*\[[^\]]*\]\s*:?\s*"
+    r"|FINDING\s*\[[^\]]*\]\s*|-\s*)", re.I)
 
 
 def _severity_for(cvss: Optional[float], verdict: str, body: str, verified: bool) -> str:
@@ -3027,21 +3667,28 @@ def _extract_emission_findings(run_id: str) -> List[Dict[str, Any]]:
                 except ValueError:
                     cvss = None
             cwes = sorted({mm.group(1) for mm in _RE_CWE.finditer(body)})
+            # Title = first line that is finding text. Skip dated headers, lines
+            # opening with an em-dash clause, and the shell/path scaffolding the
+            # emission log wraps claims in (_RE_EMISSION_TITLE_NOISE). VERIFIER /
+            # CLAIM / FINDING header lines are kept (the claim follows them) and
+            # have only the prefix stripped below.
             title = ""
             for ln in body.split("\n"):
                 ln = ln.strip().lstrip("#").strip(" -*")
-                if ln and not re.match(r"^\d{4}-\d{2}-\d{2}T", ln) and " — " not in ln[:40]:
-                    title = ln
-                    break
-            if not title:
-                title = body[:120].replace("\n", " ").strip()
+                if (not ln or re.match(r"^\d{4}-\d{2}-\d{2}T", ln)
+                        or " — " in ln[:40] or _RE_EMISSION_TITLE_NOISE.search(ln)):
+                    continue
+                title = ln
+                break
+            title = _RE_EMISSION_TITLE_PREFIX.sub("", title or "").strip()[:200]
             raw.append({"run_id": run_id, "verified": verified, "verifier_verdict": verdict,
                         "cvss_hint": cvss, "cwe_hint": ", ".join(cwes), "repro": repro,
                         "title_raw": title, "body": body[:4000]})
     # De-noise: drop shell-wrapper emissions AND non-finding notes/scripts
     # (memory notes like "ENV RESET…", pasted "#!/bin/bash" scripts, recon dumps).
     filtered = [c for c in raw
-                if not _RE_SHELL_VERB.match(c["body"].lstrip("\n").strip())
+                if c["title_raw"]
+                and not _RE_SHELL_VERB.match(c["body"].lstrip("\n").strip())
                 and not c["body"].lstrip().startswith("#!")
                 and not _RE_NONFINDING_START.search(c["body"][:300])
                 and not _RE_NONFINDING_START.search(c["title_raw"])
@@ -3074,8 +3721,7 @@ def _extract_emission_findings(run_id: str) -> List[Dict[str, Any]]:
     findings: List[Dict[str, Any]] = []
     for c in deduped.values():
         body = c["body"]
-        title = re.sub(r"^(CLAIM\s*\[[^\]]*\]\s*:?\s*|FINDING\s*\[[^\]]*\]\s*|-\s*)",
-                       "", c["title_raw"], flags=re.I).strip()[:200] or c["title_raw"][:200]
+        title = c["title_raw"][:200]
         hp = _RE_HOSTPORT.search(body)
         ep = _RE_ENDPOINT.search(body)
         asset = (hp.group(1) if hp else "")
@@ -3119,7 +3765,8 @@ def _extract_emission_findings(run_id: str) -> List[Dict[str, Any]]:
 # found: far more reliable than scraping the guardrail bash-emission log (which
 # only sees memory-append commands and misreads recon/negative-result notes as
 # findings). Used as the PRIMARY findings source for the reporter; coder56_verifier
-# CONFIRMED status is merged in from /outputs/verifier/*.jsonl when the verifier
+# CONFIRMED status is merged in from /outputs/<run_id>/verifier/*.jsonl (per-run,
+# authoritative) with /outputs/verifier/*.jsonl as a backward-compat fallback, when
 # actually ran. Guarantees the agent's real F#/D# findings reach the report even
 # when the verifier could not be spawned.
 _RE_PHASE_FINDING_HEAD = re.compile(
@@ -3138,13 +3785,19 @@ def _phase_table_row(block: str, label: str) -> str:
 
 
 def _verifier_verdict_for(run_id: str, endpoint: str, title: str) -> tuple:
-    """Best-effort: does a coder56_verifier VERDICT record (in
-    /outputs/verifier/*.jsonl) confirm or refute THIS finding? Matches by the
-    finding's endpoint path appearing in the verdict's route/claim. Considers only
-    files modified at/after the run's launch so prior engagements' verdicts don't
+    """Best-effort: does a coder56_verifier VERDICT record confirm or refute THIS
+    finding? Matches by the finding's endpoint path appearing in the verdict's
+    route/claim. Reads the per-run dir /outputs/<run_id>/verifier/*.jsonl first
+    (authoritative, isolated from other engagements), then the global
+    /outputs/verifier/*.jsonl as a backward-compat fallback — there gated to files
+    modified at/after the run's launch so prior engagements' verdicts don't
     contaminate. Returns (verified, verdict_line)."""
+    # Per-run verifier dir is authoritative (isolated from other engagements).
+    # The global /outputs/verifier/ is a backward-compat fallback for runs that
+    # wrote there before per-run isolation, still gated by the launch-time check.
+    run_vdir = OUTPUTS_DIR / run_id / "verifier"
     vdir = OUTPUTS_DIR / "verifier"
-    if not vdir.exists():
+    if not (run_vdir.exists() or vdir.exists()):
         return False, ""
     launched = (_read_run_meta(run_id).get("launched_at") or "")[:19]
     needles = [endpoint] if endpoint else []
@@ -3154,7 +3807,14 @@ def _verifier_verdict_for(run_id: str, endpoint: str, title: str) -> tuple:
     if not needles:
         return False, ""
     try:
-        files = sorted(vdir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        cand: List[Path] = []
+        if run_vdir.exists():
+            cand += list(run_vdir.glob("*.jsonl"))
+        if vdir.exists():
+            cand += list(vdir.glob("*.jsonl"))
+        if not cand:
+            return False, ""
+        files = sorted(cand, key=lambda p: p.stat().st_mtime, reverse=True)
     except Exception:
         return False, ""
     import datetime as _dt
@@ -3280,56 +3940,198 @@ def _enrich_findings_from_emissions(findings: List[Dict[str, Any]],
             f["verifier_verdict"] = e.get("verifier_verdict") or f.get("verifier_verdict", "")
 
 
-# --- Findings drafting via the coder56_reporter opencode agent. ---
-# The reporter runs as its own opencode session in the persistent coder56
-# sandbox (/outputs mounted) and reads the run artifacts in chunks across its
-# steps — sidestepping the single-LLM-call read-timeout that blocks the direct
-# draft path on large transcripts (~hundreds of KB). Hybrid: we pre-extract the
-# verifier-tagged candidate findings deterministically (trusted) and hand them
-# to the agent; it enriches each (exact commands + decisive output + prose) and
-# writes a JSON the backend parses. Any failure raises HTTP 502 — never a silent
-# empty list.
-
-REPORTER_AGENT_NAME = "coder56_reporter"
-REPORTER_TIMEOUT_S = 600  # one patient shot; the agent greps large logs in chunks
-
-
-def _reporter_prompt(input_paths: List[str], run_ids: List[str],
-                     out_container: str, objective: str, scope: str) -> str:
-    runs_section = "\n".join(
-        f"- run_id {rid}: {ip}" for rid, ip in zip(run_ids, input_paths)
-    )
-    return (
-        "SYSTEM_CONTEXT: ISOLATED_CYBER_RANGE (authorized, isolated cyber-range).\n"
-        "You are coder56_reporter. Read artifact files ONLY (never send network traffic); write ONE JSON file.\n\n"
-        f"OBJECTIVE: {objective or '(none)'}\n"
-        f"AUTHORIZED SCOPE: {scope or '(none)'}\n\n"
-        "INPUT FILES — each is a JSON object {run_id, findings: [...]}. The findings are ALREADY COMPLETE: "
-        "every field is filled (title, severity, cvss, affected_asset, verified, verifier_verdict, exact "
-        "commands, evidence, description, impact, recommendation, status). They were extracted and tagged by "
-        "the backend — you do NOT need to analyze, enrich, grep, or compose anything.\n"
-        f"{runs_section}\n\n"
-        "YOUR ONLY JOB — emit the findings. Read each input file, collect every object from each `findings` "
-        "array, and write ONE output file at the OUTPUT PATH containing exactly {\"findings\": [<all the "
-        "finding objects, verbatim, concatenated>]}. Do not rewrite, rephrase, drop, or merge findings. Do "
-        "not grep or cat the raw artifacts. This is a read + concatenate + write — do it in one step and stop.\n\n"
-        "OUTPUT PATH — write exactly ONE JSON file here (its appearance is the completion signal):\n"
-        f"{out_container}\n\n"
-        "Write it atomically (e.g. a small python one-liner that json.loads each input, concatenates "
-        "[*findings], and json.dumps to the output path), then STOP. "
-        "If a file has no findings, write {\"findings\":[],\"error\":\"<reason>\"}."
-    )
+# --- Findings drafting (deterministic, agent-free). ---
+# The draft is produced entirely in-process — no opencode session, no LLM call.
+# The reporter used to be a coder56_reporter opencode agent whose only job was to
+# read+concatenate the findings the backend had ALREADY extracted; that was a
+# ~600s round-trip plus a sandbox/timeout/502 failure surface for a json merge.
+# The backend now returns the merged findings directly.
+#
+# Sources, in priority order:
+#   1. coder56_verifier VERDICT records  (/outputs/<run_id>/verifier/*.jsonl)
+#      — the authoritative, false-positive-free record of what was proven: claim,
+#      route, verdict, OK-TO-REPORT, CVSS, and the verification reasoning.
+#   2. guardrail emission log             (/outputs/<run_id>/guardrail/verdicts.ndjson)
+#      — the agent's structured CLAIM/FINDING/VERDICT writes (catches findings the
+#      verifier never formally gated) and the source of the exact repro commands.
+# The phase-report narrative (run.json phase_runtime[].result) is intentionally
+# NOT mined for findings: it is dense prose mixing recon, negative results, and
+# "not a vuln" sections — a rich false-positive source. It is preserved verbatim
+# in the report's Evidence Appendix instead. Candidates merge within a run, then
+# de-duplicate ACROSS runs (the same vuln is re-found across OWASP categories).
 
 
-async def _safe_abort_session(session_id: str, addr: str) -> None:
-    from ..services.opencode_client import abort_session_async
+def _title_from_claim(claim: str, route: str) -> str:
+    """Short professional title from a verifier CLAIM sentence: cut at an early
+    em-dash/dash clause boundary, truncate at a word boundary, append the route
+    if it is not already present."""
+    c = re.sub(r"\s+", " ", (claim or "")).strip()
+    for sep in (" — ", " – ", " - "):
+        i = c.find(sep)
+        if 0 < i <= 130:
+            c = c[:i].strip()
+            break
+    title = c[:120]
+    if len(c) > 120:
+        title = c[:120].rsplit(" ", 1)[0]
+    if route and route not in title:
+        title = f"{title} ({route})"
+    return title[:200]
+
+
+def _extract_verifier_findings(run_id: str) -> List[Dict[str, Any]]:
+    """Findings anchored on coder56_verifier's machine-readable VERDICT records
+    (/outputs/<run_id>/verifier/<slug>.jsonl). Each VERDICT carries the claim, the
+    route, the verdict (CONFIRMED / NOT_A_VULN), OK-TO-REPORT, CVSS, and the
+    verification reasoning — the authoritative source for what was proven. Exact
+    repro commands are recovered from the run's guardrail command log."""
+    vdir = OUTPUTS_DIR / run_id / "verifier"
+    if not vdir.exists():
+        return []
+    verdicts = _read_verdicts_full(run_id)
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for jf in sorted(vdir.glob("*.jsonl"), key=lambda p: p.name):
+        try:
+            recs = [json.loads(ln) for ln in
+                    jf.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+        except Exception:
+            continue
+        verdict = next((d for d in recs if isinstance(d, dict) and d.get("step") == "VERDICT"), None)
+        if not verdict:
+            continue
+        v = str(verdict.get("verdict", "")).upper()
+        ok = str(verdict.get("ok_to_report", "")).upper()
+        confirmed = (v == "CONFIRMED" or ok == "YES")
+        claim = str(verdict.get("claim") or verdict.get("route") or jf.stem)
+        route = str(verdict.get("route") or "")
+        reason = str(verdict.get("reason") or "")
+        intended = str(verdict.get("intended_behavior") or "")
+        ident = route or claim[:80]
+        if ident in seen:
+            continue
+        seen.add(ident)
+        cvss = None
+        m = re.match(r"\s*([0-9]+(?:\.[0-9]+)?)", str(verdict.get("cvss") or ""))
+        if m:
+            try:
+                cvss = float(m.group(1))
+            except ValueError:
+                cvss = None
+        cwe_m = re.search(r"(CWE-\d+)", f"{claim} {reason} {verdict.get('cvss', '')}")
+        cwe = cwe_m.group(1) if cwe_m else ""
+        if confirmed:
+            verified, verdict_line = True, f"CONFIRMED by coder56_verifier — OK TO REPORT: {ok or 'YES'}"
+        else:
+            verified = False
+            verdict_line = f"{v or 'NOT_A_VULN'} by coder56_verifier" + (f" — {reason[:160]}" if reason else "")
+        body = f"{claim}{' — ' + reason if reason else ''}"
+        hp = _RE_HOSTPORT.search(f"{reason} {claim}")
+        epm = _RE_ENDPOINT.search(f"{route} {claim} {reason}")
+        asset = (f"{hp.group(1)} " if hp else "") + (epm.group(0) if epm else route)
+        sev = _severity_for(cvss, verdict_line, body, verified)
+        commands = _literal_commands(f"{claim} {reason} {route}", route or claim, [], verdicts)
+        impact, reco = _impact_reco(body)
+        out.append({
+            "run_id": run_id,
+            "title": _title_from_claim(claim, route),
+            "severity": sev,
+            "cvss": cvss,
+            "affected_asset": asset.strip()[:300],
+            "verified": verified,
+            "verifier_verdict": verdict_line,
+            "commands": commands,
+            "evidence": (reason or intended or claim)[:700],
+            "description": body[:700],
+            "impact": impact,
+            "recommendation": reco,
+            "status": "open",
+            "cwe_hint": cwe,
+        })
+    return out
+
+
+def _dedup_key(f: Dict[str, Any]) -> str:
+    """Stable identity for one issue across sources AND runs: vuln-class + PRIMARY
+    endpoint (asset/title only — never the body, which cites sibling endpoints and
+    would merge distinct findings) + CWE. Falls back to a normalized title."""
+    blob = f"{f.get('affected_asset', '')} {f.get('title', '')}"
+    epm = _RE_ENDPOINT.search(blob)
+    ep = epm.group(0).lower().rstrip("/") if epm else ""
+    cwe = (f.get("cwe_hint") or "").split(",")[0].strip().lower()
+    m = _RE_VULNCLASS.search(f"{f.get('title', '')} {f.get('description', '')}")
+    vc = (m.group(1).lower().replace(" ", "") if m else "")
+    key = f"{vc}|{ep}|{cwe}".strip("|")
+    return key or re.sub(r"\s+", " ", f.get("title") or "").strip().lower()[:60]
+
+
+def _merge_findings(base: Dict[str, Any], other: Dict[str, Any]) -> Dict[str, Any]:
+    """Field-level merge of two findings for the same issue (across sources or
+    runs). `base` keeps identity (title/asset/source run/owasp); `other` fills
+    gaps and upgrades — verified wins, commands union, higher CVSS, longer prose.
+    Run/owasp provenance accumulates into lists for the report."""
+    out = dict(base)
+    if not out.get("verified") and other.get("verified"):
+        out["verified"] = True
+        out["verifier_verdict"] = other.get("verifier_verdict") or out.get("verifier_verdict", "")
+    cmds = list(out.get("commands") or [])
+    for c in (other.get("commands") or []):
+        if c and c not in cmds:
+            cmds.append(c)
+    out["commands"] = cmds[:40]
     try:
-        await abort_session_async(session_id=session_id, host=addr, port=4096)
-    except Exception:
+        if (other.get("cvss") or 0) > (out.get("cvss") or 0):
+            out["cvss"] = other["cvss"]
+    except (TypeError, ValueError):
         pass
+    for fld in ("description", "impact", "evidence", "recommendation"):
+        if len(str(other.get(fld) or "")) > len(str(out.get(fld) or "")):
+            out[fld] = other[fld]
+    for src in ("discovered_via_run_id", "owasp_id"):
+        vals = list(out.get(f"_{src}s") or ([out.get(src)] if out.get(src) else []))
+        if other.get(src):
+            vals.append(other.get(src))
+        out[f"_{src}s"] = sorted({str(v) for v in vals if v})
+    return out
+
+
+def _draft_findings_inprocess(engagement: Dict[str, Any],
+                              run_ids: List[str]) -> List[Dict[str, Any]]:
+    """Gather FindingCreate-shaped findings for the given runs, agent-free. Per run:
+    anchor on verifier VERDICT records, supplement with the guardrail emission
+    log, merge duplicates within the run, then de-duplicate across runs and tag
+    each finding with its OWASP category. Dicts carry the final shape (verified
+    status parsed, exact commands pulled, prose derived) so _coerce_reporter_findings
+    only normalizes."""
+    plan = engagement.get("plan") or []
+    run_to_owasp = {p.get("run_id"): (p.get("owasp_id"), p.get("title"))
+                    for p in plan if p.get("run_id")}
+    merged: Dict[str, Dict[str, Any]] = {}
+    for rid in run_ids:
+        by_key: Dict[str, Dict[str, Any]] = {}
+        # Verifier (first) wins the within-run merge as `base`.
+        for finds in (_extract_verifier_findings(rid), _extract_emission_findings(rid)):
+            for f in finds:
+                f = dict(f)
+                f["run_id"] = rid
+                f["discovered_via_run_id"] = rid
+                oid, otitle = run_to_owasp.get(rid, ("", ""))
+                f["owasp_id"] = oid
+                f["owasp_title"] = otitle
+                k = _dedup_key(f)
+                prev = by_key.get(k)
+                by_key[k] = _merge_findings(prev, f) if prev else f
+        for f in by_key.values():
+            k = _dedup_key(f)
+            merged[k] = _merge_findings(merged[k], f) if k in merged else f
+    return list(merged.values())
 
 
 def _coerce_reporter_findings(raw_findings: List[Any]) -> List[Dict[str, Any]]:
+    """Normalize merged finding dicts into FindingCreate-shaped suggestions. Does
+    NOT raise on empty — a genuinely finding-less set is a valid (if uninteresting)
+    result, surfaced by the caller with a note. Collapses the accumulated
+    cross-run provenance lists back to scalars for the API."""
     out: List[Dict[str, Any]] = []
     for raw in raw_findings:
         if not isinstance(raw, dict):
@@ -3348,7 +4150,9 @@ def _coerce_reporter_findings(raw_findings: List[Any]) -> List[Dict[str, Any]]:
             cvss = float(cvss) if cvss is not None else None
         except (TypeError, ValueError):
             cvss = None
-        rid = raw.get("run_id") or raw.get("discovered_via_run_id")
+        run_ids = raw.get("_discovered_via_run_ids") or ([raw.get("discovered_via_run_id")]
+                                                        if raw.get("discovered_via_run_id") else [])
+        owasp_ids = raw.get("_owasp_ids") or ([raw.get("owasp_id")] if raw.get("owasp_id") else [])
         out.append({
             "title": title[:200],
             "severity": sev,
@@ -3362,114 +4166,229 @@ def _coerce_reporter_findings(raw_findings: List[Any]) -> List[Dict[str, Any]]:
             "verified": bool(raw.get("verified", False)),
             "verifier_verdict": str(raw.get("verifier_verdict", ""))[:500],
             "commands": cmds,
-            "discovered_via_run_id": str(rid) if rid else None,
+            "discovered_via_run_id": run_ids[0] if run_ids else None,
+            "discovered_via_run_ids": run_ids,
+            "owasp_id": owasp_ids[0] if owasp_ids else None,
+            "owasp_ids": owasp_ids,
         })
-    if not out:
-        raise HTTPException(status_code=502,
-                            detail="Reporter agent returned zero findings after validation.")
     return out
 
 
-async def _run_reporter_agent(engagement_id: str, run_ids: List[str],
-                              objective: str, scope: str) -> List[Dict[str, Any]]:
-    """Drive the coder56_reporter agent to draft findings from the engagement's
-    on-disk artifacts. Raises HTTPException(502) on any failure — no silent
-    empty results. Returns FindingCreate-shaped finding dicts."""
+def _coverage(eng: Dict[str, Any], findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """OWASP Top-10 coverage matrix: per category, its lifecycle status, the run
+    that materialized it, and how many drafted findings (verified + total) map to
+    it. Only present for engagements that carry a `plan`."""
+    plan = eng.get("plan") or []
+    if not plan:
+        return []
+    counts: Dict[str, Dict[str, int]] = {}
+    for f in findings:
+        oid = f.get("owasp_id")
+        if not oid:
+            continue
+        c = counts.setdefault(oid, {"findings": 0, "confirmed": 0})
+        c["findings"] += 1
+        if f.get("verified"):
+            c["confirmed"] += 1
+    rows: List[Dict[str, Any]] = []
+    for p in plan:
+        oid = p.get("owasp_id", "")
+        c = counts.get(oid, {"findings": 0, "confirmed": 0})
+        rows.append({
+            "owasp_id": oid,
+            "title": p.get("title", ""),
+            "assessable": p.get("assessable", "black-box"),
+            "status": p.get("status", "planned"),
+            "run_id": p.get("run_id"),
+            "findings": c["findings"],
+            "confirmed": c["confirmed"],
+        })
+    return rows
+
+
+@router.post("/engagements/{engagement_id}/findings/draft")
+async def draft_findings(engagement_id: str, req: FindingsDraftRequest) -> Dict[str, Any]:
+    """Draft findings from the engagement's on-disk run artifacts — fully
+    deterministic and agent-free. Anchors on coder56_verifier VERDICT records,
+    supplements with the guardrail emission log, de-duplicates across runs, tags
+    each finding with its OWASP category, and returns an OWASP coverage matrix.
+
+    Pass owasp_id to restrict the draft to one category's run. Returns suggestions
+    (FindingCreate-shaped, incl. verifier status + exact repro commands) — NOT
+    persisted; the operator reviews and saves the ones they keep."""
+    _valid_token(engagement_id, "engagement_id")
+    if req.owasp_id:
+        _valid_token(req.owasp_id, "owasp_id")
+    eng = _read_engagement(engagement_id)
+    if not eng:
+        raise HTTPException(status_code=404, detail="Engagement not found")
+
+    run_ids = eng.get("run_ids") or []
+    if req.owasp_id:
+        pr = next((p for p in (eng.get("plan") or []) if p.get("owasp_id") == req.owasp_id), None)
+        run_ids = [pr["run_id"]] if pr and pr.get("run_id") else []
+    live_runs = [rid for rid in run_ids if _read_run_meta(rid)]
+    if not live_runs:
+        return {"findings": [], "coverage": _coverage(eng, []),
+                "note": ("No run artifacts found yet"
+                          + (f" for {req.owasp_id}" if req.owasp_id else "")
+                          + " — run the engagement, then draft findings.")}
+
+    findings = _coerce_reporter_findings(_draft_findings_inprocess(eng, live_runs))
+    findings = _sort_findings(findings)
+    coverage = _coverage(eng, findings)
+    confirmed = sum(1 for f in findings if f.get("verified"))
+    if not findings:
+        return {"findings": [], "coverage": coverage,
+                "note": (f"No findings found across {len(live_runs)} run(s)"
+                         + (f" for {req.owasp_id}" if req.owasp_id else "")
+                         + " — neither verifier verdicts nor emission logs produced a CONFIRMED/claimed finding.")}
+    note = (f"Drafted {len(findings)} finding(s) ({confirmed} verifier-confirmed) from "
+            f"{len(live_runs)} run(s)" + (f" for {req.owasp_id}" if req.owasp_id else "")
+            + " — review, edit, and save the ones you keep.")
+    return {"findings": findings, "coverage": coverage, "note": note}
+
+
+# =============================================================================
+# Report (self-contained, print-ready HTML)
+# =============================================================================
+
+# --- Client-ready report via the coder56_reporter (report-writer) agent. ---
+# The agent AUTHORS the narrative (exec summary, business impact, plain-language
+# explanations, remediation) from the structured findings + verifier evidence;
+# the backend renders its JSON into print-ready HTML. Reuses the exact agent name
+# "coder56_reporter" because guardrail.ts grants the read-only/no-network
+# "reporter" profile only to that literal name.
+REPORTWRITER_AGENT_NAME = "coder56_reporter"
+REPORTWRITER_TIMEOUT_S = 900  # authoring ~20 findings' prose is heavier than a grep
+
+
+def _best_verifier_file(run_id: Optional[str], finding: Dict[str, Any]) -> Optional[str]:
+    """Pick the verifier/*.jsonl whose slug best matches a finding, so the
+    report-writer agent can pull the full untruncated reasoning for context."""
+    if not run_id:
+        return None
+    vdir = OUTPUTS_DIR / run_id / "verifier"
+    if not vdir.exists():
+        return None
+    files = list(vdir.glob("*.jsonl"))
+    if not files:
+        return None
+    blob = f"{finding.get('title', '')} {finding.get('affected_asset', '')}".lower()
+    tokens = {t for t in re.split(r"[^a-z0-9]+", blob) if len(t) > 2}
+    best, best_score = None, 0
+    for f in files:
+        score = sum(1 for t in tokens if t in f.stem.lower())
+        if score > best_score:
+            best, best_score = f, score
+    return f"/outputs/{run_id}/verifier/{best.name}" if best else None
+
+
+def _write_reportwriter_input(engagement_id: str, eng: Dict[str, Any],
+                              findings: List[Dict[str, Any]]) -> Path:
+    """Write the compact, agent-facing report input: engagement meta, the OWASP
+    coverage matrix, and one block per finding (verified facts + a pointer to its
+    verifier evidence file for richer context)."""
+    rows = []
+    for f in findings:
+        rid = f.get("discovered_via_run_id") or f.get("run_id")
+        rows.append({
+            "title": f.get("title", ""),
+            "severity": f.get("severity", "medium"),
+            "cvss": f.get("cvss"),
+            "owasp_id": f.get("owasp_id") or "",
+            "affected_asset": f.get("affected_asset", ""),
+            "verified": bool(f.get("verified", False)),
+            "verifier_verdict": f.get("verifier_verdict", ""),
+            "technical_summary": f.get("description", ""),
+            "evidence": f.get("evidence", ""),
+            "commands": f.get("commands") or [],
+            "evidence_file": _best_verifier_file(rid, f),
+        })
+    payload = {
+        "engagement_name": eng.get("name", ""),
+        "client": eng.get("client", ""),
+        "target_scope": eng.get("target_scope", ""),
+        "objective": eng.get("objective", ""),
+        "roe": eng.get("roe", ""),
+        "coverage": _coverage(eng, findings),
+        "findings": rows,
+    }
+    path = OUTPUTS_DIR / "engagements" / f"{engagement_id}.reportwriter_input.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+async def _run_reportwriter_agent(engagement_id: str, eng: Dict[str, Any],
+                                  findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Drive the coder56_reporter (report-writer) agent to author the client-ready
+    report JSON. Raises HTTPException(502) on any failure — no silent empty."""
     from ..services.container_addr import get_container_address
     from ..services.opencode_client import (
         check_opencode_ready_async, create_session_async, send_prompt_async,
-        get_session_messages_async,
+        get_session_messages_async, abort_session_async,
     )
-
-    # 1. Deterministically pre-extract COMPLETE findings → reporter_input.json
-    #    per run (visible in-container under /outputs/<run_id>/). Each file is
-    #    already in the final output shape ({findings: [...]} with every field
-    #    filled: verifier status parsed, exact commands pulled from the verdict
-    #    log, prose derived). The reporter's job is just to merge + emit them.
-    input_paths: List[str] = []
-    for rid in run_ids:
-        # PRIMARY source = the phase reports (the agent's real F#/D# findings).
-        # Supplement/enrich with the emission log (verifier-tagged candidates +
-        # exact repro commands); fall back to emissions alone if no phase report
-        # was parseable.
-        findings = _extract_findings_from_phase_reports(rid)
-        ems = _extract_emission_findings(rid)
-        if findings and ems:
-            _enrich_findings_from_emissions(findings, ems)
-        elif not findings:
-            findings = ems
-        if not findings:
-            continue
-        try:
-            run_dir = OUTPUTS_DIR / rid
-            run_dir.mkdir(parents=True, exist_ok=True)
-            (run_dir / "reporter_input.json").write_text(
-                json.dumps({"run_id": rid, "findings": findings}, ensure_ascii=False),
-                encoding="utf-8")
-            input_paths.append(f"/outputs/{rid}/reporter_input.json")
-        except Exception as exc:
-            raise HTTPException(status_code=502,
-                                detail=f"Reporter setup failed (input for run {rid}): {exc}")
-    if not input_paths:
-        raise HTTPException(status_code=502,
-                            detail="No findings found in any run — neither the phase reports nor the verifier emissions produced a usable finding.")
-
-    live_runs = [rid for rid, _ in zip(run_ids, input_paths)]
-
-    # 2. Output file under the shared /outputs mount (engagements dir). Stale-guard.
-    out_rel = f"engagements/{engagement_id}.reporter.json"
+    _write_reportwriter_input(engagement_id, eng, findings)
+    in_container = f"/outputs/engagements/{engagement_id}.reportwriter_input.json"
+    out_rel = f"engagements/{engagement_id}.report.json"
     out_host = OUTPUTS_DIR / out_rel
     out_container = f"/outputs/{out_rel}"
     try:
         out_host.parent.mkdir(parents=True, exist_ok=True)
         out_host.unlink(missing_ok=True)
     except Exception as exc:
-        raise HTTPException(status_code=502,
-                            detail=f"Reporter setup failed (output path): {exc}")
+        raise HTTPException(status_code=502, detail=f"Report setup failed (output path): {exc}")
 
-    # 3. Ensure the sandbox (persistent, /outputs mounted, opencode on :4096).
     try:
         container_id = await _ensure_sandbox()
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=502,
-                            detail=f"Could not start the coder56 sandbox for the reporter: {exc}")
+        raise HTTPException(status_code=502, detail=f"Could not start the coder56 sandbox: {exc}")
     try:
         addr = await get_container_address(container_id)
         ready = await check_opencode_ready_async(host=addr, port=4096, timeout=30)
     except Exception as exc:
-        raise HTTPException(status_code=502,
-                            detail=f"OpenCode not reachable in sandbox: {exc}")
+        raise HTTPException(status_code=502, detail=f"OpenCode not reachable in sandbox: {exc}")
     if not (ready and ready.get("ready")):
-        raise HTTPException(status_code=502,
-                            detail=f"OpenCode not ready in sandbox after 30s: {ready}")
+        raise HTTPException(status_code=502, detail=f"OpenCode not ready in sandbox after 30s: {ready}")
 
-    # 4. Launch a reporter session.
-    prompt = _reporter_prompt(input_paths, live_runs, out_container, objective, scope)
-    create = await create_session_async(host=addr, port=4096, title=f"reporter-{engagement_id}")
+    prompt = (
+        "You are coder56_reporter — the senior penetration-test report writer. Author the client-ready "
+        "report per your system instructions and write ONE JSON file to the OUTPUT PATH.\n\n"
+        f"INPUT FILE: {in_container}\n"
+        f"OUTPUT PATH: {out_container}\n\n"
+        f"There are {len(findings)} finding(s). Read the input; optionally read a finding's evidence_file "
+        "for richer context; then write the output JSON atomically and stop. The backend detects completion "
+        "by the output file appearing. Preserve each finding's severity/cvss/owasp_id/affected_asset/verified "
+        "verbatim and rewrite only the prose. Write the executive summary + overall risk specific to THIS "
+        "engagement — no boilerplate, no internal/lab voice."
+    )
+    create = await create_session_async(host=addr, port=4096, title=f"reportwriter-{engagement_id}")
     if not create.get("success") or not create.get("session_id"):
         raise HTTPException(status_code=502,
-                            detail=f"Could not create a reporter OpenCode session: {create.get('error')}")
+                            detail=f"Could not create a report-writer session: {create.get('error')}")
     session_id = create["session_id"]
     send = await send_prompt_async(session_id, prompt, host=addr, port=4096,
-                                   agent=REPORTER_AGENT_NAME, async_mode=True)
+                                   agent=REPORTWRITER_AGENT_NAME, async_mode=True)
     if not send.get("success"):
-        await _safe_abort_session(session_id, addr)
+        try:
+            await abort_session_async(session_id=session_id, host=addr, port=4096)
+        except Exception:
+            pass
         raise HTTPException(status_code=502, detail=(
-            f"Could not send the reporter prompt — agent '{REPORTER_AGENT_NAME}' may not be baked into the "
-            f"opencode image / sandbox (rebuild ubuntu-24.04-opencode:0.1 + recreate sandbox): {send.get('error')}"))
+            f"Could not send the report-writer prompt — agent '{REPORTWRITER_AGENT_NAME}' may not be baked "
+            f"into the image (rebuild ubuntu-24.04-opencode:0.1 + POST /sandbox/restart): {send.get('error')}"))
 
-    # 5. Poll for the output file (primary completion signal) until the deadline.
-    deadline = time.monotonic() + REPORTER_TIMEOUT_S
+    deadline = time.monotonic() + REPORTWRITER_TIMEOUT_S
     session_err: Optional[str] = None
-    file_appeared = False
+    appeared = False
     while time.monotonic() < deadline:
         await asyncio.sleep(5)
         if out_host.exists():
-            file_appeared = True
+            appeared = True
             break
-        # Best-effort early-out if the session died.
         try:
             res = await get_session_messages_async(session_id=session_id, host=addr, port=4096)
             err = str(res.get("error") or "")
@@ -3478,72 +4397,77 @@ async def _run_reporter_agent(engagement_id: str, run_ids: List[str],
                 break
         except Exception:
             pass
-
-    if not file_appeared:
-        await _safe_abort_session(session_id, addr)
+    if not appeared:
+        try:
+            await abort_session_async(session_id=session_id, host=addr, port=4096)
+        except Exception:
+            pass
         if session_err:
             raise HTTPException(status_code=502,
-                                detail=f"Reporter session disappeared mid-run ({session_err}). Check sandbox session {session_id}.")
+                                detail=f"Report-writer session disappeared ({session_err}).")
         raise HTTPException(status_code=502, detail=(
-            f"Reporter agent did not finish within {REPORTER_TIMEOUT_S}s. The run transcript is large; "
-            f"retry, or draft from a single run. (sandbox session {session_id})"))
+            f"Report-writer agent did not finish within {REPORTWRITER_TIMEOUT_S}s (session {session_id}). "
+            "Retry, or reduce the finding set."))
 
-    # 6. Parse + validate the output file.
     try:
-        raw_text = out_host.read_text(encoding="utf-8", errors="ignore")
-        result = json.loads(raw_text)
+        result = json.loads(out_host.read_text(encoding="utf-8", errors="ignore"))
     except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Report-writer output was not valid JSON: {exc}.")
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail="Report-writer output was not a JSON object.")
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=f"Report-writer reported an error: {result.get('error')}")
+    if not isinstance(result.get("findings"), list) or not result.get("executive_summary"):
         raise HTTPException(status_code=502,
-                            detail=f"Reporter output was not valid JSON: {exc}. First 200 chars: {raw_text[:200]!r}")
-    raw_findings = result.get("findings") if isinstance(result, dict) else None
-    if not isinstance(raw_findings, list):
-        err = result.get("error") if isinstance(result, dict) else None
-        raise HTTPException(status_code=502,
-                            detail=f"Reporter output had no 'findings' list{' (' + err + ')' if err else ''}.")
-    return _coerce_reporter_findings(raw_findings)
+                            detail="Report-writer output missing required fields (executive_summary/findings).")
+    return result
 
 
-@router.post("/engagements/{engagement_id}/findings/draft")
-async def draft_findings(engagement_id: str, req: FindingsDraftRequest) -> Dict[str, Any]:
-    """Draft findings from the engagement's ON-DISK run artifacts via the
-    coder56_reporter opencode agent (runs in the persistent sandbox, reads the
-    full transcript in chunks — no single-call size limit).
-
-    Returns suggestions (FindingCreate-shaped, incl. verifier status + exact
-    repro commands) — NOT persisted; the operator reviews and POSTs the ones
-    they keep. Raises HTTP 502 with the reason on any failure (sandbox down,
-    agent error, timeout, unparseable output) — never a silently-empty list."""
+@router.post("/engagements/{engagement_id}/report/write", response_class=HTMLResponse)
+async def write_engagement_report(engagement_id: str) -> HTMLResponse:
+    """Generate the client-ready report: the coder56_reporter report-writer agent
+    authors the narrative from the engagement's findings (+ verifier evidence),
+    the backend renders it to print-ready HTML and caches it. GET report.html then
+    serves the cached version. Uses saved findings if any, else drafts in-process."""
     _valid_token(engagement_id, "engagement_id")
     eng = _read_engagement(engagement_id)
     if not eng:
         raise HTTPException(status_code=404, detail="Engagement not found")
+    saved = eng.get("findings") or []
+    if saved:
+        findings = saved
+    else:
+        live = [r for r in (eng.get("run_ids") or []) if _read_run_meta(r)]
+        findings = _coerce_reporter_findings(_draft_findings_inprocess(eng, live)) if live else []
+    if not findings:
+        raise HTTPException(status_code=409,
+                            detail="No findings to report. Draft/save findings first, or run the engagement.")
+    report = await _run_reportwriter_agent(engagement_id, eng, findings)
+    detail = _engagement_detail(eng)
+    runs = detail["runs"]
+    verdicts_by_run = {rid: _read_verdicts_raw(rid, 200) for rid in (eng.get("run_ids") or [])}
+    html = render_client_report(eng, report, runs, mitre_catalog(), verdicts_by_run)
+    cache = OUTPUTS_DIR / "engagements" / f"{engagement_id}.report.html"
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(html, encoding="utf-8")
+    except Exception:
+        pass  # serving the response does not require the cache to persist
+    return HTMLResponse(html)
 
-    run_ids = eng.get("run_ids") or []
-    live_runs = [rid for rid in run_ids if _read_run_meta(rid)]
-    if not live_runs:
-        return {"findings": [], "note": "No run artifacts found yet. Run the engagement, then draft findings."}
-
-    findings = await _run_reporter_agent(
-        engagement_id, live_runs, eng.get("objective") or "", eng.get("target_scope") or "")
-    note = (f"Reporter agent drafted {len(findings)} finding(s) from {len(live_runs)} run(s) "
-            f"— review, edit, and save the ones you keep.")
-    return {"findings": findings, "note": note}
-
-
-# =============================================================================
-# Report (self-contained, print-ready HTML)
-# =============================================================================
 
 @router.get("/engagements/{engagement_id}/report.html", response_class=HTMLResponse)
 async def engagement_report(engagement_id: str) -> HTMLResponse:
-    """Render the full engagement report as a self-contained, print-ready HTML
-    page (cover, exec summary, scope/RoE, MITRE methodology, findings by
-    severity, evidence appendix). Opened in a new tab; the user prints / saves
-    as PDF via the page's toolbar (no binary PDF deps)."""
+    """Serve the client-ready report: the agent-authored version if it has been
+    generated (POST .../report/write) and cached, else the deterministic fallback.
+    Self-contained, print-ready; the user prints / saves as PDF via the toolbar."""
     _valid_token(engagement_id, "engagement_id")
     eng = _read_engagement(engagement_id)
     if not eng:
         raise HTTPException(status_code=404, detail="Engagement not found")
+    cached = OUTPUTS_DIR / "engagements" / f"{engagement_id}.report.html"
+    if cached.exists():
+        return HTMLResponse(cached.read_text(encoding="utf-8", errors="ignore"))
     detail = _engagement_detail(eng)
     runs = detail["runs"]
     verdicts_by_run = {rid: _read_verdicts_raw(rid, 200) for rid in (eng.get("run_ids") or [])}
@@ -3559,34 +4483,44 @@ async def get_mitre_catalog() -> Dict[str, Any]:
     return mitre_catalog()
 
 
+@router.get("/owasp/catalog")
+async def get_owasp_catalog() -> Dict[str, Any]:
+    """OWASP Top 10 (2021) category catalog for the goal-builder / OWASP plan
+    drafting. Mirrors /mitre/catalog."""
+    return owasp_catalog()
+
+
 @router.get("/runs")
 async def list_runs() -> Dict[str, Any]:
-    """Recent run ids under /outputs (those with a guardrail/ dir first).
+    """Recent real runs under /outputs.
 
-    Skips the shared `engagements/` store dir so it never surfaces as a phantom
-    run. Each run is enriched with its `engagement_id` (read from the manifest)
-    so the flat list can badge linked vs standalone runs."""
+    A directory is a run only when it has a guardrail/run.json manifest. This
+    excludes support stores such as .session-runs, engagements, verifier, and
+    memory from appearing as phantom executions.
+    """
     out: List[Dict[str, Any]] = []
     if OUTPUTS_DIR.exists():
         for child in OUTPUTS_DIR.iterdir():
             if not child.is_dir():
                 continue
-            if child.name == "engagements":
-                continue  # the engagement store, not a run
             gr = child / "guardrail"
+            meta_path = gr / "run.json"
+            if not meta_path.exists():
+                continue
             try:
-                mtime = gr.stat().st_mtime if gr.exists() else child.stat().st_mtime
+                mtime = gr.stat().st_mtime
             except OSError:
                 mtime = 0
-            # Cheap enrichment: engagement_id if the manifest carries it.
-            engagement_id = None
-            meta_path = gr / "run.json"
-            if meta_path.exists():
-                try:
-                    engagement_id = json.loads(meta_path.read_text(encoding="utf-8")).get("engagement_id")
-                except Exception:
-                    engagement_id = None
-            out.append({"run_id": child.name, "has_guardrail": gr.exists(),
-                        "mtime": mtime, "engagement_id": engagement_id})
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            out.append({
+                "run_id": child.name,
+                "has_guardrail": True,
+                "mtime": mtime,
+                "engagement_id": meta.get("engagement_id"),
+                "status": _run_overall_status(meta),
+            })
     out.sort(key=lambda r: r.get("mtime", 0), reverse=True)
     return {"runs": out[:50]}

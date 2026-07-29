@@ -1119,6 +1119,16 @@ class GuideRequest(BaseModel):
     prompt: str
 
 
+class JudgeFailRequest(BaseModel):
+    """Live-toggle the guardrail's judge-unavailable fallback for a run.
+
+    'escalate' (default, fail-safe) holds a command for operator review when the
+    guardrail JUDGE itself can't produce a verdict; 'allow' executes it instead of
+    stalling on judge downtime. Applies only to verdict===null (judge unreachable).
+    """
+    value: str
+
+
 # -----------------------------------------------------------------------------
 # Engagements + Findings (grouped executions + curated pentest report data)
 #
@@ -1177,6 +1187,7 @@ class FindingCreate(BaseModel):
     verified: bool = Field(default=False, description="Independently confirmed by the coder56_verifier subagent")
     verifier_verdict: str = Field(default="", description="Verifier verdict line (CONFIRMED / NOT_A_VULN / refuted)")
     commands: List[str] = Field(default_factory=list, description="Exact repro commands that prove the finding")
+    owasp_id: Optional[str] = Field(default=None, description="OWASP Top-10 category (A01-A10) this finding maps to, when drafted from an OWASP plan")
 
 
 # Defined BEFORE Engagement because Engagement.findings references Finding
@@ -1187,6 +1198,50 @@ class Finding(FindingCreate):
     engagement_id: str
     created_at: str
     updated_at: str
+
+
+# -----------------------------------------------------------------------------
+# OWASP Top 10 plan (drafted per-category runs)
+#
+# An engagement may carry a `plan`: a drafted run per OWASP Top 10 category
+# (A01-A10), generated from one shared scope+target. Each PlannedRun is a
+# *draft* — it holds the objective/checklist/tools but is NOT a real run until
+# the operator materializes it (POST .../plan/{owasp_id}/run), which calls the
+# existing launch() and records the resulting run_id back here. This lets an
+# operator "draft 10, run one at a time, any order".
+#
+# Defined BEFORE Engagement because Engagement.plan references PlannedRun
+# (annotations are evaluated eagerly at class-definition time — no forward refs).
+# -----------------------------------------------------------------------------
+class PlannedRunStatus(str, Enum):
+    """Lifecycle state of a drafted per-category run."""
+    PLANNED = "planned"       # drafted, not yet executed
+    RUNNING = "running"       # materialized into a real run (launch() called)
+    DONE = "done"             # operator marked the category assessed
+    SKIPPED = "skipped"       # deliberately not assessed (e.g. white-box-only)
+
+
+class PlannedRun(BaseModel):
+    """One drafted run in the engagement's OWASP plan.
+
+    `objective` is the primary input (what this category-run should achieve),
+    scoped to the engagement target via the catalog's objective_template.
+    """
+    owasp_id: str = Field(..., description="OWASP category id, e.g. A03")
+    title: str = Field(default="", description="OWASP category name, e.g. 'Injection'")
+    objective: str = Field(default="", description="Scoped objective for this category-run")
+    checklist: List[str] = Field(default_factory=list, description="WSTG-style sub-tests")
+    tools: List[str] = Field(default_factory=list, description="Recommended tools")
+    scope_notes: str = Field(default="", description="In/out-of-scope guidance for the guardrail")
+    assessable: str = Field(default="black-box", description="black-box | white-box-only")
+    status: PlannedRunStatus = Field(default=PlannedRunStatus.PLANNED)
+    run_id: Optional[str] = Field(default=None, description="Real run_id once materialized via launch()")
+    run_at: str = Field(default="", description="ISO timestamp of the last materialization")
+    # LLM-drafted phased execution plan for this category (like a normal run's
+    # goal/draft). Empty until the operator drafts phases; when non-empty the run
+    # materializes as a phased native_subagents run instead of a single-shot.
+    phases: List[PhaseSpec] = Field(default_factory=list)
+    phase_draft_note: str = Field(default="", description="LLM draft summary / status note")
 
 
 class EngagementCreate(BaseModel):
@@ -1201,12 +1256,16 @@ class EngagementCreate(BaseModel):
 
 class Engagement(EngagementCreate):
     """A persisted engagement. `run_ids` links to run manifests; `findings` is
-    the curated list (kept in the same JSON for atomic writes)."""
+    the curated list (kept in the same JSON for atomic writes). `plan` is the
+    optional OWASP Top 10 drafted-runs ledger; `plan_launch` holds the default
+    'where coder56 runs' settings applied when a planned run is materialized."""
     id: str
     created_at: str
     updated_at: str
     run_ids: List[str] = Field(default_factory=list)
     findings: List[Finding] = Field(default_factory=list)
+    plan: List[PlannedRun] = Field(default_factory=list, description="Drafted per-OWASP-category runs")
+    plan_launch: Optional[Dict[str, Any]] = Field(default=None, description="Default launch target (topology_id/host_id/isolated/criticality)")
 
 
 class EngagementUpdate(BaseModel):
@@ -1244,6 +1303,31 @@ class AddRunRequest(BaseModel):
 class FindingsDraftRequest(BaseModel):
     """Ask the LLM to draft findings from an engagement's on-disk run artifacts."""
     engagement_id: str
+    owasp_id: Optional[str] = Field(default=None, description="Restrict the draft to one OWASP category's run (A01-A10)")
+
+
+class OwaspPlanRequest(BaseModel):
+    """Generate (or regenerate) the OWASP Top 10 plan for an engagement from one
+    shared scope+target. The 10 drafted runs are produced deterministically from
+    the catalog (owasp_catalog.py); no LLM call required."""
+    target_scope: Optional[str] = Field(default=None, description="Override engagement target_scope for objective templating")
+    objective: Optional[str] = Field(default=None, description="Optional engagement-level objective prefix folded into each run")
+    topology_id: Optional[str] = Field(default=None, description="Default 'where coder56 runs' for materializing a planned run")
+    host_id: Optional[str] = Field(default=None, description="Default coder56 host for materializing a planned run")
+    isolated: bool = Field(default=False, description="Default: materialize planned runs into the isolated sandbox")
+    criticality: Criticality = Field(default=Criticality.MEDIUM)
+
+
+class PlannedRunUpdate(BaseModel):
+    """PATCH fields for a drafted planned run (status / objective / phases)."""
+    status: Optional[PlannedRunStatus] = None
+    objective: Optional[str] = None
+    phases: Optional[List[PhaseSpec]] = None
+
+
+class PlannedPhaseDraftRequest(BaseModel):
+    """Request the LLM to draft a phased plan for one OWASP planned run."""
+    depth: str = Field(default="standard", description="brief | standard | thorough")
 
 
 # =============================================================================

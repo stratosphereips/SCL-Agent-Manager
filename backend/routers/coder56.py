@@ -43,7 +43,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
@@ -113,6 +113,148 @@ def _engagement_lock(engagement_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _engagement_locks[engagement_id] = lock
     return lock
+
+# ---------------------------------------------------------------------------
+# Container-busy guard (one-run-per-host hard launch gate)
+#
+# Two launches against the same (topology_id, host_id) MUST NOT coexist: the
+# lead-driver writes the shared per-host guardrail state (mode.txt/goal.txt) and
+# drives ONE coder56_lead session, so a second launch would silently clobber the
+# first run's manifest and verdicts.  The guard is enforced as a HARD launch gate
+# (HTTP 409 before any topology bring-up) using two independent signals:
+#   1. an in-process registry of active lead-driver tasks per host (instant,
+#      authoritative for live runs); AND
+#   2. a restart-surviving scan of recent guardrail verdicts for that host
+#      (the registry is wiped on a dashboard restart, so a run that is still
+#      live in the container must still be detected).
+# Either signal busy => refuse.  The registry is released when _lead_driver exits
+# (see _release_host_run) so a host frees up as soon as its run finishes.
+# ---------------------------------------------------------------------------
+BUSY_RECENT_VERDICT_S = float(os.getenv("CODER56_BUSY_VERDICT_S", "600"))
+_active_host_runs: Dict[Tuple[str, str], Dict[str, str]] = {}
+
+
+def _host_key(topology_id: str, host_id: str) -> Tuple[str, str]:
+    """Normalization point for the registry key (trim + lower the host id)."""
+    return ((topology_id or "").strip(), (host_id or "").strip())
+
+
+def _parse_iso_ts(raw: str) -> Optional[float]:
+    """Parse an ISO-8601 timestamp (with trailing 'Z' or +00:00) to epoch seconds.
+    Returns None if unparseable."""
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _recent_host_verdict_ts(topology_id: str, host_id: str) -> Optional[float]:
+    """Most-recent guardrail verdict epoch-seconds across runs on this host.
+    Scans every /outputs/<run>/guardrail/run.json for matching topology/host,
+    then reads the last ts of that run's verdicts.ndjson.  Restart-surviving:
+    if a run is still live in the container (verdicts streaming) this catches it
+    even after the in-process registry was wiped."""
+    key = _host_key(topology_id, host_id)
+    if not key[0] or not key[1]:
+        return None
+    if not OUTPUTS_DIR.exists():
+        return None
+    latest: Optional[float] = None
+    try:
+        children = list(OUTPUTS_DIR.iterdir())
+    except Exception:
+        return None
+    for child in children:
+        if not child.is_dir():
+            continue
+        meta_path = child / "guardrail" / "run.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if _host_key(meta.get("topology_id", ""), meta.get("host_id", "")) != key:
+            continue
+        vpath = child / "guardrail" / "verdicts.ndjson"
+        if not vpath.exists():
+            continue
+        try:
+            # Tail-read the last line only (verdicts files can be large).
+            with vpath.open("rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                if size == 0:
+                    continue
+                block = b""
+                pos = size - 1
+                while pos > 0 and block.count(b"\n") < 2:
+                    step = min(2048, pos)
+                    fh.seek(pos - step)
+                    block = fh.read(step) + block
+                    pos -= step
+                last_line = block.strip().split(b"\n")[-1]
+            if not last_line:
+                continue
+            rec = json.loads(last_line.decode("utf-8", errors="ignore"))
+        except Exception:
+            continue
+        ts = _parse_iso_ts(rec.get("ts") or rec.get("timestamp"))
+        if ts is not None and (latest is None or ts > latest):
+            latest = ts
+    return latest
+
+
+def _host_busy_state(topology_id: str, host_id: str) -> Dict[str, Any]:
+    """Decide whether a host is already running a coder56 engagement.
+    Returns {busy, reason, run_id, since, last_verdict_ts}."""
+    key = _host_key(topology_id, host_id)
+    if not key[0] or not key[1]:
+        return {"busy": False, "reason": "", "run_id": "", "since": "",
+                "last_verdict_ts": None}
+
+    # Signal 1: in-process registry of live lead-driver tasks.
+    entry = _active_host_runs.get(key)
+    if entry:
+        run_id = entry.get("run_id", "")
+        task = _lead_drivers.get(run_id) if run_id else None
+        if task and not task.done():
+            return {"busy": True, "reason": "lead-driver active",
+                    "run_id": run_id, "since": entry.get("since", ""),
+                    "last_verdict_ts": _recent_host_verdict_ts(*key)}
+        # Stale registry entry (driver already gone): drop it so it can't block.
+        _active_host_runs.pop(key, None)
+
+    # Signal 2: recent verdicts for this host (restart-surviving fallback).
+    last_ts = _recent_host_verdict_ts(*key)
+    if last_ts is not None and (time.time() - last_ts) < BUSY_RECENT_VERDICT_S:
+        return {"busy": True, "reason": f"recent guardrail verdict (within {int(BUSY_RECENT_VERDICT_S)}s)",
+                "run_id": "", "since": "",
+                "last_verdict_ts": last_ts}
+
+    return {"busy": False, "reason": "", "run_id": "",
+            "since": "", "last_verdict_ts": last_ts}
+
+
+def _register_host_run(topology_id: str, host_id: str, run_id: str,
+                       container_id: str = "") -> None:
+    """Mark a host busy (one run per host).  Idempotent for the same run_id."""
+    key = _host_key(topology_id, host_id)
+    if not key[0] or not key[1] or not run_id:
+        return
+    _active_host_runs[key] = {"run_id": run_id, "since": _now_iso(),
+                              "container_id": container_id}
+
+
+def _release_host_run(topology_id: str, host_id: str, run_id: str) -> None:
+    """Free a host when its run ends.  Only clears the entry if it still points
+    at this run_id (a newer run may have legitimately taken the slot)."""
+    key = _host_key(topology_id, host_id)
+    entry = _active_host_runs.get(key)
+    if entry and entry.get("run_id") == run_id:
+        _active_host_runs.pop(key, None)
 
 # Drafting an engagement plan can require a long inference queue on the shared
 # provider.  Four minutes was not enough during normal provider load and caused
@@ -274,6 +416,58 @@ def _write_engagement(engagement_id: str, data: Dict[str, Any]) -> None:
     _atomic_write(_engagement_path(engagement_id), data)
 
 
+# Private/reserved IP ranges that are NEVER considered "external/production".
+# Recommendation #5: judge_fail=allow must be refused for any target that is
+# non-RFC1918 / externally-routable. We treat loopback, link-local, and all of
+# RFC1918 (which already covers the lab's 172.25.0.0/x scl-playground bridge
+# and the docker/topology bridges) as internal; anything else (a public IP or
+# a routable CIDR) is external. Hostnames/URLs with no IP literal are treated
+# as conservatively-internal (lab topology hosts are named), because we cannot
+# resolve them offline here — the gate is about IP-bearing scopes.
+import ipaddress as _ipaddress
+
+_PRIVATE_NETS = [
+    _ipaddress.ip_network("10.0.0.0/8"),
+    _ipaddress.ip_network("172.16.0.0/12"),
+    _ipaddress.ip_network("192.168.0.0/16"),
+    _ipaddress.ip_network("127.0.0.0/8"),     # loopback
+    _ipaddress.ip_network("169.254.0.0/16"),  # link-local
+]
+
+
+def _scope_is_external_target(scope: str) -> bool:
+    """True if scope contains ANY routable (non-private) IP literal or CIDR.
+
+    Hostnames/URLs without an IP literal return False (cannot classify offline;
+    named lab hosts must not be blocked). A single public IP in the scope makes
+    the whole engagement 'external'."""
+    if not scope:
+        return False
+    # Extract dotted-quad IPv4 literals and CIDRs (1.2.3.4 or 1.2.3.0/24).
+    tokens = re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?\b", scope)
+    for tok in tokens:
+        try:
+            net = _ipaddress.ip_network(tok, strict=False)
+        except ValueError:
+            continue
+        if not any(net.subnet_of(priv) for priv in _PRIVATE_NETS):
+            return True
+    return False
+
+
+def _engagement_target_is_external(engagement_id: Optional[str]) -> bool:
+    """True if the engagement's target_scope names an externally-routable target.
+
+    Returns False when there is no engagement, no scope, or the scope is private
+    / hostname-only (the operator-allowable cases)."""
+    if not engagement_id:
+        return False
+    eng = _read_engagement(engagement_id)
+    if not eng:
+        return False
+    return _scope_is_external_target((eng.get("target_scope") or "").strip())
+
+
 def _new_id() -> str:
     return uuid.uuid4().hex[:12]
 
@@ -299,9 +493,18 @@ def _sort_findings(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _run_overall_status(meta: Dict[str, Any]) -> str:
-    """Derive the user-facing lifecycle from durable manifest state."""
+    """Derive the user-facing lifecycle from durable manifest state.
+
+    A manifest-level HALT (set by the circuit breaker / no-op detector) takes
+    PRECEDENCE over the all-phases-completed derivation: run b1425481 had 4/4
+    phases 'completed' yet was a dead-judge failure, so without this override a
+    halted run would still surface as 'completed'. An undecided-escalate pause is
+    reported as 'awaiting_review' (recoverable operator hold), not 'failed'.
+    """
     if not meta.get("accepted"):
         return "awaiting_accept"
+    if meta.get("halted") or str(meta.get("status") or "").lower() == "failed":
+        return "failed"
     runtime = meta.get("phase_runtime") or []
     if runtime:
         statuses = [str(p.get("status") or "") for p in runtime]
@@ -377,6 +580,26 @@ def _run_memory_path(run_id: str) -> Path:
     return OUTPUTS_DIR / run_id / "memory" / "MEMORY.md"
 
 
+def _phase0_complete(engagement_id: Optional[str]) -> bool:
+    """Phase 0 is complete enough to advance past when the engagement's shared
+    memory carries the THREAT_MODEL| record (fallback: at least TARGET_IDENTITY|).
+    The deployed coder56_phase Phase-0 worker emits both per
+    PHASE0_TARGET_VALIDATION_BLOCK. Used by the Phase-0 hard guard
+    (advance_phase) and the auto-mode nudge (_lead_driver) so glm-5.2 cannot
+    skip scoping and dive straight into deep testing (it did on the OpenHospital
+    run — TARGET_IDENTITY| was grabbed but no THREAT_MODEL| was emitted)."""
+    if not engagement_id:
+        return False
+    try:
+        path = _engagement_memory_path(engagement_id)
+        if not path.exists():
+            return False
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+    return ("THREAT_MODEL|" in text) or ("TARGET_IDENTITY|" in text)
+
+
 def _memory_seed_header(eng: Dict[str, Any]) -> str:
     """Self-describing header for a fresh engagement memory file."""
     name = (eng.get("name") or eng.get("id") or "").strip()
@@ -389,6 +612,19 @@ def _memory_seed_header(eng: Dict[str, Any]) -> str:
         lines.append(f"**Target scope:** {scope}")
     if obj:
         lines.append(f"**Objective:** {obj}")
+    eid = (eng.get("id") or "").strip()
+    if eid:
+        # C1: make the engagement identity explicit so memory is keyed by
+        # (engagement, target_fingerprint) and a repointed host is detected.
+        lines.append(f"**Engagement id:** {eid}")
+    # C1 TARGET-IDENTITY: the fingerprint the phase worker re-checks at each phase
+    # boundary (single-line JSON so it is trivially greppable + parseable).
+    fp = eng.get("target_fingerprint")
+    if isinstance(fp, dict) and fp:
+        try:
+            lines.append("**TARGET FINGERPRINT:** " + json.dumps(fp, ensure_ascii=False, separators=(",", ":")))
+        except Exception:
+            pass
     lines += [
         "",
         "_Shared long-term notebook across ALL runs and phases of this "
@@ -520,6 +756,13 @@ async def _resolve_container_id(topology_id: str, host_id: str) -> str:
     from .containers import get_container_by_host
     try:
         detail = await get_container_by_host(topology_id, host_id)
+        raw_state = detail.container.state
+        state = str(getattr(raw_state, "value", raw_state) or "").lower()
+        if state != "running":
+            raise HTTPException(
+                status_code=404,
+                detail=f"Container for host {host_id} is not running (state={state or 'unknown'})",
+            )
         return detail.container.container_id
     except HTTPException:
         raise
@@ -589,23 +832,54 @@ async def _fix_egress(container_id: str) -> str:
         return ""
 
 
+def _launched_at_epoch_ms(run_id: str, meta: Dict[str, Any]) -> Optional[int]:
+    """Resolve the run's launch instant as epoch-MILLIS, the unit opencode.db
+    stores in session.time_created (e.g. 1785706219570). launched_at is written
+    by _finalize_run as an ISO-8601 string (_now_iso). Returns None if unknown
+    (caller then skips filtering rather than risk dropping everything)."""
+    raw = meta.get("launched_at") or ""
+    if isinstance(raw, (int, float)):
+        val = int(raw)
+        return val if val > 10_000_000_000 else val * 1000  # seconds->ms heuristic
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except (TypeError, ValueError):
+        return None
+
+
 async def _snapshot_opencode_db(run_id: str) -> None:
     """Persist the run's ephemeral opencode.db (agent transcripts + per-session
     token totals) to OUTPUTS_DIR/<run_id>/opencode.db so it survives host/
     container recreate. Only /outputs is mounted into the run container, so the
     in-container opencode.db is otherwise lost the moment the host is recreated.
 
-    Best-effort: called on every lead-driver exit (phase review-gate, auto-
-    continue completion, stall/timeout); never raises. Uses `sqlite3 .backup`
-    inside the container for a consistent online snapshot of the live (possibly
-    WAL-open) database. run_id is _valid_token-validated (no shell metachars)."""
+    The live container opencode.db is SHARED across every run on that host, so a
+    raw `sqlite3 .backup` absorbs earlier runs' sessions (run2 inherited run1's).
+    After the backup we therefore (1) keep a FULL unfiltered copy at
+    opencode.db.full for forensics and (2) FILTER opencode.db to drop every
+    session/message/part whose time_created predates THIS run's launched_at
+    (epoch-ms), always keeping the run's own root session. opencode's schema
+    cascades session->message/part/session_message/session_input on delete, but
+    SQLite has FK enforcement OFF by default and the in-container binary is
+    version-variable, so we delete the child rows by their own time_created too
+    (belt-and-suspenders) before VACUUM.
+
+    Best-effort: called on every driver exit (lead + phase, incl. review-gate,
+    auto-continue completion, stall/timeout/watchdog kill, graceful finalize);
+    never raises. run_id is _valid_token-validated (no shell metachars)."""
     try:
         meta = _read_run_meta(run_id)
         container_id = meta.get("container_id", "")
         if not container_id:
             return
         dst_dir = OUTPUTS_DIR / run_id
-        script = (
+        root_session = str(meta.get("session_id") or "")
+        launched_ms = _launched_at_epoch_ms(run_id, meta)
+        # Back up the live (WAL-open) db first, into opencode.db (full).
+        backup_script = (
             "set -e; "
             "DST='/outputs/" + run_id + "'; "
             "mkdir -p \"$DST\"; "
@@ -616,7 +890,7 @@ async def _snapshot_opencode_db(run_id: str) -> None:
         )
         async with create_docker_client() as docker_client:
             container = await docker_client.docker.containers.get(container_id)
-            exec_inst = await container.exec(cmd=["sh", "-c", script], stdout=True, stderr=True)
+            exec_inst = await container.exec(cmd=["sh", "-c", backup_script], stdout=True, stderr=True)
             out = b""
             async with exec_inst.start(detach=False) as stream:
                 while True:
@@ -626,10 +900,77 @@ async def _snapshot_opencode_db(run_id: str) -> None:
                     out += msg.data if isinstance(msg.data, bytes) else str(msg.data).encode()
         text = out.decode("utf-8", "replace").strip()
         last = text.splitlines()[-1] if text else ""
-        if last == "SNAP_OK":
-            logger.info("snapshot_opencode_db[%s]: saved -> %s", run_id, dst_dir / "opencode.db")
-        else:
+        if last != "SNAP_OK":
             logger.warning("snapshot_opencode_db[%s]: %s", run_id, text or "(no output)")
+            return
+        logger.info("snapshot_opencode_db[%s]: saved -> %s", run_id, dst_dir / "opencode.db")
+
+        # Forensic full copy (absorbs all prior host sessions — never filtered).
+        if launched_ms is None:
+            logger.info("snapshot_opencode_db[%s]: launched_at unknown; skipping per-run filter (full snapshot kept)", run_id)
+            return
+        try:
+            full_path = dst_dir / "opencode.db.full"
+            if not full_path.exists():
+                # Only keep the first full copy per run (it already contains all
+                # prior sessions; later snapshots are subsets of this one).
+                (dst_dir / "opencode.db").replace(full_path)
+                # Re-backup the filtered source from the live db.
+                rebackup = (
+                    "set -e; DST='/outputs/" + run_id + "'; "
+                    "SRC=/root/.local/share/opencode/opencode.db; "
+                    "sqlite3 \"$SRC\" \".backup '$DST/opencode.db'\" && echo FULL_OK;"
+                )
+                async with create_docker_client() as docker_client:
+                    container = await docker_client.docker.containers.get(container_id)
+                    ei = await container.exec(cmd=["sh", "-c", rebackup], stdout=True, stderr=True)
+                    rb = b""
+                    async with ei.start(detach=False) as stream:
+                        while True:
+                            m = await stream.read_out()
+                            if m is None:
+                                break
+                            rb += m.data if isinstance(m.data, bytes) else str(m.data).encode()
+                if (rb.decode("utf-8", "replace").strip().splitlines() or [""])[-1] != "FULL_OK":
+                    logger.warning("snapshot_opencode_db[%s]: full-copy rebackup failed; keeping unfiltered snapshot", run_id)
+                    return
+        except Exception as exc:
+            logger.warning("snapshot_opencode_db[%s]: forensic full copy failed (%s); proceeding to filter", run_id, exc)
+
+        # Filter opencode.db to THIS run only: drop rows older than launched_at.
+        # root_session (the coder56 lead/launch session) is always retained even
+        # if its time_created edge-cases below the threshold. PRAGMA foreign_keys
+        # ON enables session->message/part cascade; child deletes are repeated
+        # explicitly for FK-off safety. Threshold is an integer literal (epoch-ms
+        # from _launched_at_epoch_ms, never user-controlled), and root_session is
+        # a _valid_token session id — both safe to interpolate.
+        keep_root = f" AND id != '{root_session}'" if root_session else ""
+        filter_script = (
+            "set -e; DST='/outputs/" + run_id + "/opencode.db'; "
+            "sqlite3 \"$DST\" \""
+            "PRAGMA foreign_keys=ON; "
+            "DELETE FROM session WHERE time_created < " + str(int(launched_ms)) + keep_root + "; "
+            "DELETE FROM message WHERE time_created < " + str(int(launched_ms)) + "; "
+            "DELETE FROM part WHERE time_created < " + str(int(launched_ms)) + "; "
+            "VACUUM; "
+            "\" && echo FILTER_OK;"
+        )
+        fout = b""
+        async with create_docker_client() as docker_client:
+            container = await docker_client.docker.containers.get(container_id)
+            exec_inst = await container.exec(cmd=["sh", "-c", filter_script], stdout=True, stderr=True)
+            async with exec_inst.start(detach=False) as stream:
+                while True:
+                    msg = await stream.read_out()
+                    if msg is None:
+                        break
+                    fout += msg.data if isinstance(msg.data, bytes) else str(msg.data).encode()
+        ft = fout.decode("utf-8", "replace").strip()
+        if (ft.splitlines() or [""])[-1] == "FILTER_OK":
+            logger.info("snapshot_opencode_db[%s]: filtered to sessions since launch (>= %d ms); full copy at opencode.db.full",
+                        run_id, launched_ms)
+        else:
+            logger.warning("snapshot_opencode_db[%s]: filter step output: %s", run_id, ft or "(no output)")
     except Exception as exc:
         logger.warning("snapshot_opencode_db[%s] failed: %s", run_id, exc)
 
@@ -929,6 +1270,14 @@ async def _finalize_run(req: LaunchRequest, container_id: str, *, topology_id: s
     except Exception:
         pass
 
+    # Option A: an objective-only launch (no drafted phases) still runs as a
+    # structural threat-model-driven native_subagents engagement. Synthesize the
+    # default Phase 0..3 skeleton so the run goes through coder56_lead + Phase 0 +
+    # _lead_driver + finalization, instead of degrading to legacy single-shot
+    # (which bypassed the entire methodology restructure). run_planned_run always
+    # passes non-empty phases, so it is unaffected. See _default_threatmodel_phases.
+    run_phases = list(req.phases) or _default_threatmodel_phases(req.directive)
+
     _atomic_write(_run_meta_path(run_id), {
         "run_id": run_id,
         "container_id": container_id,
@@ -945,7 +1294,7 @@ async def _finalize_run(req: LaunchRequest, container_id: str, *, topology_id: s
         "accepted": False,
         # Per-phase orchestration. `phases` is the operator's chain (empty =>
         # legacy single-shot). `current_phase` = -1 until accept starts phase 0.
-        "phases": [p.dict() for p in req.phases],
+        "phases": [p.dict() for p in run_phases],
         "phase_mode": req.phase_mode.value,
         # P2-6: backend session-per-phase path removed; all phased runs use
         # native_subagents (coder56_lead spawns coder56_phase children). Pinned
@@ -958,12 +1307,19 @@ async def _finalize_run(req: LaunchRequest, container_id: str, *, topology_id: s
              "objective": p.objective, "tactic_id": p.tactic_id,
              "technique_ids": list(p.technique_ids), "session_id": "",
              "result": "", "started_at": "", "completed_at": ""}
-            for i, p in enumerate(req.phases)
+            for i, p in enumerate(run_phases)
         ],
         # Additive engagement link (absent on legacy runs). Lets the legacy
         # /run/:runId redirect resolve its engagement without scanning files.
         "engagement_id": req.engagement_id,
     })
+
+    # Container-busy guard: lock this host to the new run the instant its manifest
+    # is written (the shared launch tail for topology + isolated paths). A
+    # subsequent launch on the same (topology_id, host_id) will hit the 409 gate
+    # in launch()/_finalize_run until the lead-driver releases it. Released on
+    # driver exit (see _lead_driver) and cleared if the task is already gone.
+    _register_host_run(topology_id, host_id, run_id, container_id)
 
     # Register the run under its engagement (if any): append run_id to run_ids.
     if req.engagement_id:
@@ -1017,6 +1373,24 @@ async def launch(req: LaunchRequest) -> LaunchResponse:
         raise HTTPException(
             status_code=409,
             detail=f"Host {req.host_id} has no coder56 agent assigned. Assign coder56 first.",
+        )
+
+    # Container-busy guard (one-run-per-host).  Refuse BEFORE the (slow) topology
+    # bring-up so a second launch never starts on a host that already has a live
+    # run.  A second concurrent run would clobber the shared per-host guardrail
+    # state + lead session; the operator must wait or queue.
+    busy = _host_busy_state(req.topology_id, req.host_id)
+    if busy.get("busy"):
+        run_id = busy.get("run_id") or "(detected via recent verdicts)"
+        since = busy.get("since") or ""
+        suffix = f" since {since}" if since else ""
+        raise HTTPException(
+            status_code=409,
+            detail=(f"A run is already active on host {req.host_id} "
+                    f"(topology {req.topology_id}){suffix}: {busy.get('reason')} "
+                    f"[run {run_id}]. Wait for it to finish or queue the new run."),
+            headers={"X-Busy-Run-Id": run_id, "X-Busy-Since": since,
+                     "X-Busy-Reason": busy.get("reason", "")},
         )
 
     # Optional engagement link: validate the token (path-safety) and confirm the
@@ -1349,6 +1723,11 @@ async def accept_initial_directive(run_id: str) -> Dict[str, Any]:
     _atomic_write(_run_meta_path(run_id), meta)
     if not accepted:
         raise HTTPException(status_code=502, detail=f"Failed to send directive to coder56: {res.get('error')}")
+    # Legacy single-shot has no driver (no _lead_driver / _phase_driver), so it
+    # has no natural exit hook. Arm a one-shot finalizer that waits for the
+    # coder56 session's turn to go idle (or times out) then snapshots once —
+    # covers the legacy path's ephemeral opencode.db the same way the drivers do.
+    _arm_legacy_finalizer(run_id)
     return {"status": "sent", "run_id": run_id, "session_id": session_id}
 
 
@@ -1448,6 +1827,20 @@ async def set_judge_fail(run_id: str, req: JudgeFailRequest) -> Dict[str, Any]:
     value = (req.value or "").strip().lower()
     if value not in ("allow", "escalate"):
         raise HTTPException(status_code=400, detail="value must be 'allow' or 'escalate'")
+    # Recommendation #5: judge_fail=allow MUST NOT be permitted against an
+    # external / production target. A judge outage (http-0 / empty body) on a
+    # routable target must keep fail-safe (escalate, hold for operator) — never
+    # auto-execute. The launch gate already forces escalate as the default, so
+    # this toggle is the only path to introduce 'allow'; refuse it here.
+    if value == "allow":
+        meta = _read_run_meta(run_id)
+        eng_id = (meta or {}).get("engagement_id")
+        if _engagement_target_is_external(eng_id):
+            raise HTTPException(
+                status_code=409,
+                detail=("judge_fail=allow is not permitted for an external/production "
+                        "target (judge outage must stay fail-safe). Use 'escalate'."),
+            )
     gdir = _guardrail_dir(run_id)
     gdir.mkdir(parents=True, exist_ok=True)
     (gdir / "judge_fail.txt").write_text(value, encoding="utf-8")
@@ -1477,7 +1870,140 @@ async def set_judge_fail(run_id: str, req: JudgeFailRequest) -> Dict[str, Any]:
 PHASE_POLL_S = 2.0          # driver message-poll interval
 PHASE_IDLE_S = 12.0         # turn must be stable this long before "complete"
 PHASE_DONE_SENTINEL = "### PHASE DONE ###"   # agent-emitted fast-complete marker
+
+# C1/C2/C3 — MANDATORY Phase-0 TARGET-VALIDATION + threat-model + enumeration /
+# multi-principal obligations. This block is injected VERBATIM into BOTH
+# _compile_lead_directive AND _compile_phase_directive (single source of truth so
+# the two compilers can never drift). It is the contract the agent prompt, the
+# memory-seed header (TARGET_IDENTITY|/THREAT_MODEL|), and the backend's
+# objective-met/coverage signals all key off. PRESERVES assessment §5: objective-
+# first, technique-agnostic (no per-class playbooks), read-only authz differential,
+# honest negatives.
+PHASE0_TARGET_VALIDATION_BLOCK = (
+    "PHASE 0 — TARGET-VALIDATION + THREAT MODEL + ATTACK-SURFACE/MULTI-PRINCIPAL (MANDATORY):\n"
+    "- TARGET-VALIDATION (C1): before any other action, fetch the target fingerprint's marker "
+    "(marker_path, default GET /api/health) and confirm it carries marker_match / canary_hash. "
+    "If the operator left it blank, choose one unauthenticated endpoint and capture it now. "
+    "Write the shared-namespace identity line to memory (ONE line, grep prefix `TARGET_IDENTITY|`):\n"
+    "    TARGET_IDENTITY|app=<expected_app>|marker=<METHOD marker_path>|match=<marker_match>|hash=<canary_hash or none>\n"
+    "At the FIRST action of the first post-recon phase AND at each phase boundary, RE-CHECK it. On mismatch emit "
+    "EXACTLY: `TARGET IDENTITY MISMATCH — possible app swap; halting` and STOP the run; do NOT transfer prior findings. "
+    "(The token `TARGET IDENTITY MISMATCH` is load-bearing — the backend/lead detect it.)\n"
+    "- THREAT MODEL (C2): build a Phase-0 threat model from recon — crown-jewel assets, sensitive-data classes, "
+    "trust boundaries, data flows, attacker goals, and an ordered list of vuln-class hypotheses high->low "
+    "(risk_priorities). Emit ONE shared-namespace line (grep prefix `THREAT_MODEL|`):\n"
+    "    THREAT_MODEL|app=<expected_app>|jewels=<comma-sep>|sensitive_data=<comma-sep>|trust_boundaries=<comma-sep>|"
+    "data_flows=<comma-sep>|attacker_goals=<comma-sep>|risk_priorities=<ordered high->low>|owasp_backstop=<comma-sep A01..A10>\n"
+    "Drive the phase plan RISK-FIRST from risk_priorities (test the top hypothesis first); OWASP Top-10 is a coverage "
+    "backstop, not the spine.\n"
+    "- ATTACK-SURFACE ENUMERATION + MULTI-PRINCIPAL (C3): enumerate the surface as inventory items — one "
+    "shared-namespace line per item (grep prefix `SURFACE_ITEM|`):\n"
+    "    SURFACE_ITEM|method=<GET|POST|...>|path=<normalized path with :param>|params=<comma-sep>|role=<min role that reaches it>|"
+    "object_id=<pattern or none>|state=<precondition state or none>|cwe=<hint class or none>\n"
+    "and a pointer: `ATTACK_SURFACE|count=<N>|principals=<principal1;principal2>`. Provision at least 2 OWNED principals "
+    "in different tenants/roles, one shared-namespace line each (grep prefix `PRINCIPAL|`):\n"
+    "    PRINCIPAL|id=<P1>|tenant=<tenantA>|role=<roleX>|how_provisioned=<owned/seeded; never a non-owned account>|token_loc=<path or VOLATILE>\n"
+    "RoE-supreme: provision principals ONLY by authenticating with pre-existing owned/seeded credentials — NEVER create "
+    "new accounts when the RoE forbids data modification. A finding is CONFIRMED FOR IMPACT only when demonstrated across "
+    ">=2 owned principals in different tenants/roles on the same object IDs (the object-level differential).\n"
+)
 PHASE_DEFAULT_MAX_S = 21600  # per-phase hard timeout before forcing review. Raised to 6h (was 3600) so healthy heavy phases (Soroban SDK/XDR/WAT parsing) and long engagements never trip it; the stall watchdog (resets on phase-complete/task-spawn) still kills a GENUINELY wedged run after 6h of zero progress — well under the old 12h hang. Dial down to re-tighten.
+
+# How often _lead_driver snapshots the in-container opencode.db mid-run (the
+# exit snapshot at driver-exit covers phase boundaries; this closes the gap where
+# a mid-phase host recreate/crash would otherwise lose the transcript).
+RUN_SNAPSHOT_CADENCE_S = 300
+
+# CONSECUTIVE-FAIL CIRCUIT BREAKER: if this many guardrail verdicts IN A ROW are
+# dead-judge (tokens.total==0 OR reason matches a no-verdict signature), the judge
+# itself is unreachable, so every command escalates and the agent cannot make real
+# progress. Reference run b1425481 = 88/88 dead-judge escalates, yet all 4 phases
+# were marked 'completed'. Hard-pause instead of burning retries / faking success.
+GUARDRAIL_CIRCUIT_BREAKER_N = 3
+# A verdict is 'dead-judge' when the JUDGE produced no usable output (vs a genuine
+# refuse/escalate the judge deliberately returned). tokens.total==0 = judge call
+# returned empty body (http 0 / connection fail / parse fail); these reason
+# substrings are the guardrail's own empty-output markers. A real escalate that
+# cost tokens is NOT matched here (that path is the undecided-escalate gate below).
+_RE_DEAD_JUDGE_REASON = re.compile(
+    r"(no assistant text|http 0|no verdict|produced no assistant|empty body|"
+    r"judge.{0,12}unreachable|judge.{0,12}failed|parse fail|no response)",
+    re.IGNORECASE,
+)
+
+
+def _default_threatmodel_phases(directive: str) -> List[PhaseSpec]:
+    """Threat-model-driven default plan for an engagement launched with NO drafted
+    phases (the objective-launch path). Without this, an empty `phases` list makes
+    accept_initial_directive fall through to legacy single-shot: the raw directive
+    goes to the generic coder56 agent, so no coder56_lead / Phase 0 / _lead_driver /
+    snapshot runs and the engagement never finalizes (the OpenHospital run hit
+    exactly this — `current_phase` stayed -1, no THREAT_MODEL|, status frozen at
+    `planning`).
+
+    Synthesizing this skeleton routes every launch through coder56_lead + Phase 0 +
+    _lead_driver + finalization — mirroring run_planned_run's checklist fallback
+    (coder56.py:3340) so the methodology restructure applies to objective-launches
+    too. The lead generates the risk-first ordering from the threat model Phase 0
+    produces; OWASP Top-10 is a coverage backstop, not the spine (assessment §4,
+    Option A). Objectives stay objective-first / technique-agnostic (no per-class
+    playbooks — preserve §5) and carry the load-bearing marker strings the deployed
+    agents already emit/read (TARGET_IDENTITY|/THREAT_MODEL|/SURFACE_ITEM|/PRINCIPAL|
+    /TESTED|)."""
+    return [
+        PhaseSpec(
+            objective=(
+                "Phase 0 — THREAT MODEL + TARGET-VALIDATION. From recon (no exploitation yet), "
+                "capture + re-check the target identity and build the threat model: crown-jewel "
+                "assets, sensitive-data classes, trust boundaries, data flows, attacker goals, and "
+                "an ordered list of vuln-class hypotheses high->low (risk_priorities). Emit the "
+                "shared-namespace lines `TARGET_IDENTITY|app=…|marker=…|match=…|hash=…` and "
+                "`THREAT_MODEL|app=…|jewels=…|sensitive_data=…|trust_boundaries=…|data_flows=…|"
+                "attacker_goals=…|risk_priorities=…|owasp_backstop=…` to engagement memory. On a "
+                "target-identity mismatch emit `TARGET IDENTITY MISMATCH` and STOP."
+            ),
+            tactic_id="TA0043", technique_ids=[], note="Phase 0 threat model + target identity",
+            tools=[], checklist=[],
+        ),
+        PhaseSpec(
+            objective=(
+                "Phase 1 — ATTACK-SURFACE ENUMERATION + MULTI-PRINCIPAL HARNESS. Enumerate the full "
+                "surface as inventory items — one `SURFACE_ITEM|method=…|path=…|params=…|role=…|"
+                "object_id=…|state=…|cwe=…` line per endpoint/param/role/object-id, plus an "
+                "`ATTACK_SURFACE|count=…|principals=…` pointer. Provision >=2 OWNED principals in "
+                "different roles (owned/seeded creds only; RoE-supreme — never create accounts), one "
+                "`PRINCIPAL|id=…|tenant=…|role=…|how_provisioned=…|token_loc=…` each. This inventory "
+                "is the substrate later phases test against and the reporter's coverage matrix consumes."
+            ),
+            tactic_id="TA0043", technique_ids=[], note="Attack-surface inventory + principals",
+            tools=[], checklist=[],
+        ),
+        PhaseSpec(
+            objective=(
+                "Phase 2 — RISK-FIRST TESTING + VERIFY (against the threat model + inventory). Test "
+                "risk_priorities[0] first, then fan out: for each candidate finding, delegate "
+                "coder56_verifier for an independent read-only reproduction and abide by its verdict "
+                "(CONFIRMED / NOT_A_VULN / INCONCLUSIVE / NOT_CONFIRMABLE). On each CONFIRMED finding, "
+                "run the finding-driven re-plan — enumerate sibling endpoints/params of the same class, "
+                "attempt chains, same-DTO fan-out. Append one `TESTED|method=…|path=…|…|status=…` record "
+                "per surface element exercised (tested_confirmed/tested_negative/could_not_test)."
+            ),
+            tactic_id="TA0043", technique_ids=[], note="Risk-first testing + verification",
+            tools=[], checklist=[],
+        ),
+        PhaseSpec(
+            objective=(
+                "Phase 3 — SYNTHESIZE COVERAGE + ENGAGEMENT SUMMARY. Confirm coverage BY SURFACE ITEM "
+                "(tested vs untested, grouped by threat-model crown jewel), frame confirmed findings as "
+                "attack paths with business impact (not an isolated CVE list), surface any "
+                "could_not_test/NOT_CONFIRMABLE items honestly, and write the engagement summary. Emit "
+                "`CATEGORY OBJECTIVE MET (<owasp_id>) — <evidence>` for any category whose objective is met."
+            ),
+            tactic_id="TA0043", technique_ids=[], note="Coverage synthesis + summary",
+            tools=[], checklist=[],
+        ),
+    ]
+
 
 # Live driver tasks, keyed by run_id. One driver per run; idempotent arming.
 _phase_drivers: Dict[str, "asyncio.Task"] = {}
@@ -1602,6 +2128,37 @@ def _extract_phase_summary(final_text: str) -> str:
     return text.strip()
 
 
+# A captured final_text below this length is almost certainly a mid-thought
+# fragment ('Let me check ...', 'Now let me test ...'), not a phase conclusion.
+# A directive-compliant 'PHASE SUMMARY' wrap-up (or any real multi-finding
+# conclusion) is far longer; ~3h of work reduced to a 57-char sentence is the
+# failure mode this threshold blocks.
+_SUMMARY_MIN_CHARS = 240
+
+
+def _is_substantive_summary(text: str) -> bool:
+    """True only when a phase's captured final_text is a genuine conclusion worth
+    forwarding as-is — NOT a stray mid-thought planning fragment. When False, the
+    caller falls through to the reconstructed tool-I/O digest (_summarize_messages),
+    because the findings then live in the commands the agent ran.
+
+    Substantive when ANY of: completion sentinel present; a 'PHASE SUMMARY' header;
+    long enough that it cannot be a one-line 'let me ...' fragment; or >= 2
+    non-trivial lines (a multi-point wrap-up)."""
+    if not text:
+        return False
+    if PHASE_DONE_SENTINEL in text:
+        return True
+    if re.search(r"(?im)^[#>\*\-]*\s*PHASE SUMMARY\b", text):
+        return True
+    if len(text) >= _SUMMARY_MIN_CHARS:
+        return True
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) >= 2:
+        return True
+    return False
+
+
 def _compile_phase_directive(full_directive: str, phase_index: int, total: int,
                              objective: str, prior_findings: Optional[List[str]] = None) -> str:
     """Build the prompt for a single phase. The FULL engagement directive is
@@ -1634,6 +2191,7 @@ def _compile_phase_directive(full_directive: str, phase_index: int, total: int,
         f"You are executing PHASE {phase_index + 1} of {total} of the engagement below.\n\n"
         "FULL ENGAGEMENT DIRECTIVE (your authorized scope — stay strictly within it):\n"
         f"{full_directive.strip()}\n\n"
+        f"{PHASE0_TARGET_VALIDATION_BLOCK}\n"
         f"{prior_block}"
         "THIS PHASE'S OBJECTIVE:\n"
         f"{objective.strip()}\n\n"
@@ -1646,7 +2204,15 @@ def _compile_phase_directive(full_directive: str, phase_index: int, total: int,
         "contradiction, or a volatile prerequisite; append RERUN_REASON.\n"
         "4. Memory is the live parallel-work bus. Before a substantial branch, reread its "
         "tail and use [CLAIMED] WORK_ID / [DONE] WORK_ID. Append any information useful to "
-        "another pentest phase immediately, not only at phase end.\n\n"
+        "another pentest phase immediately, not only at phase end.\n"
+        "5. PERSIST YOUR OUTPUT (every phase, before PHASE DONE): append one "
+        "`TESTED|method=...|path=...|params=...|role=...|object_id=...|status=...|evidence=...` "
+        "line to /outputs/$RUN_ID/memory/MEMORY.md for each endpoint x param x role x object-id "
+        "you actually exercised (status = tested_confirmed | tested_negative | not_applicable | "
+        "could_not_test | unverifiable) — this drives the coverage matrix, so a phase that "
+        "exercises endpoints but writes no TESTED| line reads as uncovered. Also append a short "
+        "dated entry for any confirmed/unverified finding (route, vuln class, verified status, "
+        "evidence path). APPEND ONLY (>>); never edit prior lines.\n\n"
         "Work ONLY this phase's objective within the authorized scope above. Do not begin "
         "any later phase. When this phase's objective is met (or you cannot progress), write "
         "a concise PHASE SUMMARY of what you found / achieved, then end your message with "
@@ -1749,6 +2315,77 @@ async def _start_phase(run_id: str, index: int, addr: str, revised_objective: Op
     meta["current_phase"] = index
     _atomic_write(_run_meta_path(run_id), meta)
     return session_id
+
+
+# Legacy single-shot runs (no phases, orchestration != native_subagents) have
+# no driver watching the coder56 session, so the ephemeral opencode.db would
+# never be snapshotted on their completion. A one-shot finalizer per legacy run
+# waits for the session turn to go idle (or a deadline) then snapshots once.
+_legacy_finalizers: Dict[str, asyncio.Task] = {}
+
+
+def _arm_legacy_finalizer(run_id: str) -> None:
+    """Best-effort: spawn (once) a watcher that snapshots the legacy single-shot
+    run's opencode.db when its coder56 session turn ends. Never raises."""
+    try:
+        existing = _legacy_finalizers.get(run_id)
+        if existing and not existing.done():
+            return
+        _legacy_finalizers[run_id] = asyncio.create_task(_legacy_finalizer(run_id))
+    except Exception as exc:
+        logger.warning("legacy_finalizer[%s] arm failed: %s", run_id, exc)
+
+
+async def _legacy_finalizer(run_id: str) -> None:
+    """Watch a legacy single-shot coder56 session; snapshot its opencode.db once
+    the turn is idle (no pending tool) or after LEGACY_FINALIZER_DEADLINE_S,
+    whichever comes first. Mirrors _lead_driver's completion heuristic in miniature."""
+    from ..services.container_addr import get_container_address
+    from ..services.opencode_client import get_session_messages_async
+    deadline = time.monotonic() + 21600  # 6h whole-run backstop (PHASE_DEFAULT_MAX_S ceiling)
+    last_activity = time.monotonic()
+    try:
+        while time.monotonic() < deadline:
+            await asyncio.sleep(PHASE_POLL_S * 2)
+            meta = _read_run_meta(run_id)
+            session_id = str(meta.get("session_id") or "")
+            if not session_id:
+                break
+            container_id = meta.get("container_id", "")
+            if not container_id:
+                break
+            try:
+                addr = await get_container_address(container_id)
+            except Exception:
+                continue
+            res = await get_session_messages_async(session_id=session_id, host=addr, port=4096)
+            if not res.get("success"):
+                continue
+            msgs = res.get("messages", []) or []
+            pending_tool = False
+            for m in msgs:
+                for p in (m.get("parts") or []):
+                    if isinstance(p, dict) and p.get("type") == "tool":
+                        st = p.get("state") or {}
+                        if st.get("status") and st.get("status") not in ("completed", "error"):
+                            pending_tool = True
+            # Turn complete = has messages and nothing pending. Also bail if the
+            # session has gone idle for a long stretch (agent finished quietly).
+            if msgs and not pending_tool:
+                break
+            if msgs:
+                last_activity = time.monotonic()
+            elif (time.monotonic() - last_activity) >= 600:
+                break  # no messages at all for 10 min — assume done/stalled
+        await _snapshot_opencode_db(run_id)
+    except Exception as exc:
+        logger.warning("legacy_finalizer[%s] error: %s", run_id, exc)
+        try:
+            await _snapshot_opencode_db(run_id)
+        except Exception:
+            pass
+    finally:
+        logger.info("legacy_finalizer[%s] exited", run_id)
 
 
 def _arm_driver(run_id: str) -> None:
@@ -1861,7 +2498,8 @@ async def _phase_driver(run_id: str) -> None:
         # report appendix / review gate show); the digest only fires when the
         # agent left no final text at all. This `result` is what later phases
         # receive as context.
-        summary = (_extract_phase_summary(final_text) if final_text else "") \
+        _agent_summary = _extract_phase_summary(final_text) if final_text else ""
+        summary = (_agent_summary if _is_substantive_summary(_agent_summary) else "") \
             or _summarize_messages(msgs) or ""
         summary = summary.strip()
         if timed_out:
@@ -1892,6 +2530,10 @@ async def _phase_driver(run_id: str) -> None:
             logger.warning("phase_driver[%s] auto-advance to phase %d failed: %s", run_id, cur + 1, exc)
             break
 
+    # "run/phase finished (for now)" hook: snapshot the ephemeral opencode.db
+    # before the host can be recreated and lose it. Best-effort; fires on every
+    # exit incl. review-gates and timeouts. (Mirrors _lead_driver's exit hook.)
+    await _snapshot_opencode_db(run_id)
     logger.info("phase_driver[%s] exited", run_id)
 
 
@@ -2088,6 +2730,7 @@ def _compile_lead_directive(meta: Dict[str, Any]) -> str:
         "each phase to the coder56_phase subagent via the task tool.\n\n"
         "FULL ENGAGEMENT DIRECTIVE (your authorized scope — stay strictly within it and pass it "
         f"verbatim to each subagent):\n{directive}\n\n"
+        f"{PHASE0_TARGET_VALIDATION_BLOCK}\n"
         "PHASES (execute in order):\n"
         f"{phases_block}\n\n"
         f"{pacing}\n\n"
@@ -2098,7 +2741,16 @@ def _compile_lead_directive(meta: Dict[str, Any]) -> str:
         "`MEMORY FIRST: read "
         "/outputs/$RUN_ID/memory/MEMORY.md before any other action; trust established records; "
         "coordinate through [CLAIMED]/[DONE]; execute only the phase-specific delta; append every "
-        "broadly useful discovery immediately.` The explicit prior summaries and shared memory "
+        "broadly useful discovery immediately. VERIFIER GATE (mandatory): before you report any "
+        "finding as a vulnerability, you MUST delegate it to the coder56_verifier subagent via the "
+        "task tool (subagentType coder56_verifier) and gate on its OK TO REPORT: token; include a "
+        "## VERIFIER CALLS section in your report proving each delegated finding with the token + "
+        "cited /outputs/$RUN_ID/verifier/*.jsonl. Recon facts need no gate. If the verifier task "
+        "fails to launch, emit === VERIFIER UNAVAILABLE: <reason> === and list the candidate as "
+        "unverified; do not report it as a finding. Prefer the matching hexstrike-ai_* MCP tool "
+        "over its bash CLI. PERSIST COVERAGE: append one TESTED|method=...|path=...|params=...|"
+        "role=...|status=...|evidence=... line per endpoint x param x role you actually exercised.` "
+        "The explicit prior summaries and shared memory "
         "are complementary handoffs; neither authorizes repeating established work.\n"
         "2. When the subagent reports back, record only a concise summary of the NEW DELTA; do "
         "not restate inherited memory facts as new findings.\n"
@@ -2131,6 +2783,124 @@ async def _graceful_finalize_session(session_id: str, addr: str, timeout_s: int 
         )
     except Exception as exc:
         logger.warning("graceful_finalize[%s] best-effort send failed (continuing): %s", session_id, exc)
+
+
+def _read_verdicts_tail(run_id: str, limit: int = 64) -> List[Dict[str, Any]]:
+    """Newest-first tail of the guardrail verdicts.ndjson for a run. Each line is
+    {decision, reason, tokens:{total,...}, ...}. Best-effort: missing/garbage file
+    => []. Used by the circuit breaker (consecutive dead-judge) and the escalate
+    gate (any undecided escalate)."""
+    path = _guardrail_dir(run_id) / "verdicts.ndjson"
+    if not path.exists():
+        return []
+    out: List[Dict[str, Any]] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return []
+    for line in lines[-limit:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+    return out
+
+
+def _verdict_is_dead_judge(v: Dict[str, Any]) -> bool:
+    """True when the JUDGE itself produced no usable verdict (not a deliberate
+    refuse/escalate). Matches run b1425481: 88/88 verdicts decision='escalate',
+    tokens.total==0, reason='...no assistant text (attempt 3/3)'."""
+    if not isinstance(v, dict):
+        return False
+    toks = v.get("tokens") or {}
+    if int(toks.get("total") or 0) == 0:
+        return True
+    reason = str(v.get("reason") or "")
+    return bool(_RE_DEAD_JUDGE_REASON.search(reason))
+
+
+def _consecutive_dead_judge(run_id: str) -> int:
+    """Count of TRAILING verdicts that are dead-judge (scanning newest -> oldest,
+    stopping at the first live verdict). 3 in a row = judge is down for the whole
+    recent window => circuit-breaker trip."""
+    verdicts = _read_verdicts_tail(run_id, limit=128)
+    n = 0
+    for v in reversed(verdicts):
+        if _verdict_is_dead_judge(v):
+            n += 1
+        else:
+            break
+    return n
+
+
+def _undecided_escalate_count(run_id: str) -> int:
+    """Count of pending operator approvals whose guardrail verdict was 'escalate'
+    AND that have no decision file yet. These block phase advance / run completion
+    under judge_fail=escalate: an undecided escalate means a command is held for
+    operator review, so the run is NOT actually free to proceed. Files are
+    guardrail-authored <id>.req.json + operator <id>.dec.json (see _scan_approvals).
+    Best-effort; a missing approvals dir => 0."""
+    d = _approvals_dir(run_id)
+    if not d.exists():
+        return 0
+    n = 0
+    for req_file in d.glob("*.req.json"):
+        try:
+            raw = json.loads(req_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        gv = raw.get("guardrail_verdict") or {}
+        if str(gv.get("decision") or "").lower() != "escalate":
+            continue
+        req_id = raw.get("id", req_file.stem)
+        # Decided-ness is derived solely from the presence of <id>.dec.json.
+        if _dec_path(run_id, req_id).exists():
+            continue
+        n += 1
+    return n
+
+
+def _count_session_parts(msgs: Any) -> int:
+    """Total non-empty message parts across a session's message list. A lead/phase
+    session that produced 0 parts never really ran (the agent emitted nothing) —
+    the no-op failure detector marks the run failed rather than completed.
+    Reference run 71592e76 (fabricated deliverables from an empty session)."""
+    if not isinstance(msgs, list):
+        return 0
+    total = 0
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        parts = m.get("parts") or []
+        if isinstance(parts, list):
+            total += sum(1 for p in parts if isinstance(p, dict) and p.get("type"))
+    return total
+
+
+def _halt_run_failed(meta: Dict[str, Any], rt: List[Dict[str, Any]], reason: str) -> None:
+    """Mark a run FAILED / needs-operator in place on the manifest: set the durable
+    status flag + a human-readable failure_reason, and annotate the highest RUNNING
+    phase so the UI/report show WHY (rather than silently flipping everything to
+    COMPLETED like the pre-fix auto_continue path). _run_overall_status is
+    status-driven, so we encode the halt via a manifest-level status override that
+    takes precedence (see _run_overall_status patch)."""
+    meta["status"] = "failed"
+    meta["halted"] = True
+    meta["needs_operator"] = True
+    meta["failure_reason"] = reason
+    note = f"[RUN HALTED — {reason}]"
+    gate_idx = -1
+    for i in range(len(rt)):
+        if rt[i].get("status") == PhaseStatus.RUNNING.value:
+            gate_idx = i
+    if gate_idx < 0:
+        gate_idx = len(rt) - 1
+    if 0 <= gate_idx < len(rt):
+        prev = rt[gate_idx].get("result", "") or ""
+        rt[gate_idx]["result"] = (prev + "\n" + note).strip() if prev else note
 
 
 def _arm_lead_driver(run_id: str) -> None:
@@ -2190,6 +2960,8 @@ async def _lead_driver(run_id: str) -> None:
     prev_n_tasks = -1
     gated_through = -1  # highest phase index already gated to awaiting_review
     auto_resumed_after = -1  # completion count already nudged in this driver
+    phase0_nudged = False  # one-shot: Phase-0 THREAT_MODEL| nudge already sent
+    last_snapshot = time.time()  # mid-run transcript snapshot cadence
 
     while True:
         try:
@@ -2267,6 +3039,25 @@ async def _lead_driver(run_id: str) -> None:
                     continue
                 if (not entry.get("result")) or (entry.get("status") in (PhaseStatus.PENDING.value, PhaseStatus.RUNNING.value)):
                     entry["result"] = parsed.get("result") or ""
+                    # VERIFIER-GATE GUARD (advisory, non-blocking): if this phase's
+                    # OWN findings region asserts a vulnerability but shows no
+                    # ## VERIFIER CALLS / OK TO REPORT: YES and no === VERIFIER
+                    # UNAVAILABLE === marker, the verification gate was skipped.
+                    # Annotate so the operator/UI/reporter sees the claims are
+                    # UNVERIFIED. Scoped to the findings region + a strong signal to
+                    # avoid false-annotating recon prose or echoed prior-block text.
+                    _res = entry.get("result", "") or ""
+                    if _res:
+                        _region = _res.rsplit("WHAT YOU FOUND", 1)[-1]
+                        _vuln_asserted = re.search(
+                            r"(?im)(^\s*##\s*[FD]?\d*[^\n]*\b(idor|bfla|bola|sqli|sql injection|injection|auth(?:oriz|ent)?(?:\s* bypass)?|priv(?:ilege)?\s*esc|rate[- ]?limit|plaintext|unauth(?:orized)?|exposure|missing auth)\b"
+                            r"|\b(confirmed|vulnerability|vuln:|exploitable)\b[^.\n]{0,80}\b(critical|high|medium|low|idor|bfla|injection|bypass|escalat|plaintext|exposure|rate[- ]?limit)\b)",
+                            _region,
+                        )
+                        _verifier_evidence = re.search(r"(?im)(##\s*VERIFIER CALLS|OK\s+TO\s+REPORT\s*:\s*YES|VERIFIER UNAVAILABLE)", _res)
+                        if _vuln_asserted and not _verifier_evidence:
+                            entry["result"] = (_res + "\n[BACKEND VERIFIER-GATE GUARD: this phase asserts a vulnerability but contains no ## VERIFIER CALLS / OK TO REPORT: YES and no === VERIFIER UNAVAILABLE === marker. All vuln claims are UNVERIFIED — the verification gate was skipped.]").strip()
+                            logger.warning("lead_driver[%s] phase %d reported a vuln with no verifier delegation; claims marked unverified", run_id, idx)
                     if child:
                         entry["session_id"] = child
                     if obj:
@@ -2292,7 +3083,89 @@ async def _lead_driver(run_id: str) -> None:
                 prev_n_completed = n_completed
                 prev_n_tasks = len(tasks)
 
+            # Phase-0 guard for auto_continue (best-effort one-shot — never blocks
+            # the driver, per A4): if Phase 0 has completed (n_completed >= 1) but
+            # engagement memory still lacks THREAT_MODEL|, nudge the Lead once to
+            # complete scoping before it grinds into deep testing. The review_each
+            # hard gate lives in advance_phase; this covers the auto path.
+            if (n_completed >= 1 and not phase0_nudged
+                    and not _phase0_complete(meta.get("engagement_id"))):
+                phase0_nudged = True
+                try:
+                    await send_prompt_async(
+                        session_id=lead_sess, host=addr, port=4096,
+                        agent="coder56_lead", async_mode=True, timeout=30,
+                        prompt=(
+                            "Your Phase 0 completed but engagement memory still has no THREAT_MODEL| "
+                            "record, so scoping is incomplete. Append the THREAT_MODEL|app=…|jewels=…|"
+                            "sensitive_data=…|trust_boundaries=…|data_flows=…|attacker_goals=…|"
+                            "risk_priorities=…|owasp_backstop=… line to engagement memory now (and "
+                            "TARGET_IDENTITY| if missing) before proceeding with deep testing."
+                        ),
+                    )
+                    last_progress = time.time()
+                except Exception as exc:
+                    logger.warning("lead_driver[%s] phase0 nudge failed: %s", run_id, exc)
+
             now = time.time()
+            # Periodic mid-run transcript snapshot: the exit snapshot at driver
+            # exit (below) covers phase boundaries; this covers a mid-phase host
+            # recreate/crash so the full execution is never lost. Best-effort.
+            if (now - last_snapshot) >= RUN_SNAPSHOT_CADENCE_S:
+                await _snapshot_opencode_db(run_id)
+                last_snapshot = now
+
+            # === REC#3 SAFETY GATES (fire every poll, before any completion mark) ===
+            # These prevent the b1425481 / 71592e76 failure modes: a dead guardrail
+            # judge makes every command escalate, yet auto_continue used to mark all
+            # phases 'completed'. Each gate halts the run FAILED/needs-operator,
+            # snapshots the transcript, and exits WITHOUT faking completion.
+            halt_reason = ""
+            # (c) NO-OP FAILURE DETECTOR: the Lead session produced no parts at all —
+            # the agent never really ran. Fabricating deliverables (71592e76) is
+            # worse than an honest failure.
+            if not msgs:
+                halt_reason = "no-op session: lead session produced 0 messages/parts — the agent never ran (no transcript to report)"
+            # (b) CONSECUTIVE-FAIL CIRCUIT BREAKER: >=3 dead-judge verdicts in a row
+            # (judge unreachable / empty body). Stop burning retries.
+            elif _consecutive_dead_judge(run_id) >= GUARDRAIL_CIRCUIT_BREAKER_N:
+                halt_reason = (f"circuit breaker: {GUARDRAIL_CIRCUIT_BREAKER_N}+ consecutive guardrail "
+                               "verdicts had tokens.total==0 / no-verdict (judge unreachable). Run paused "
+                               "to stop burning retries; flip judge-fail to 'allow' or restore the judge "
+                               "and restart the run")
+            # (a) UNDECIDED-ESCALATE GATE: a pending escalate approval is an open
+            # operator hold. judge_fail=escalate must NOT let the run advance /
+            # complete while a command is still awaiting a human decision.
+            elif _undecided_escalate_count(run_id) > 0 and not meta.get("halted"):
+                # Pause (awaiting operator) rather than hard-fail: an undecided
+                # escalate is a recoverable human-in-the-loop hold, not a crash.
+                # We DO NOT mark remaining phases completed; we just stop here.
+                gate_idx_e = -1
+                for i in range(len(rt)):
+                    if rt[i].get("status") == PhaseStatus.RUNNING.value:
+                        gate_idx_e = i
+                if gate_idx_e < 0:
+                    gate_idx_e = max(0, (sum(1 for _, s in tasks if s == "completed") - 1))
+                if 0 <= gate_idx_e < len(rt) and rt[gate_idx_e].get("status") not in (
+                    PhaseStatus.AWAITING_REVIEW.value, PhaseStatus.COMPLETED.value,
+                ):
+                    rt[gate_idx_e]["status"] = PhaseStatus.AWAITING_REVIEW.value
+                    prev = rt[gate_idx_e].get("result", "") or ""
+                    rt[gate_idx_e]["result"] = (prev + "\n[phase gated — one or more guardrail escalate verdicts await operator decision; resolve them before the run can advance]").strip() if prev else "[phase gated — one or more guardrail escalate verdicts await operator decision; resolve them before the run can advance]"
+                    meta["current_phase"] = gate_idx_e
+                meta["phase_runtime"] = rt
+                meta["pending_escalates"] = _undecided_escalate_count(run_id)
+                _atomic_write(_run_meta_path(run_id), meta)
+                await _snapshot_opencode_db(run_id)
+                break  # exit driver; run stays awaiting_review until the operator decides
+            if halt_reason and not meta.get("halted"):
+                _halt_run_failed(meta, rt, halt_reason)
+                meta["phase_runtime"] = rt
+                _atomic_write(_run_meta_path(run_id), meta)
+                await _snapshot_opencode_db(run_id)
+                logger.error("lead_driver[%s] HALTING run: %s", run_id, halt_reason)
+                break  # exit the driver — run is failed/needs-operator, NOT completed
+
             per_phase_max = int(meta.get("timeout_seconds") or PHASE_DEFAULT_MAX_S)
             # stalled = no forward progress for a whole phase budget — catches a Lead
             # blocked on a hung task call (its messages go quiet) regardless of how many
@@ -2333,7 +3206,7 @@ async def _lead_driver(run_id: str) -> None:
                     if 0 <= gate_idx < len(rt) and rt[gate_idx].get("status") not in (PhaseStatus.AWAITING_REVIEW.value, PhaseStatus.COMPLETED.value):
                         rt[gate_idx]["status"] = PhaseStatus.AWAITING_REVIEW.value
                         prev = rt[gate_idx].get("result", "")
-                        rt[gate_idx]["result"] = (prev + "\n[phase finalized under time budget — partial result; full findings in /outputs/agent-memory/MEMORY.md, verifier verdicts in /outputs/$RUN_ID/verifier/]").strip() \
+                        rt[gate_idx]["result"] = (prev + f"\n[phase finalized under time budget — partial result; full findings in {_run_memory_path(run_id)}, verifier verdicts in /outputs/$RUN_ID/verifier/]").strip() \
                             if prev else f"[phase finalized under time budget — partial result; full findings in {_run_memory_path(run_id)}, verifier verdicts in /outputs/$RUN_ID/verifier/]"
                     gated_through = gate_idx
                     gated_now = True
@@ -2341,9 +3214,43 @@ async def _lead_driver(run_id: str) -> None:
                     done = True
             else:  # auto_continue
                 if not pending_tool and n_completed >= len(phases):
+                    # REC#3(a): do NOT auto-complete while an escalate verdict is
+                    # still awaiting operator decision under judge_fail=escalate.
+                    # Gate to awaiting_review instead (the per-poll undecided-
+                    # escalate break covers the common case; this guards the exact
+                    # boundary iteration).
+                    _pending_esc = _undecided_escalate_count(run_id)
+                    if _pending_esc > 0:
+                        gate_idx_e = max(0, n_completed - 1)
+                        if 0 <= gate_idx_e < len(rt) and rt[gate_idx_e].get("status") not in (
+                            PhaseStatus.AWAITING_REVIEW.value, PhaseStatus.COMPLETED.value,
+                        ):
+                            rt[gate_idx_e]["status"] = PhaseStatus.AWAITING_REVIEW.value
+                        meta["pending_escalates"] = _pending_esc
+                        changed = True
+                        done = True
+                    else:
+                        for i in range(len(rt)):
+                            if rt[i].get("status") not in (PhaseStatus.AWAITING_REVIEW.value, PhaseStatus.COMPLETED.value):
+                                rt[i]["status"] = PhaseStatus.COMPLETED.value
+                        changed = True
+                        done = True
+                elif (not pending_tool and lead_turn_complete
+                      and _RE_OBJECTIVE_MET.search(final_text or "")):
+                    # M9 (C7.2 + A1): the Lead intentionally stopped early because the
+                    # engagement OBJECTIVE is already met (it emitted OBJECTIVE ALREADY
+                    # MET). Respect that — mark remaining phases COMPLETED with an
+                    # objective-met note instead of auto-resuming them (auto-resume would
+                    # grind past a solved objective). No new SATISFIED enum: COMPLETED
+                    # keeps _run_overall_status correct. Category-level CATEGORY OBJECTIVE
+                    # MET does NOT halt here — the Lead may still continue to other
+                    # categories; only the engagement-level gate halts the run.
                     for i in range(len(rt)):
                         if rt[i].get("status") not in (PhaseStatus.AWAITING_REVIEW.value, PhaseStatus.COMPLETED.value):
                             rt[i]["status"] = PhaseStatus.COMPLETED.value
+                            prev = rt[i].get("result", "")
+                            note_txt = "[OBJECTIVE ALREADY MET — phase not executed; the engagement objective was satisfied earlier in the run]"
+                            rt[i]["result"] = (prev + "\n" + note_txt).strip() if prev else note_txt
                     changed = True
                     done = True
                 elif _lead_needs_auto_resume(
@@ -2389,7 +3296,7 @@ async def _lead_driver(run_id: str) -> None:
                     if 0 <= gate_idx < len(rt) and rt[gate_idx].get("status") not in (PhaseStatus.AWAITING_REVIEW.value, PhaseStatus.COMPLETED.value):
                         rt[gate_idx]["status"] = PhaseStatus.AWAITING_REVIEW.value
                         prev = rt[gate_idx].get("result", "")
-                        rt[gate_idx]["result"] = (prev + "\n[phase finalized under time budget — partial result; full findings in /outputs/agent-memory/MEMORY.md, verifier verdicts in /outputs/$RUN_ID/verifier/]").strip() \
+                        rt[gate_idx]["result"] = (prev + f"\n[phase finalized under time budget — partial result; full findings in {_run_memory_path(run_id)}, verifier verdicts in /outputs/$RUN_ID/verifier/]").strip() \
                             if prev else f"[phase finalized under time budget — partial result; full findings in {_run_memory_path(run_id)}, verifier verdicts in /outputs/$RUN_ID/verifier/]"
                     gated_now = True
                     changed = True
@@ -2427,7 +3334,51 @@ async def _lead_driver(run_id: str) -> None:
     # recreated and lose it. Best-effort; fires on every exit incl. review-gates
     # (so each phase boundary leaves a checkpoint; the final exit is complete).
     await _snapshot_opencode_db(run_id)
+    # Merge this run's verifier-CONFIRMED findings into the engagement ledger.
+    # Runs on EVERY exit (phase boundary, run end, watchdog/stall, graceful_finalize)
+    # so a finalized-under-time-budget or aborted run still lands its CONFIRMED
+    # verdicts. Best-effort + engagement-locked; never raises into the exit path.
+    # GATED on verdict==CONFIRMED && ok_to_report==YES inside the helper — refuted /
+    # inconclusive / NOT_A_VULN records are never merged. Re-runs de-duplicate by
+    # canonical route+CWE key; existing engagement findings are preserved.
+    try:
+        _eng_id = _read_run_meta(run_id).get("engagement_id") or ""
+        if _eng_id:
+            async with _engagement_lock(_eng_id):
+                _n = _merge_confirmed_findings_into_engagement(_eng_id, run_id)
+            if _n:
+                logger.info("lead_driver[%s] merged %d confirmed finding(s) into engagement %s",
+                            run_id, _n, _eng_id)
+    except Exception as exc:
+        logger.warning("lead_driver[%s] confirmed-findings merge failed: %s", run_id, exc)
+
+    # REC #17: MANDATORY reportwriter pass on run completion. Closes the gap
+    # where reportwriter_input.json existed but no report.json/report.html was
+    # ever produced (the pass only ran on explicit operator POST .../report/write
+    # and silently skipped when the sandbox was down). Fire-and-forget so a slow
+    # agent/fallback never blocks the driver exit or freezes sibling runs; the
+    # startup sweep (_reconcile_all_engagement_reports) repairs anything this
+    # misses after a restart. Idempotent: the age-comparison gate + atomic
+    # overwrite make re-runs a no-op for unchanged findings.
+    try:
+        _meta = _read_run_meta(run_id) or {}
+        _eid = _meta.get("engagement_id")
+        if _eid:
+            asyncio.create_task(_reconcile_reportwriter(_eid))
+    except Exception:
+        pass
+
     logger.info("lead_driver[%s] exited", run_id)
+
+    # Container-busy guard: free the host so a new run can launch. Only clears the
+    # slot if it still points at this run_id (a later launch on a different host
+    # key is unaffected; a re-launch that somehow re-took this slot is preserved).
+    try:
+        _meta = _read_run_meta(run_id)
+        _release_host_run(_meta.get("topology_id", ""),
+                          _meta.get("host_id", ""), run_id)
+    except Exception as _exc:
+        logger.debug("lead_driver[%s] host-release skipped: %s", run_id, _exc)
 
 
 @router.post("/runs/{run_id}/phases/{n}/advance")
@@ -2451,6 +3402,40 @@ async def advance_phase(run_id: str, n: int, req: AdvanceRequest) -> Dict[str, A
 
     # Mark the currently-awaiting phase completed (operator chose to move on).
     cur = meta.get("current_phase", -1)
+    # Phase-0 hard guard (assessment Option A): glm-5.2 skipped Phase 0 on the
+    # OpenHospital run (grabbed TARGET_IDENTITY| but emitted no THREAT_MODEL|).
+    # Refuse to advance out of Phase 0 until engagement memory carries the
+    # THREAT_MODEL| record (fallback TARGET_IDENTITY|). Best-effort nudge the
+    # active Phase-0 session to finish scoping; the operator re-advances once it
+    # has. Does NOT touch meta (phase 0 stays AWAITING_REVIEW) on refusal.
+    if cur == 0 and not _phase0_complete(meta.get("engagement_id")):
+        try:
+            from ..services.container_addr import get_container_address
+            from ..services.opencode_client import send_prompt_async, _ensure_network_connectivity
+            await _ensure_network_connectivity(meta.get("container_id", ""))
+            _addr = await get_container_address(meta.get("container_id", ""))
+            _target = (rt[0].get("session_id") if rt else "") or meta.get("session_id", "")
+            _agent = "coder56_phase" if (rt and rt[0].get("session_id")) else "coder56_lead"
+            if _target:
+                await send_prompt_async(
+                    session_id=_target, host=_addr, port=4096, agent=_agent,
+                    async_mode=True, timeout=30,
+                    prompt=(
+                        "Phase 0 is NOT complete — engagement memory has no THREAT_MODEL| record, so "
+                        "the operator cannot advance to Phase 1. Finish Phase 0 NOW: append the "
+                        "`THREAT_MODEL|app=…|jewels=…|sensitive_data=…|trust_boundaries=…|data_flows=…|"
+                        "attacker_goals=…|risk_priorities=…|owasp_backstop=…` line (and TARGET_IDENTITY| "
+                        "if missing) to engagement memory, then stop."
+                    ),
+                )
+        except Exception as exc:
+            logger.warning("phase0_guard[%s] nudge failed: %s", run_id, exc)
+        raise HTTPException(
+            status_code=409,
+            detail="Phase 0 is incomplete: engagement memory has no THREAT_MODEL| record. Phase 0 "
+                   "must emit THREAT_MODEL| (and TARGET_IDENTITY|) before deep testing. A corrective "
+                   "prompt was sent to the Phase-0 worker; re-advance once it has.",
+        )
     if 0 <= cur < len(rt) and rt[cur].get("status") == PhaseStatus.AWAITING_REVIEW.value:
         rt[cur]["status"] = PhaseStatus.COMPLETED.value
         meta["phase_runtime"] = rt
@@ -2601,12 +3586,19 @@ def _compile_directive(req: GoalCompileRequest) -> str:
         lines.append("")
         lines.append("STOP CONDITIONS:")
         lines.append(req.stop_conditions.strip())
+    # C2: Phase 0 is always present and ALWAYS FIRST — threat-model + capture the
+    # target identity before any testing. The `risk_priorities` it produces drive
+    # risk-first ordering of the remaining phases.
+    lines.append("")
+    lines.append("PLANNED ENGAGEMENT CHAIN (MITRE ATT&CK phases):")
+    lines.append("  Phase 0 — THREAT MODEL: build the threat model (crown jewels, sensitive-data "
+                 "classes, trust boundaries, data flows, attacker goals, ordered risk_priorities) "
+                 "and capture TARGET_IDENTITY; emit THREAT_MODEL|... and TARGET_IDENTITY|... to "
+                 "shared memory. Generate the remaining phase order risk-first from risk_priorities.")
     if req.phases:
-        lines.append("")
-        lines.append("PLANNED ENGAGEMENT CHAIN (MITRE ATT&CK phases):")
         for i, ph in enumerate(req.phases, 1):
             techs = ", ".join(ph.technique_ids) if ph.technique_ids else "(operator-defined)"
-            lines.append(f"  Phase {i} [{ph.tactic_id}] techniques({techs}): {ph.note.strip()}".rstrip())
+            lines.append(f"  Phase {i + 1} [{ph.tactic_id}] techniques({techs}): {ph.note.strip()}".rstrip())
             if ph.tools:
                 lines.append(f"    Recommended tools: {', '.join(ph.tools)}")
             if ph.checklist:
@@ -2617,6 +3609,14 @@ def _compile_directive(req: GoalCompileRequest) -> str:
     lines.append("- Confirm you are targeting ONLY the authorized scope above before any network action.")
     lines.append("- Prefer bounded, targeted commands; avoid mass-scanning or broad sweeps beyond scope.")
     lines.append("- Do NOT perform destructive impact, denial of service, or exfiltration to external systems outside the lab.")
+    # C3: enumeration + multi-principal obligation; C8: non-mutating-first (the
+    # read-only authz differential is the mandated first oracle).
+    lines.append("- ENUMERATE the attack surface (SURFACE_ITEM| per endpoint x params x role x object_id) "
+                 "and provision >=2 OWNED principals in different tenants/roles (PRINCIPAL|) using only "
+                 "pre-existing owned/seeded credentials; never create accounts a no-mod RoE forbids.")
+    lines.append("- Prove policy/RoE-sensitive findings with read-only oracles FIRST (registration-validation-error "
+                 "introspection, client-side rule inspection, dup-key/expected-error differential); mutate state only "
+                 "as a last resort, record it, and restore it.")
     lines.append("- Report findings concisely; iterate methodically phase by phase.")
     lines.append("=== END DIRECTIVE ===")
     return "\n".join(lines)
@@ -2782,7 +3782,27 @@ def _empty_draft() -> Dict[str, Any]:
         "phases": [],
         "summary": "",
         "declined": True,
+        # C2: threat model + risk priorities are first-class top-level fields so a
+        # later phase can be risk-first. Empty by default; the planner populates them.
+        "threat_model": {},
+        "risk_priorities": [],
     }
+
+
+# Representative HexStrike MCP tools available on coder56-mcp hosts. Surfaced to
+# the phase drafter so it recommends the matching MCP tool (already available, no
+# install) over a CLI the agent would have to install. ~130 more exist; the agent
+# picks by name at runtime and falls back to bash when a tool is absent.
+_HEXSTRIKE_MCP_TOOLS_NOTE = (
+    "Hosts running the HexStrike MCP server (coder56-mcp hosts) already provide ~150 tools under "
+    "the `hexstrike-ai_` prefix. Representative available tools: "
+    "port/service scan: hexstrike-ai_nmap_scan, hexstrike-ai_nmap_advanced_scan, hexstrike-ai_masscan_high_speed, hexstrike-ai_rustscan_fast_scan; "
+    "web/dir recon: hexstrike-ai_ffuf_scan, hexstrike-ai_gobuster_scan, hexstrike-ai_katana_crawl, hexstrike-ai_whatweb, hexstrike-ai_httpx_probe, hexstrike-ai_wafw00f_scan; "
+    "web vuln: hexstrike-ai_nuclei_scan, hexstrike-ai_nikto_scan, hexstrike-ai_sqlmap_scan, hexstrike-ai_zap_scan, hexstrike-ai_dalfox_xss_scan; "
+    "brute/crack: hexstrike-ai_hydra_attack, hexstrike-ai_john_crack, hexstrike-ai_hashcat_crack; "
+    "enum/recon: hexstrike-ai_enum4linux_scan, hexstrike-ai_smbmap_scan, hexstrike-ai_dnsenum_scan, hexstrike-ai_amass_scan; "
+    "binary/forensics: hexstrike-ai_radare2_analyze, hexstrike-ai_binwalk_analyze, hexstrike-ai_strings_extract, hexstrike-ai_volatility3_analyze."
+)
 
 
 async def _draft_goal_plan(objective: str, target: str, rules_of_engagement: str,
@@ -2807,9 +3827,22 @@ async def _draft_goal_plan(objective: str, target: str, rules_of_engagement: str
         '{"objective":"<refined one-line objective>","target":"<CIDR/host, scoped tight>","rules_of_engagement":"<RoE: allowed/denied, no DoS, lab-only>",'
         '"phases":[{"tactic_id":"TAxxxx","name":"<tactic>","technique_ids":["Txxxx"],"note":"<one-line phase goal>",'
         '"tools":["<recommended tool 1>","<tool 2>",...],"checklist":["<task 1>","<task 2>",...]}],'
+        '"threat_model":{"jewels":"<crown-jewel assets>","sensitive_data":"<data classes>",'
+        '"trust_boundaries":"<comma-sep>","attacker_goals":"<comma-sep>"},'
+        '"risk_priorities":["<vuln-class hypothesis 1, highest priority>","<hypothesis 2>",...],'
         '"summary":"<2-3 sentence plan summary>"}\n'
-        "Each phase MUST include a `tools` array with 2-4 recommended pentest tools (e.g. nmap, ffuf, sqlmap, ldapsearch, netcat, curl, john, hashcat, hydra, metasploit, impacket, certipy, enum4linux, evil-winrm, bloodhound, chisel, ligolo-ng) "
-        "relevant to that phase's objective, and a `checklist` array listing 3-6 concrete goals or tasks the agent should verify/complete in that phase. "
+        "risk_priorities is an ORDERED list (highest risk first) of vuln-class hypotheses derived from the "
+        "threat model; subsequent phases should be ordered to test risk_priorities[0] first. "
+        "Each phase MUST include a `tools` array with 2-4 recommended tools for that phase's objective, "
+        "and a `checklist` array listing 3-6 concrete goals or tasks the agent should verify/complete in that phase. "
+        "CLARIFY each tool's source/availability: PREFER a tool ALREADY AVAILABLE via the HexStrike MCP server — "
+        "list it by its `hexstrike-ai_*` name (no install needed, auto-adjudicated by the guardrail); only list a "
+        "BARE CLI name (e.g. nmap, sqlmap, ffuf, hydra, john, hashcat, ldapsearch, metasploit, impacket, certipy, "
+        "enum4linux, evil-winrm, bloodhound, chisel, ligolo-ng, curl, netcat) when NO hexstrike-ai_* tool covers the "
+        "task AND the agent must install it. The naming is the signal: a `hexstrike-ai_*` entry means 'use the "
+        "available MCP tool'; a bare name means 'install this CLI'. "
+        + _HEXSTRIKE_MCP_TOOLS_NOTE
+        + " "
         "Use real ATT&CK tactic IDs (TA0043 Recon, TA0001 Initial Access, TA0002 Execution, TA0003 Persistence, "
         "TA0004 Privilege Escalation, TA0005 Defense Evasion, TA0006 Credential Access, TA0007 Discovery, "
         "TA0008 Lateral Movement, TA0009 Collection, TA0011 Command and Control, TA0010 Exfiltration) and technique IDs. "
@@ -2839,6 +3872,10 @@ async def _draft_goal_plan(objective: str, target: str, rules_of_engagement: str
     obj.setdefault("rules_of_engagement", rules_of_engagement.strip())
     obj.setdefault("phases", [])
     obj.setdefault("summary", "")
+    # C2: guarantee the threat-model + risk-priorities keys exist even if the model
+    # omits them (callers read them unconditionally to drive risk-first ordering).
+    obj.setdefault("threat_model", {})
+    obj.setdefault("risk_priorities", [])
     obj["declined"] = False
     return obj
 
@@ -3022,9 +4059,18 @@ def _compile_owasp_directive(pr: Dict[str, Any], eng: Dict[str, Any]) -> str:
         lines.append(roe)
     lines.append("")
     lines.append(f"FOCUS: OWASP Top 10 {pr.get('owasp_id','')} — {pr.get('title','')}")
+    # C2: even the single-shot OWASP path threat-models FIRST. Phase 0 produces the
+    # risk_priorities that re-order the checklist below (risk-first), and captures the
+    # TARGET_IDENTITY so a repointed host is detected.
+    lines.append("PHASE 0 — THREAT MODEL (do this first): build the threat model (crown jewels, "
+                 "sensitive-data classes, trust boundaries, data flows, attacker goals, ordered "
+                 "risk_priorities) and capture TARGET_IDENTITY; emit THREAT_MODEL|... and "
+                 "TARGET_IDENTITY|... to shared memory. Then enumerate the attack surface "
+                 "(SURFACE_ITEM|) and provision >=2 OWNED principals in different tenants/roles (PRINCIPAL|).")
     checklist = pr.get("checklist") or []
     if checklist:
-        lines.append("STRUCTURED TEST PLAN (work through methodically; prove each with evidence):")
+        lines.append("STRUCTURED TEST PLAN (work RISK-FIRST — highest risk_priorities first; "
+                     "prove each with evidence):")
         for item in checklist:
             lines.append(f"  [ ] {item}")
     tools = pr.get("tools") or []
@@ -3035,6 +4081,17 @@ def _compile_owasp_directive(pr: Dict[str, Any], eng: Dict[str, Any]) -> str:
         lines.append("")
         lines.append("SCOPE NOTES:")
         lines.append(notes.replace("{target}", target or "the authorized target").strip())
+    # C7: surface STOP CONDITIONS (the single-shot path previously dropped them).
+    # A category's objective is met when every surface item relevant to this CWE
+    # class is terminal (TESTED confirmed/negative); emit `CATEGORY OBJECTIVE MET`.
+    lines.append("")
+    lines.append("STOP CONDITIONS:")
+    lines.append(f"- The OWASP {pr.get('owasp_id','')} category objective is MET when every enumerated "
+                 "surface item of this CWE class is terminal: a CONFIRMED finding with one bounded "
+                 "impact proof, OR a documented negative across the relevant sinks/roles.")
+    lines.append(f"- On met, emit `CATEGORY OBJECTIVE MET ({pr.get('owasp_id','')}) — <which surface "
+                 "items / evidence>` and STOP this category rather than grinding leftover phases. Do "
+                 "NOT re-test a surface item already [TESTED]/[NEGATIVE] in shared memory.")
     lines.append("")
     lines.append("OPERATING RULES:")
     lines.append("- Confirm you are targeting ONLY the authorized scope above before any network action.")
@@ -3187,6 +4244,15 @@ async def run_planned_run(engagement_id: str, owasp_id: str) -> Dict[str, Any]:
     category_obj = (pr.get("objective") or "").strip() or (
         f"Assess {target_scope} for {pr.get('title', '')} (OWASP {owasp_id})")
 
+    # C7: a real, category-specific STOP CONDITIONS predicate (previously dropped —
+    # the single-shot path passed stop_conditions=""). The authoritative signal is a
+    # CONFIRMED verdict of this category; the predicate is advisory.
+    stop_conditions = (
+        f"OWASP {owasp_id} objective is MET when every enumerated surface item of this CWE class is "
+        f"terminal: a CONFIRMED finding with one bounded impact proof, OR a documented negative across "
+        f"the relevant sinks/roles. On met, emit `CATEGORY OBJECTIVE MET ({owasp_id}) — <evidence>` and STOP."
+    )
+
     # Drafted phases present => phased native_subagents run (the normal-run path).
     drafted = [p for p in (pr.get("phases") or []) if (p.get("objective") or p.get("note") or "").strip()]
     if drafted:
@@ -3204,11 +4270,21 @@ async def run_planned_run(engagement_id: str, owasp_id: str) -> Dict[str, Any]:
         ) for p in phase_specs]
         directive = _compile_directive(GoalCompileRequest(
             objective=category_obj, target=target_scope, rules_of_engagement=roe,
-            phases=mitre_phases, stop_conditions="",
+            phases=mitre_phases, stop_conditions=stop_conditions,
         ))
     else:
-        # Fallback (no LLM draft yet): a single phase from the category checklist.
-        phase_specs = [PhaseSpec(
+        # Fallback (no LLM draft yet): prepend a synthetic Phase-0 PhaseSpec so even
+        # the checklist-fallback run threat-models + captures TARGET_IDENTITY first
+        # (C2). The checklist phase follows.
+        phase0 = PhaseSpec(
+            objective=(
+                "Phase 0 — build threat model (crown jewels, data classes, trust boundaries, attacker "
+                "goals) and capture TARGET_IDENTITY; emit THREAT_MODEL|... to memory"
+            ),
+            tactic_id="TA0043", technique_ids=[], note="Phase 0 threat model",
+            tools=[], checklist=[],
+        )
+        phase_specs = [phase0, PhaseSpec(
             objective=category_obj, tactic_id="TA0043", technique_ids=[],
             note=category_obj, tools=list(pr.get("tools") or []),
             checklist=list(pr.get("checklist") or []),
@@ -3288,6 +4364,105 @@ def _add_finding(eng: Dict[str, Any], finding: Dict[str, Any]) -> Dict[str, Any]
     eng.setdefault("findings", []).append(finding)
     eng["updated_at"] = _now_iso()
     return eng
+
+
+def _merge_confirmed_findings_into_engagement(engagement_id: str, run_id: str) -> int:
+    """Merge this run's verifier-CONFIRMED findings into the engagement ledger.
+
+    Scans /outputs/<run_id>/verifier/*.jsonl (via _extract_verifier_findings, which
+    parses line-by-line — skipping malformed lines, never whole-file — and sets
+    verified=True ONLY when the VERDICT record has verdict=="CONFIRMED" OR
+    ok_to_report=="YES"). NOT_A_VULN / INCONCLUSIVE / NOT_CONFIRMABLE are never
+    merged. New CONFIRMED findings are appended to engagement.findings[]; existing
+    findings are PRESERVED (never overwritten) and de-duplicated by canonical key
+    (route + CWE, via _dedup_key) so re-runs don't duplicate. Returns the number of
+    NEW findings appended. Holds the engagement lock for the read-merge-write so a
+    concurrent run registration cannot clobber it (see _draft_phases_clobbers_run_ledger).
+    """
+    if not engagement_id or not run_id:
+        return 0
+    try:
+        candidates = _extract_verifier_findings(run_id)
+    except Exception as exc:
+        logger.warning("merge_confirmed_findings[%s] extract failed: %s", run_id, exc)
+        return 0
+    # Gate strictly on verifier CONFIRMED (defensive: _extract_verifier_findings
+    # already sets verified only on CONFIRMED/ok_to_report==YES, but we re-check so
+    # a future change to that helper cannot leak refuted/inconclusive records in).
+    candidates = [f for f in candidates if f.get("verified") is True]
+    if not candidates:
+        return 0
+
+    eng = _read_engagement(engagement_id)
+    if not eng:
+        return 0
+
+    # OWASP plan mapping so a merged finding carries its category (mirrors
+    # _draft_findings_inprocess).
+    plan = eng.get("plan") or []
+    run_to_owasp = {p.get("run_id"): (p.get("owasp_id"), p.get("title"))
+                    for p in plan if p.get("run_id")}
+    oid, _otitle = run_to_owasp.get(run_id, ("", ""))
+
+    existing = eng.get("findings") or []
+    existing_keys = set()
+    for f in existing:
+        try:
+            existing_keys.add(_dedup_key(f))
+        except Exception:
+            existing_keys.add(str(f.get("title", "")).lower()[:60])
+
+    now = _now_iso()
+    added = 0
+    new_findings = list(existing)
+    seen_new: set = set()
+    for cand in candidates:
+        cand = dict(cand)
+        cand["discovered_via_run_id"] = run_id
+        if oid:
+            cand["owasp_id"] = oid
+        try:
+            key = _dedup_key(cand)
+        except Exception:
+            key = str(cand.get("title", "")).lower()[:60]
+        # Skip if already in the engagement (preserve existing) OR already added
+        # this run (two CONFIRMED VERDICTs for the same issue).
+        if key in existing_keys or key in seen_new:
+            continue
+        seen_new.add(key)
+        # CVSS fallback: _extract_verifier_findings already copies the recomputed
+        # CVSS from the VERDICT record into cand["cvss"], so no extra fallback is
+        # needed; we just carry it through.
+        finding = {
+            "title": str(cand.get("title") or "")[:200],
+            "severity": str(cand.get("severity") or "medium").lower(),
+            "cvss": cand.get("cvss"),
+            "affected_asset": str(cand.get("affected_asset") or "")[:300],
+            "description": str(cand.get("description") or ""),
+            "impact": str(cand.get("impact") or ""),
+            "evidence": str(cand.get("evidence") or ""),
+            "recommendation": str(cand.get("recommendation") or ""),
+            "status": str(cand.get("status") or "open"),
+            "discovered_via_run_id": run_id,
+            "verified": True,
+            "verifier_verdict": str(cand.get("verifier_verdict") or "")[:500],
+            "commands": list(cand.get("commands") or [])[:40],
+            "owasp_id": oid or None,
+            "id": _new_id(),
+            "engagement_id": engagement_id,
+            "created_at": now,
+            "updated_at": now,
+        }
+        new_findings.append(finding)
+        added += 1
+        logger.info("merge_confirmed_findings[%s] appended finding '%s' to engagement %s",
+                    run_id, finding["title"][:80], engagement_id)
+
+    if added:
+        eng["findings"] = _sort_findings(new_findings)
+        eng["updated_at"] = now
+        _write_engagement(engagement_id, eng)
+    return added
 
 
 @router.post("/engagements/{engagement_id}/findings")
@@ -3396,13 +4571,31 @@ _RE_REFUTE = re.compile(
     r'"verdict"\s*:\s*"(?:NOT_A_VULN|INCONCLUSIVE|REFUTED)"|"ok_to_report"\s*:\s*"NO"', re.I
 )
 _RE_OK_REPORT = re.compile(r"OK\s+TO\s+REPORT\s*:\s*(YES|NO)", re.I)
+# C8: a finding that can ONLY be proved by mutating live state under a no-mod RoE,
+# with no read-only oracle (coder56_verifier's NOT_CONFIRMABLE verdict). Distinct
+# from REFUTED (NOT_CONFIRMABLE is "real but unprovable without breaking RoE", not
+# "not a vuln"). Underscored, so it does NOT collide with "NOT CONFIRMED" (spaced).
+_RE_NOT_CONFIRMABLE = re.compile(r"NOT_CONFIRMABLE|\"verdict\"\s*:\s*\"NOT_CONFIRMABLE\"", re.I)
+# C6: HTTP method inference from finding title/asset/route (default GET) for the
+# strict pre-verifier fingerprint.
+_RE_METHOD = re.compile(r"\b(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b")
+# C7/M9: the Lead's engagement-level early-stop token (it emits this when the
+# objective is already satisfied). The lead driver respects it instead of grinding
+# remaining phases (the Greedy A10 / Owasp2 A03 redundant-phase failure mode).
+_RE_OBJECTIVE_MET = re.compile(r"OBJECTIVE\s+ALREADY\s+MET", re.I)
 _RE_CVSS = re.compile(r"CVSS\s*(?:v[\d.]+)?\s*[:~]?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
 _RE_CWE = re.compile(r"(CWE-\d+|OWASP\s+A\d{2}:?\d{4})", re.I)
 # Candidate dedup/noise helpers. Emissions often repeat the same finding in two
 # places (a `printf` VERIFIER verdict AND a `MEMORY.md` FINDING block) and include
 # command-wrapper noise (`mkdir … && cat >>`, `cd /tmp && …`). These collapse
 # the candidate set so the reporter agent does one unit of work per real finding.
-_RE_ENDPOINT = re.compile(r"/(?:api/)?[a-z][a-z0-9_/-]{2,}", re.I)
+# An HTTP endpoint path. The negative lookahead excludes filesystem/infra paths
+# (/outputs, /tmp, /proc, …) that leak into command bodies — without it a stub
+# like "TOKEN / SCOPE" (whose body is full of /outputs/... plumbing) gets
+# affected_asset="/outputs/" and is mistaken for a real finding.
+_RE_ENDPOINT = re.compile(
+    r"/(?!outputs|tmp|proc|sys|opt|srv|root|var|home|etc|dev|run)(?:api/)?[a-z][a-z0-9_/-]{2,}",
+    re.I)
 _RE_VULNCLASS = re.compile(
     r"\b(bfla|broken[- ]access|sql(?:i|injection)|injection|xss|csrf|ssrf|idor|rce|"
     r"lfi|rfi|csv|formula|unauth(?:orized)?|default\s+cred|priv(?:ilege)?\s*esc|"
@@ -3423,6 +4616,11 @@ def _verifier_status(text: str):
     explicit_no = bool(ok and ok.group(1).upper() == "NO")
     if _RE_CONFIRMED.search(text) and not explicit_no:
         return True, "CONFIRMED by coder56_verifier" + oktxt
+    # C8/A3: NOT_CONFIRMABLE is "real but only provable by mutating live state under
+    # a no-mod RoE" — NOT a refutation. Recognize it distinctly so it is never labeled
+    # INCONCLUSIVE/empty (which would silently drop the RoE conflict the agent raised).
+    if _RE_NOT_CONFIRMABLE.search(text):
+        return False, "NOT_CONFIRMABLE by coder56_verifier" + oktxt
     if _RE_REFUTE.search(text):
         m = re.search(r"(NOT_A_VULN|FALSE POSITIVE|NOT CONFIRMED|REFUTED|RULED OUT)[^.]*",
                       text, re.I)
@@ -3487,6 +4685,25 @@ _RE_EMISSION_TITLE_NOISE = re.compile(
 _RE_EMISSION_TITLE_PREFIX = re.compile(
     r"^(VERIFIER\s*\([^)]*\)\s*:?\s*|CLAIM\s*\[[^\]]*\]\s*:?\s*"
     r"|FINDING\s*\[[^\]]*\]\s*|-\s*)", re.I)
+# A title that is NOT a finding — process/coverage stubs the agent writes as
+# memory headers, and shell fragments scraped out of command plumbing. The
+# emission log captures the agent's own write-ups verbatim, so a "VERIFIER GATE
+# RUN (… all CONFIRMED)" or `python3 - "$F" <<'PY'` line can otherwise be ingested
+# as a (sometimes verified=True!) finding. Reject these outright.
+_RE_GARBAGE_TITLE = re.compile(
+    r"^(VERIFIER\s+GATE\s+RUN"            # "VERIFIER GATE RUN (coder56_verifier invoked x3…)"
+    r"|VERIFIER\s+CONFIRMED\s*\("         # "VERIFIER CONFIRMED (independent repro this run)…"
+    r"|CONFIRMED\s+A\d{2}\s+vulns"        # "CONFIRMED A04 vulns (both coder56_verifier…)"
+    r"|Evidence-capture\s+artifacts"       # "Evidence-capture artifacts (this run)"
+    r"|PHASE\s+\d+\s+OBJECTIVE"            # "PHASE 9 OBJECTIVE: …"
+    r"|Claim\s*:)"                         # raw "Claim: …" header (a restated dup, not a title)
+    r"|<<\s*['\"]?[A-Z]{2,}"               # heredoc tail: <<'PY'
+    r"|python3?\s+-\s"                     # "python3 - "$F""
+    r"|\$\{?[A-Za-z_][A-Za-z0-9_]*\s*=",   # shell assignment as title: $VAR= / MEM=
+    re.I)
+# A title with NO lowercase letter is a fragment (e.g. "TOKEN / SCOPE"), not a
+# finding sentence. Real findings always contain lowercase prose.
+_RE_NO_LOWER = re.compile(r"^[^a-z]*$")
 
 
 def _severity_for(cvss: Optional[float], verdict: str, body: str, verified: bool) -> str:
@@ -3496,7 +4713,8 @@ def _severity_for(cvss: Optional[float], verdict: str, body: str, verified: bool
     # verifier explaining why it's real), which must not be misread as a refutation.
     is_refuted = (not verified) and (
         (verdict and any(k in verdict.lower() for k in
-                         ("not_a_vuln", "false positive", "refuted", "ruled out")))
+                         ("not_a_vuln", "false positive", "refuted", "ruled out",
+                          "not_confirmable", "could_not_test", "unverifiable")))
         or any(k in low for k in ("not_a_vuln", "false positive", "refuted", "ruled out",
                                   "no impact", "standard k8s", "by design", "intended behavior"))
     )
@@ -3653,7 +4871,17 @@ def _extract_emission_findings(run_id: str) -> List[Dict[str, Any]]:
         for body in _split_findings(_decode_emission_body(cmd)):
             if len(body.strip()) < 20:
                 continue
-            verified, verdict = _verifier_status(body)
+            # An emission is a CLAIM, not a confirmation. The verifier's
+            # machine-readable VERDICT record (read by _extract_verifier_findings)
+            # is the only thing that makes a finding confirmed — NOT the agent's
+            # own prose, which routinely says "CONFIRMED" inside process stubs
+            # ("VERIFIER GATE RUN … all CONFIRMED", "python3 … <<'PY'") that then
+            # get counted as confirmed findings. So: trust only REFUTATIONS from
+            # prose (a NOT_A_VULN / NOT_CONFIRMABLE claim correctly lowers the
+            # finding to info); a prose "CONFIRMED" does not confirm here.
+            vflag, vline = _verifier_status(body)
+            verified = False
+            verdict = (vline if (vline and not vflag) else "")
             repro: List[str] = []
             m = re.search(r"[-*]?\s*(?:verifier\s+)?repro(?:duction)?\s*:?\s*(.*?)(?:\n\s*[-*]\s|\Z)",
                           body, re.I | re.S)
@@ -3688,6 +4916,8 @@ def _extract_emission_findings(run_id: str) -> List[Dict[str, Any]]:
     # (memory notes like "ENV RESET…", pasted "#!/bin/bash" scripts, recon dumps).
     filtered = [c for c in raw
                 if c["title_raw"]
+                and not _RE_GARBAGE_TITLE.search(c["title_raw"])
+                and not _RE_NO_LOWER.match(c["title_raw"])
                 and not _RE_SHELL_VERB.match(c["body"].lstrip("\n").strip())
                 and not c["body"].lstrip().startswith("#!")
                 and not _RE_NONFINDING_START.search(c["body"][:300])
@@ -3992,12 +5222,25 @@ def _extract_verifier_findings(run_id: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     seen: set = set()
     for jf in sorted(vdir.glob("*.jsonl"), key=lambda p: p.name):
-        try:
-            recs = [json.loads(ln) for ln in
-                    jf.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
-        except Exception:
-            continue
-        verdict = next((d for d in recs if isinstance(d, dict) and d.get("step") == "VERDICT"), None)
+        # Parse line-by-line and SKIP only the malformed line — do NOT abandon the
+        # whole file. The verifier routinely writes output_excerpt fields containing
+        # raw nested JSON (e.g. {"token":"eyJ..."} captured verbatim) with unescaped
+        # inner quotes, which makes that ONE record unparseable. The file's VERDICT
+        # record lives on a later, well-formed line; the old whole-file try/except
+        # let one bad record nuke the confirmed finding entirely (this is what
+        # dropped the owasp2 A01 BOLA — CONFIRMED, ok_to_report=YES — even though its
+        # VERDICT line parsed fine). 5/25 owasp2 verifier files were affected.
+        recs: List[Dict[str, Any]] = []
+        for ln in jf.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if not ln.strip():
+                continue
+            try:
+                d = json.loads(ln)
+            except Exception:
+                continue
+            if isinstance(d, dict):
+                recs.append(d)
+        verdict = next((d for d in recs if d.get("step") == "VERDICT"), None)
         if not verdict:
             continue
         v = str(verdict.get("verdict", "")).upper()
@@ -4051,18 +5294,107 @@ def _extract_verifier_findings(run_id: str) -> List[Dict[str, Any]]:
     return out
 
 
+def _normalize_path(path: str) -> str:
+    """Normalize a route for fingerprinting: drop query/protocol/host, strip a
+    trailing slash, collapse numeric/hex/uuid path SEGMENTS to :param, lowercase.
+    CRITICAL: only individual id-like segments collapse — the resource PREFIX is
+    preserved, so /distributions/:param/finalize != /donation-receptions/:param/finalize."""
+    if not path:
+        return ""
+    p = path.split("?")[0].strip()
+    p = re.sub(r"^[a-z]+://[^/]+", "", p, flags=re.I)
+    segs: List[str] = []
+    for seg in p.split("/"):
+        if not seg:
+            continue
+        if (re.fullmatch(r"\d+", seg)                      # 123
+                or re.fullmatch(r"[0-9a-fA-F]{8,}", seg)    # hex >= 8
+                or re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F-]+", seg)):  # uuid
+            seg = ":param"
+        else:
+            seg = seg.lower()
+        segs.append(seg)
+    norm = "/" + "/".join(segs)
+    return norm.rstrip("/") or "/"
+
+
+def _parse_pipe_record(s: str) -> Optional[Dict[str, str]]:
+    """Parse a `k=v|k=v|...` pipe-delimited agent memory record (TESTED|,
+    SURFACE_ITEM|, PRINCIPAL|, THREAT_MODEL|, TARGET_IDENTITY|) into a dict.
+    None if no key=value pairs found."""
+    rec: Dict[str, str] = {}
+    for part in s.split("|"):
+        if "=" in part:
+            k, _, v = part.partition("=")
+            rec[k.strip()] = v.strip()
+    return rec or None
+
+
+# Map a vuln class (detected from the finding's prose) to its canonical CWE. The
+# agent tags the CWE on a finding inconsistently — two restatements of the SAME
+# issue often carry the literal "CWE-307" in only one (the other just says "no
+# rate-limiting"). A dedup key built from the raw tag then fails to merge them
+# (the owasp2 login-rate-limit and donor-email-exposure duplicate pairs). Inferring
+# the canonical CWE from the class makes the key stable regardless of whether the
+# literal tag was emitted. Order matters: more specific access-control classes
+# (BOLA/IDOR/BFLA) are matched BEFORE the generic data-exposure class, so a BOLA
+# claim that happens to mention "donor_email PII" keys as CWE-639, not CWE-200 —
+# keeping the access-control finding distinct from the over-exposure finding on
+# the same route.
+_VULNCLASS_TO_CWE: List[tuple] = [
+    (re.compile(r"\b(rate[- ]?limit|lockout|anti[- ]?automation|brute[- ]?force)\b", re.I), "cwe-307"),
+    (re.compile(r"\b(idor|bola|broken[- ]?access|priv(?:ilege)?\s*esc|access[- ]?control|cross[- ]?tenant)\b", re.I), "cwe-639"),
+    (re.compile(r"\b(bfla|function[- ]?level|broken[- ]?function)\b", re.I), "cwe-285"),
+    (re.compile(r"\b(session\s+(?:expir|invalid|revoc)|no\s+server[- ]?side\s+(?:revocation|invalidation)|non[- ]?revocable|token\s+invalidation|jwt\s+expir)\b", re.I), "cwe-613"),
+    (re.compile(r"\b(password\s+policy|weak\s+password|min(?:imum)?[- ]?length\s+\d)\b", re.I), "cwe-521"),
+    (re.compile(r"\b(timing[- ]?(?:based|sensitive)?\s*(?:user|account)?\s*enumerat|username\s+enumerat)\b", re.I), "cwe-208"),
+    (re.compile(r"\b(sql(?:i|injection)|injection)\b", re.I), "cwe-89"),
+    (re.compile(r"\b(?:input[- ]?validation|accept(?:ing|s)\s+fabricat\w*|no\s+server[- ]?side\s+(?:format|length))", re.I), "cwe-20"),
+    (re.compile(r"\bxss\b|cross[- ]?site\s+script", re.I), "cwe-79"),
+    (re.compile(r"\bssrf\b|server[- ]?side\s+request\s+forge", re.I), "cwe-918"),
+    (re.compile(r"\b(expos(?:e|ure)|over[- ]?fetch|excessive\s+data|sensitive\s+data|donor_email|plaintext|pii)\b", re.I), "cwe-200"),
+]
+
+
+def _canonical_cwe(f: Dict[str, Any]) -> str:
+    """The finding's canonical CWE: the explicit tag if present, else inferred
+    from its vuln-class vocabulary (see _VULNCLASS_TO_CWE). '' if neither."""
+    raw = (str(f.get("cwe_hint") or "")).split(",")[0].strip().lower()
+    if raw.startswith("cwe-"):
+        return raw
+    blob = " ".join(str(f.get(k) or "") for k in
+                    ("title", "title_raw", "description", "body", "affected_asset"))
+    for pat, cwe in _VULNCLASS_TO_CWE:
+        if pat.search(blob):
+            return cwe
+    return ""
+
+
 def _dedup_key(f: Dict[str, Any]) -> str:
-    """Stable identity for one issue across sources AND runs: vuln-class + PRIMARY
-    endpoint (asset/title only — never the body, which cites sibling endpoints and
-    would merge distinct findings) + CWE. Falls back to a normalized title."""
-    blob = f"{f.get('affected_asset', '')} {f.get('title', '')}"
-    epm = _RE_ENDPOINT.search(blob)
-    ep = epm.group(0).lower().rstrip("/") if epm else ""
-    cwe = (f.get("cwe_hint") or "").split(",")[0].strip().lower()
-    m = _RE_VULNCLASS.search(f"{f.get('title', '')} {f.get('description', '')}")
-    vc = (m.group(1).lower().replace(" ", "") if m else "")
-    key = f"{vc}|{ep}|{cwe}".strip("|")
-    return key or re.sub(r"\s+", " ", f.get("title") or "").strip().lower()[:60]
+    """Stable identity for one issue across sources AND runs.
+
+    Canonical key = METHOD | normalized_path | canonical_CWE | role, computed the
+    SAME way for every candidate (verifier-anchored or emission). Previously the
+    strict METHOD|PATH|CWE|role fingerprint was used only when method AND cwe were
+    both present, with a noisy vuln-class|endpoint fallback otherwise — and since
+    the agent tags CWE inconsistently, two restatements of one finding routinely
+    landed on different keys and survived as duplicates (the owasp2 login-rate-limit
+    and donor-email-exposure pairs). Using the _canonical_cwe (inferred when the
+    literal tag is missing) makes the key stable so duplicates collapse, while
+    METHOD/role still keep BFLA-vs-BOLA and different-attacker-role distinct.
+
+    Falls back to a normalized title only when no endpoint path is derivable."""
+    blob = f"{f.get('title') or f.get('title_raw') or ''} {f.get('affected_asset', '')} {f.get('description', '')}"
+    mm = _RE_METHOD.search(blob)
+    method = mm.group(1).upper() if mm else ""
+    epm = _RE_ENDPOINT.search(f"{f.get('affected_asset', '')} {f.get('title') or f.get('title_raw') or ''}")
+    path = _normalize_path(epm.group(0)) if epm else ""
+    cwe = _canonical_cwe(f)
+    rm = re.search(r"\b(ROLE_[A-Z_]+)\b", blob)
+    role = rm.group(1).lower() if rm else ""
+    if path:
+        return f"{method}|{path}|{cwe}|{role}"
+    return re.sub(r"\s+", " ", f.get("title") or f.get("title_raw") or "").strip().lower()[:60]
 
 
 def _merge_findings(base: Dict[str, Any], other: Dict[str, Any]) -> Dict[str, Any]:
@@ -4072,8 +5404,17 @@ def _merge_findings(base: Dict[str, Any], other: Dict[str, Any]) -> Dict[str, An
     Run/owasp provenance accumulates into lists for the report."""
     out = dict(base)
     if not out.get("verified") and other.get("verified"):
+        # CONFIRMED > REFUTED/INCONCLUSIVE precedence (postmortem defect #2): a real
+        # verifier VERDICT confirming an issue that an earlier restatement demoted to
+        # info/NOT_A_VULN must define the finding — its boolean flag AND its verdict,
+        # cvss, and severity. Without recomputing severity/cvss here, a confirmed
+        # finding merging into a refuted base kept the base's severity=info.
         out["verified"] = True
         out["verifier_verdict"] = other.get("verifier_verdict") or out.get("verifier_verdict", "")
+        if other.get("cvss") is not None:
+            out["cvss"] = other["cvss"]
+        if other.get("severity"):
+            out["severity"] = other["severity"]
     cmds = list(out.get("commands") or [])
     for c in (other.get("commands") or []):
         if c and c not in cmds:
@@ -4174,13 +5515,102 @@ def _coerce_reporter_findings(raw_findings: List[Any]) -> List[Dict[str, Any]]:
     return out
 
 
-def _coverage(eng: Dict[str, Any], findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _surface_coverage(engagement_id: Optional[str],
+                      findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """M10: coverage by SURFACE ITEM, not OWASP category. The phase worker appends a
+    `TESTED|` line to the engagement's shared memory (_engagement_memory_path) for
+    every endpoint x param x role x object-id x state it actually exercised; this
+    mines those records (the producer↔consumer contract the phase prompt emits).
+    Verifier VERDICT-confirmed routes not already in a TESTED| line are folded in so
+    a confirmed finding is never absent from the matrix. `status` mirrors the phase
+    contract: tested_confirmed | tested_negative | not_applicable | could_not_test |
+    unverifiable — could_not_test/unverifiable are VISIBLE, never silently dropped
+    (what A10 needed to say 'unverifiable (sink unreachable)' instead of 'no vuln')."""
+    ledger: List[Dict[str, Any]] = []
+    seen: set = set()
+    mem = ""
+    if engagement_id:
+        try:
+            mp = _engagement_memory_path(engagement_id)
+            if mp.exists():
+                mem = mp.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            mem = ""
+    for ln in mem.splitlines():
+        ln = ln.strip()
+        if not ln.startswith("TESTED|"):
+            continue
+        rec = _parse_pipe_record(ln[len("TESTED|"):])
+        if not rec:
+            continue
+        method = (rec.get("method") or "").upper()
+        path = rec.get("path") or ""
+        key = f"{method}|{path}|{rec.get('params', '')}|{rec.get('role', '')}|{rec.get('object_id', '')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        status = rec.get("status") or "tested_negative"
+        ev = rec.get("evidence") or ""
+        ledger.append({
+            "method": method,
+            "path": path,
+            "params": [p for p in rec.get("params", "").split(",") if p],
+            "role": rec.get("role", ""),
+            "object_id": rec.get("object_id", ""),
+            "cwe": rec.get("cwe", ""),
+            "tested": status in ("tested_confirmed", "tested_negative"),
+            "status": status,
+            "run_id": rec.get("run_id", ""),
+            "verified": status == "tested_confirmed",
+            "evidence_file": "" if ev in ("", "none") else ev,
+        })
+    # Supplement: a verifier-CONFIRMED finding proves a surface item even if the
+    # phase omitted its TESTED| line. Fold the finding's route in as tested_confirmed.
+    for f in findings:
+        if not f.get("verified"):
+            continue
+        blob = f"{f.get('title', '')} {f.get('affected_asset', '')} {f.get('verifier_verdict', '')}"
+        mm = _RE_METHOD.search(blob)
+        method = mm.group(1).upper() if mm else ""
+        epm = _RE_ENDPOINT.search(f"{f.get('affected_asset', '')} {f.get('title', '')}")
+        path = _normalize_path(epm.group(0)) if epm else ""
+        if not path:
+            continue
+        key = f"{method}|{path}|||"
+        if key in seen:
+            continue
+        seen.add(key)
+        cwe = (f.get("cwe_hint") or "").split(",")[0].strip().lower()
+        ledger.append({
+            "method": method, "path": path, "params": [], "role": "",
+            "object_id": "", "cwe": cwe, "tested": True,
+            "status": "tested_confirmed",
+            "run_id": f.get("discovered_via_run_id") or f.get("run_id") or "",
+            "verified": True, "evidence_file": "",
+        })
+    return ledger
+
+
+def _coverage(eng: Dict[str, Any], findings: List[Dict[str, Any]],
+              engagement_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """OWASP Top-10 coverage matrix: per category, its lifecycle status, the run
     that materialized it, and how many drafted findings (verified + total) map to
-    it. Only present for engagements that carry a `plan`."""
+    it. Only present for engagements that carry a `plan`. M10: when engagement_id is
+    supplied, each row also carries the surface_items relevant to that category
+    (mined from the engagement memory TESTED| ledger via _surface_coverage)."""
     plan = eng.get("plan") or []
     if not plan:
         return []
+    surf_all = _surface_coverage(engagement_id, findings) if engagement_id else []
+    # Bucket surface items to a category by matching the category's own finding routes.
+    cat_paths: Dict[str, List[str]] = {}
+    for f in findings:
+        oid = f.get("owasp_id")
+        if not oid:
+            continue
+        epm = _RE_ENDPOINT.search(f"{f.get('affected_asset', '')} {f.get('title', '')}")
+        if epm:
+            cat_paths.setdefault(oid, []).append(_normalize_path(epm.group(0)))
     counts: Dict[str, Dict[str, int]] = {}
     for f in findings:
         oid = f.get("owasp_id")
@@ -4194,6 +5624,13 @@ def _coverage(eng: Dict[str, Any], findings: List[Dict[str, Any]]) -> List[Dict[
     for p in plan:
         oid = p.get("owasp_id", "")
         c = counts.get(oid, {"findings": 0, "confirmed": 0})
+        paths = cat_paths.get(oid, [])
+        sitems: List[Dict[str, Any]] = []
+        if paths and surf_all:
+            for s in surf_all:
+                sp = s.get("path", "")
+                if any(sp == pp or sp.startswith(pp + "/") or pp.startswith(sp + "/") for pp in paths):
+                    sitems.append(s)
         rows.append({
             "owasp_id": oid,
             "title": p.get("title", ""),
@@ -4202,6 +5639,7 @@ def _coverage(eng: Dict[str, Any], findings: List[Dict[str, Any]]) -> List[Dict[
             "run_id": p.get("run_id"),
             "findings": c["findings"],
             "confirmed": c["confirmed"],
+            "surface_items": sitems,
         })
     return rows
 
@@ -4229,24 +5667,26 @@ async def draft_findings(engagement_id: str, req: FindingsDraftRequest) -> Dict[
         run_ids = [pr["run_id"]] if pr and pr.get("run_id") else []
     live_runs = [rid for rid in run_ids if _read_run_meta(rid)]
     if not live_runs:
-        return {"findings": [], "coverage": _coverage(eng, []),
+        return {"findings": [], "coverage": _coverage(eng, [], engagement_id),
+                "coverage_ledger": _surface_coverage(engagement_id, []),
                 "note": ("No run artifacts found yet"
                           + (f" for {req.owasp_id}" if req.owasp_id else "")
                           + " — run the engagement, then draft findings.")}
 
     findings = _coerce_reporter_findings(_draft_findings_inprocess(eng, live_runs))
     findings = _sort_findings(findings)
-    coverage = _coverage(eng, findings)
+    coverage = _coverage(eng, findings, engagement_id)
+    coverage_ledger = _surface_coverage(engagement_id, findings)
     confirmed = sum(1 for f in findings if f.get("verified"))
     if not findings:
-        return {"findings": [], "coverage": coverage,
+        return {"findings": [], "coverage": coverage, "coverage_ledger": coverage_ledger,
                 "note": (f"No findings found across {len(live_runs)} run(s)"
                          + (f" for {req.owasp_id}" if req.owasp_id else "")
                          + " — neither verifier verdicts nor emission logs produced a CONFIRMED/claimed finding.")}
     note = (f"Drafted {len(findings)} finding(s) ({confirmed} verifier-confirmed) from "
             f"{len(live_runs)} run(s)" + (f" for {req.owasp_id}" if req.owasp_id else "")
             + " — review, edit, and save the ones you keep.")
-    return {"findings": findings, "coverage": coverage, "note": note}
+    return {"findings": findings, "coverage": coverage, "coverage_ledger": coverage_ledger, "note": note}
 
 
 # =============================================================================
@@ -4292,6 +5732,16 @@ def _write_reportwriter_input(engagement_id: str, eng: Dict[str, Any],
     rows = []
     for f in findings:
         rid = f.get("discovered_via_run_id") or f.get("run_id")
+        # C5: preconditions derived (not fabricated) from the finding's auth/role
+        # context; attack_path starts empty and the reporter infers chains from the
+        # coverage_ledger (which surface items connect to which crown jewel).
+        precond_bits: List[str] = []
+        blob = f"{f.get('title', '')} {f.get('affected_asset', '')} {f.get('verifier_verdict', '')} {f.get('evidence', '')}"
+        rm = re.search(r"\b(ROLE_[A-Z_]+)\b", blob)
+        if rm:
+            precond_bits.append(f"authenticated as {rm.group(1)}")
+        if re.search(r"\bunauth|no[_ -]?auth|pre[_ -]?auth\b", blob, re.I):
+            precond_bits.append("no authentication required")
         rows.append({
             "title": f.get("title", ""),
             "severity": f.get("severity", "medium"),
@@ -4304,6 +5754,8 @@ def _write_reportwriter_input(engagement_id: str, eng: Dict[str, Any],
             "evidence": f.get("evidence", ""),
             "commands": f.get("commands") or [],
             "evidence_file": _best_verifier_file(rid, f),
+            "preconditions": "; ".join(precond_bits),
+            "attack_path": [],
         })
     payload = {
         "engagement_name": eng.get("name", ""),
@@ -4311,7 +5763,8 @@ def _write_reportwriter_input(engagement_id: str, eng: Dict[str, Any],
         "target_scope": eng.get("target_scope", ""),
         "objective": eng.get("objective", ""),
         "roe": eng.get("roe", ""),
-        "coverage": _coverage(eng, findings),
+        "coverage": _coverage(eng, findings, engagement_id),
+        "coverage_ledger": _surface_coverage(engagement_id, findings),
         "findings": rows,
     }
     path = OUTPUTS_DIR / "engagements" / f"{engagement_id}.reportwriter_input.json"
@@ -4363,7 +5816,12 @@ async def _run_reportwriter_agent(engagement_id: str, eng: Dict[str, Any],
         "for richer context; then write the output JSON atomically and stop. The backend detects completion "
         "by the output file appearing. Preserve each finding's severity/cvss/owasp_id/affected_asset/verified "
         "verbatim and rewrite only the prose. Write the executive summary + overall risk specific to THIS "
-        "engagement — no boilerplate, no internal/lab voice."
+        "engagement — no boilerplate, no internal/lab voice.\n\n"
+        "The input also carries `coverage_ledger` (the attack-surface items actually tested, by surface "
+        "element not OWASP category) and each finding carries `preconditions` + an `attack_path` list. Render "
+        "a COVERAGE MATRIX from coverage_ledger grouped by the threat-model crown jewels, frame connected "
+        "findings as attack paths (fill each finding's attack_path from the ledger where they chain), and "
+        "treat could_not_test/unverifiable surface items as visible coverage gaps — not as clean."
     )
     create = await create_session_async(host=addr, port=4096, title=f"reportwriter-{engagement_id}")
     if not create.get("success") or not create.get("session_id"):
@@ -4421,6 +5879,171 @@ async def _run_reportwriter_agent(engagement_id: str, eng: Dict[str, Any],
         raise HTTPException(status_code=502,
                             detail="Report-writer output missing required fields (executive_summary/findings).")
     return result
+
+
+# ---------------------------------------------------------------------------
+# MANDATORY + IDEMPOTENT reportwriter reconcile (REC #17).
+# Background: _write_reportwriter_input writes <id>.reportwriter_input.json but
+# nothing guarantees the reportwriter pass (_run_reportwriter_agent ->
+# <id>.report.json + <id>.report.html) ever completes. The pass only ran on an
+# explicit operator POST .../report/write; if that was never called, or the
+# coder56_reporter sandbox/opencode was unavailable, the engagement was left with
+# reportwriter_input.json and NO report (confirmed: 8ef1a41d2388 status=planning
+# 7 findings, 0fa53642625e status=active 6 findings, both reportwriter_input.json
+# present but no report.json/report.html). This closes that gap and advances the
+# engagement status out of 'planning' when findings are present.
+# ---------------------------------------------------------------------------
+
+def _engagement_status_after_findings(eng: Dict[str, Any]) -> Optional[str]:
+    """Advance engagement.status out of PLANNING/ACTIVE toward REPORTING once the
+    engagement has persisted findings. Never forces CLOSED (operator-delivered).
+    Returns the new status string, or None if no change is warranted."""
+    from ..models import EngagementStatus
+    findings = eng.get("findings") or []
+    cur = (eng.get("status") or EngagementStatus.PLANNING.value)
+    if not findings:
+        return None
+    if cur in (EngagementStatus.PLANNING.value, EngagementStatus.ACTIVE.value):
+        return EngagementStatus.REPORTING.value
+    return None
+
+
+def _deterministic_report_fallback(engagement_id: str, eng: Dict[str, Any],
+                                   findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Produce a structured <id>.report.json + <id>.report.html deterministically
+    (no agent) so the reconcile gap is ALWAYS closed even when the reportwriter
+    sandbox/opencode is unavailable. The HTML reuses the existing render_report
+    fallback (the same one GET report.html serves when no cache exists). Returns
+    the structured report dict. Idempotent: identical findings -> identical files."""
+    detail = _engagement_detail(eng)
+    runs = detail["runs"]
+    verdicts_by_run = {rid: _read_verdicts_raw(rid, 200) for rid in (eng.get("run_ids") or [])}
+    report = {
+        "engagement_name": eng.get("name", ""),
+        "executive_summary": (
+            f"Automated draft of {len(findings)} finding(s) for "
+            f"{eng.get('name', 'this engagement')} ("
+            f"{sum(1 for f in findings if f.get('verified'))} verifier-confirmed). "
+            "Authored by the deterministic fallback because the report-writer agent "
+            "was unavailable during the mandatory reconcile pass; re-run POST "
+"/engagements/{id}/report/write to regenerate the agent-authored narrative."
+        ),
+        "overall_risk": "See per-finding severities.",
+        "findings": findings,
+        "generated_by": "deterministic-fallback",
+    }
+    out_dir = OUTPUTS_DIR / "engagements"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = out_dir / f"{engagement_id}.report.json"
+    html_path = out_dir / f"{engagement_id}.report.html"
+    html = render_report(eng, runs, findings, mitre_catalog(), verdicts_by_run)
+    tmp = json_path.with_suffix(json_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, json_path)
+    try:
+        html_path.write_text(html, encoding="utf-8")
+    except Exception:
+        pass
+    return report
+
+
+async def _reconcile_reportwriter(engagement_id: str, *, force: bool = False) -> bool:
+    """Mandatory + idempotent reportwriter pass for ONE engagement.
+
+    Runs the reportwriter agent when <id>.report.json is missing OR older than
+    <id>.reportwriter_input.json (stale), and falls back to the deterministic
+    renderer if the agent/sandbox is unavailable so a report ALWAYS exists once
+    findings are present. Also advances engagement.status from planning/active to
+    reporting when findings exist. Best-effort + never raises (called from the
+    lead-driver exit and startup sweep). Returns True if (re)generated."""
+    if not engagement_id:
+        return False
+    try:
+        eng = _read_engagement(engagement_id)
+        if not eng:
+            return False
+        out_dir = OUTPUTS_DIR / "engagements"
+        input_path = out_dir / f"{engagement_id}.reportwriter_input.json"
+        json_path = out_dir / f"{engagement_id}.report.json"
+        html_path = out_dir / f"{engagement_id}.report.html"
+
+        # Gather findings: saved first, else draft in-process from run artifacts
+        # (so the report is never empty when runs produced CONFIRMED verdicts).
+        findings = eng.get("findings") or []
+        if not findings:
+            live = [r for r in (eng.get("run_ids") or []) if _read_run_meta(r)]
+            findings = _coerce_reporter_findings(_draft_findings_inprocess(eng, live)) if live else []
+        if not findings:
+            # Nothing to report yet; nothing to reconcile. Do not touch status.
+            return False
+
+        # Idempotency gate: skip if the JSON report exists and is at least as new
+        # as the input (unless force=True).
+        needs_run = force or (not json_path.exists())
+        if not needs_run and input_path.exists():
+            try:
+                if json_path.stat().st_mtime >= input_path.stat().st_mtime:
+                    regenerated = False
+                else:
+                    needs_run = True
+            except OSError:
+                needs_run = True
+        if not needs_run:
+            regenerated = False
+        else:
+            # Always (re)write the agent input from the CURRENT findings so the
+            # input is never stale relative to a saved-finding edit.
+            _write_reportwriter_input(engagement_id, eng, findings)
+            regenerated = False
+            try:
+                report = await _run_reportwriter_agent(engagement_id, eng, findings)
+                detail = _engagement_detail(eng)
+                runs = detail["runs"]
+                verdicts_by_run = {rid: _read_verdicts_raw(rid, 200)
+                                   for rid in (eng.get("run_ids") or [])}
+                html = render_client_report(eng, report, runs, mitre_catalog(), verdicts_by_run)
+                try:
+                    html_path.write_text(html, encoding="utf-8")
+                except Exception:
+                    pass
+                regenerated = True
+            except HTTPException as exc:
+                # Agent/sandbox unavailable -> deterministic fallback so the report
+                # gap is ALWAYS closed (the original silent-skip failure mode).
+                logger.warning("reconcile_reportwriter[%s]: agent failed (%s); "
+                               "using deterministic fallback", engagement_id,
+                               str(exc.detail)[:160])
+                _deterministic_report_fallback(engagement_id, eng, findings)
+                regenerated = True
+            except Exception as exc:
+                logger.warning("reconcile_reportwriter[%s]: agent error (%s); "
+                               "using deterministic fallback", engagement_id, exc)
+                _deterministic_report_fallback(engagement_id, eng, findings)
+                regenerated = True
+
+        # Advance status out of planning/active when findings are present.
+        new_status = _engagement_status_after_findings(eng)
+        if new_status and (eng.get("status") or "") != new_status:
+            eng = _read_engagement(engagement_id) or eng
+            eng["status"] = new_status
+            eng["updated_at"] = _now_iso()
+            _write_engagement(engagement_id, eng)
+        return regenerated
+    except Exception as exc:
+        logger.warning("reconcile_reportwriter[%s] error (continuing): %s",
+                       engagement_id, exc)
+        return False
+
+
+async def _reconcile_all_engagement_reports() -> None:
+    """Startup sweep: close the reportwriter gap for every existing engagement so
+    a backend restart repairs engagements left with reportwriter_input.json but
+    no report (8ef1a41d2388, 0fa53642625e). Sequential + best-effort."""
+    for eng in _load_all_engagements():
+        eid = eng.get("id")
+        if not eid:
+            continue
+        await _reconcile_reportwriter(eid)
 
 
 @router.post("/engagements/{engagement_id}/report/write", response_class=HTMLResponse)
@@ -4488,6 +6111,25 @@ async def get_owasp_catalog() -> Dict[str, Any]:
     """OWASP Top 10 (2021) category catalog for the goal-builder / OWASP plan
     drafting. Mirrors /mitre/catalog."""
     return owasp_catalog()
+
+
+@router.get("/hosts/busy")
+async def get_host_busy(topology_id: str = Query(default=""),
+                        host_id: str = Query(default="")) -> Dict[str, Any]:
+    """Container-busy state for the operator UI.
+
+    With both params: returns the busy state of one host (busy/reason/run_id/
+    since/last_verdict_ts) — drive a 'host busy' badge / launch-disable in the
+    console.  Without params: returns every currently-registered active host run
+    (the in-process registry; not a full historical scan)."""
+    if topology_id or host_id:
+        return {"topology_id": topology_id, "host_id": host_id,
+                **_host_busy_state(topology_id, host_id)}
+    active = [
+        {"topology_id": k[0], "host_id": k[1], **v}
+        for k, v in _active_host_runs.items()
+    ]
+    return {"active": active, "count": len(active)}
 
 
 @router.get("/runs")

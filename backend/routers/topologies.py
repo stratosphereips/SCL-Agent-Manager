@@ -54,6 +54,9 @@ class NetworkHost(BaseModel):
     # it round-trips through the plugin's topology.json (NetworkHost is the detail
     # sub-model; without this the detail/create response would 500 on the key).
     guardrail_enabled: Optional[bool] = Field(default=None)
+    # Per-host coder56 verification mode. None/absent keeps the current default
+    # (enabled); False restores direct single-agent finding validation.
+    coder56_verifier_enabled: Optional[bool] = Field(default=None)
     generate_data: bool = False
     data_prompt: Optional[str] = None
     data_content: Optional[str] = None
@@ -110,6 +113,12 @@ class TopologyStopResponse(BaseModel):
     """Response for stopping a topology."""
     message: str
     topology_id: str
+
+
+class Coder56VerifierUpdate(BaseModel):
+    """Persist and optionally apply the coder56 verifier mode for one host."""
+    enabled: bool
+    restart: bool = True
 
 
 # =============================================================================
@@ -401,6 +410,79 @@ async def update_topology(topology_id: str, payload: Dict[str, Any]):
         raise
     except Exception as e:
         logger.error(f"Error updating topology {topology_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/{topology_id}/hosts/{host_id}/coder56-verifier")
+async def update_coder56_verifier(
+    topology_id: str,
+    host_id: str,
+    payload: Coder56VerifierUpdate,
+):
+    """Enable/disable coder56's independent verifier on a topology host.
+
+    The setting is stored in topology.json. When ``restart`` is true, asking the
+    topology plugin to start again regenerates compose and recreates the changed
+    coder56 container, so the new OpenCode permissions/prompts take effect.
+    """
+    try:
+        current_data = await fetch_from_topology_plugin(f"/api/topologies/{topology_id}")
+        topology = current_data.get("topology", current_data)
+
+        target_host = None
+        for network in topology.get("networks", []):
+            for host in network.get("hosts", []):
+                if host.get("id") == host_id:
+                    target_host = host
+                    break
+            if target_host is not None:
+                break
+
+        if target_host is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Host {host_id} not found in topology {topology_id}",
+            )
+        if "coder56" not in (target_host.get("agents") or []):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Host {host_id} does not have coder56 assigned",
+            )
+
+        current_enabled = target_host.get("coder56_verifier_enabled") is not False
+        changed = current_enabled != payload.enabled
+        target_host["coder56_verifier_enabled"] = payload.enabled
+        saved_data = await post_to_topology_plugin("/api/topologies", topology)
+
+        start_data: Dict[str, Any] = {}
+        if changed and payload.restart:
+            start_data = await post_to_topology_plugin(
+                f"/api/topologies/{topology_id}/start"
+            )
+
+        return {
+            "topology_id": topology_id,
+            "host_id": host_id,
+            "enabled": payload.enabled,
+            "changed": changed,
+            "restarting": bool(changed and payload.restart),
+            "job_id": start_data.get("job_id"),
+            "message": start_data.get(
+                "message",
+                "Coder56 verifier setting saved"
+                + (" and topology restart requested" if changed and payload.restart else ""),
+            ),
+            "topology": saved_data.get("topology", saved_data),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "Error updating coder56 verifier for %s/%s: %s",
+            topology_id,
+            host_id,
+            e,
+        )
         raise HTTPException(status_code=500, detail=str(e))
 
 

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import type { TimelineEntry, ReplayEvent } from '@/types';
-import { api } from '@/api-trident';
+import { getTimeline } from '@/api';
 import { useReplayContext } from '@/contexts/ReplayContext';
 
 /** Map agent keys to their expected source file paths */
@@ -108,8 +108,8 @@ export function useTimelineStream(agent: string) {
     let cancelled = false;
 
     const load = () => {
-      api.timeline(agent)
-        .then((r: any) => {
+      getTimeline(agent)
+        .then((r) => {
           if (cancelled) return;
           const fetched: TimelineEntry[] = r?.entries ?? [];
           setEntries((prev) => (fetched.length > prev.length ? fetched : prev));

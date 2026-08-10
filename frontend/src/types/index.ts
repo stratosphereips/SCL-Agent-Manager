@@ -1,36 +1,7 @@
+/**
+ * Single source of truth for frontend types.
+ *
+ * All non-Trident types AND the former `trident.ts` types now live together in
+ * `agent-manager.ts`. Import everything from `@/types` (this barrel).
+ */
 export * from './agent-manager';
-
-export type {
-  TridentContainerState,
-  TridentContainerInfo,
-  TridentSessionMessage,
-  TridentHealthResponse,
-  TridentAgentTemplate,
-  TridentAgentAssignment,
-  TopologyNode,
-  TopologyEdge,
-  TopologyData,
-  NodeType,
-  MessagePart,
-  SessionsMap,
-  AlertEntry,
-  PcapFile,
-  RunInfo,
-  TimelineEntry,
-  ServiceHealth,
-  WsContainersMessage,
-  WsSessionsMessage,
-  WsMessagesMessage,
-  OpenCodeStatePayload,
-  WsAlertMessage,
-  WsTimelineMessage,
-  WsReplayStateMessage,
-  WsReplayEventsMessage,
-  WsReplayPlaybackCompleteMessage,
-  WsReplayErrorMessage,
-  WsReplayMessage,
-  ReplayEvent,
-  ReplayState,
-  ReplayMetadata,
-  ReplayRunInfo,
-} from './trident';

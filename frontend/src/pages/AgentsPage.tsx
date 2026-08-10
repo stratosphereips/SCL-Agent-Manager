@@ -8,7 +8,21 @@ import type { AgentStateAssignment, SessionMessage, AgentTemplate, SessionInfo, 
 import { ContainerState } from '@/types';
 
 // Agent Panel Component
-function AgentPanel({ assignment, template, isGuarded }: { assignment: AgentStateAssignment, template?: AgentTemplate, isGuarded?: boolean }) {
+function AgentPanel({
+  assignment,
+  template,
+  isGuarded,
+  verifierEnabled,
+  verifierApplying,
+  onToggleVerifier,
+}: {
+  assignment: AgentStateAssignment;
+  template?: AgentTemplate;
+  isGuarded?: boolean;
+  verifierEnabled?: boolean;
+  verifierApplying?: boolean;
+  onToggleVerifier?: () => void;
+}) {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeSession, setActiveSession] = useState<SessionInfo | null>(null);
   const [messages, setMessages] = useState<SessionMessage[]>([]);
@@ -107,6 +121,26 @@ function AgentPanel({ assignment, template, isGuarded }: { assignment: AgentStat
               guarded
             </span>
           )}
+          {assignment.agent_type === 'coder56' && (
+            <label
+              title="Independent finding verifier. Turning this off restores legacy single-agent execution and restarts the changed topology container."
+              className={`badge flex items-center gap-1 cursor-pointer select-none ${
+                verifierEnabled ? 'badge-info' : 'bg-trident-border/40 text-trident-muted'
+              }`}
+            >
+              {verifierApplying ? (
+                <Loader2 size={12} className="animate-spin" />
+              ) : (
+                <input
+                  type="checkbox"
+                  checked={verifierEnabled ?? true}
+                  onChange={onToggleVerifier}
+                  className="accent-violet-500"
+                />
+              )}
+              verifier {verifierEnabled ? 'on' : 'off'}
+            </label>
+          )}
           <span className={`badge ${assignment.state === 'ready' ? 'badge-success' : assignment.state === 'failed' ? 'badge-danger' : 'badge-info'}`}>
             {assignment.state}
           </span>
@@ -162,6 +196,7 @@ export function AgentsPage() {
   const [templates, setTemplates] = useState<Record<string, AgentTemplate>>({});
   const [runningTopologyIds, setRunningTopologyIds] = useState<Set<string>>(new Set());
   const [topologyDetails, setTopologyDetails] = useState<Record<string, Topology>>({});
+  const [verifierApplying, setVerifierApplying] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -221,6 +256,71 @@ export function AgentsPage() {
     return map;
   }, [topologyDetails]);
 
+  const hostVerifierMap = useMemo(() => {
+    const map: Record<string, boolean> = {};
+    Object.values(topologyDetails).forEach((topo) => {
+      (topo.networks || []).forEach((net) => {
+        (net.hosts || []).forEach((host: Host) => {
+          map[`${topo.id}:${host.id}`] = host.coder56_verifier_enabled ?? true;
+        });
+      });
+    });
+    return map;
+  }, [topologyDetails]);
+
+  const toggleVerifier = async (assignment: AgentStateAssignment) => {
+    const key = `${assignment.topology_id}:${assignment.host_id}`;
+    const enabled = !(hostVerifierMap[key] ?? true);
+    setVerifierApplying(prev => ({ ...prev, [key]: true }));
+    try {
+      const result = await api.setCoder56Verifier(
+        assignment.topology_id,
+        assignment.host_id,
+        enabled,
+        true,
+      );
+      setTopologyDetails(prev => {
+        const current = prev[assignment.topology_id];
+        if (!current) return prev;
+        return {
+          ...prev,
+          [assignment.topology_id]: {
+            ...current,
+            networks: (current.networks || []).map(net => ({
+              ...net,
+              hosts: (net.hosts || []).map(host => (
+                host.id === assignment.host_id
+                  ? { ...host, coder56_verifier_enabled: enabled }
+                  : host
+              )),
+            })),
+          },
+        };
+      });
+
+      if (result.job_id) {
+        let completed = false;
+        for (let attempt = 0; attempt < 200; attempt++) {
+          const job = await api.getTopologyJob(assignment.topology_id, result.job_id);
+          if (job.status === 'completed') {
+            completed = true;
+            break;
+          }
+          if (job.status === 'failed') {
+            throw new Error(job.error || 'Topology restart failed');
+          }
+          await new Promise(resolve => window.setTimeout(resolve, 1500));
+        }
+        if (!completed) throw new Error('Timed out applying coder56 verifier mode');
+      }
+    } catch (err) {
+      console.error('Failed to update coder56 verifier mode', err);
+      window.alert(err instanceof Error ? err.message : 'Failed to update coder56 verifier mode');
+    } finally {
+      setVerifierApplying(prev => ({ ...prev, [key]: false }));
+    }
+  };
+
   // Replay mode: show replayed agent activity synced to playback, instead of the live management UI.
   if (replay.replayId) {
     return (
@@ -272,6 +372,9 @@ export function AgentsPage() {
               assignment={a}
               template={templates[a.agent_type]}
               isGuarded={hostGuardedMap[`${a.topology_id}:${a.host_id}`] ?? false}
+              verifierEnabled={hostVerifierMap[`${a.topology_id}:${a.host_id}`] ?? true}
+              verifierApplying={verifierApplying[`${a.topology_id}:${a.host_id}`] ?? false}
+              onToggleVerifier={() => toggleVerifier(a)}
             />
           ))}
         </div>

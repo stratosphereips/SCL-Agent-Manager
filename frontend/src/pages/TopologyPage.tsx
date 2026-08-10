@@ -157,17 +157,21 @@ function AddAgentButton({ currentAgents, agentTypes, templates, onAdd }: {
 
 // ─── Host row ────────────────────────────────────────────────────────────────
 function HostRow({
-  host, agentTypes, templates, guardrailOn, onToggleGuardrail, onAgentAdd, onAgentRemove,
+  host, agentTypes, templates, guardrailOn, verifierOn, onToggleGuardrail,
+  onToggleVerifier, onAgentAdd, onAgentRemove,
 }: {
   host: Host;
   agentTypes: string[];
   templates: TemplateMap;
   guardrailOn: boolean;
+  verifierOn: boolean;
   onToggleGuardrail: () => void;
+  onToggleVerifier: () => void;
   onAgentAdd: (agentType: string) => void;
   onAgentRemove: (agentType: string) => void;
 }) {
   const agents = host.agents ?? [];
+  const hasCoder56 = agents.includes('coder56');
   return (
     <div className="flex flex-wrap items-center gap-2 p-2 bg-gray-50 dark:bg-gray-800/60 rounded-lg">
       <Server size={14} className="text-green-500 dark:text-green-400 flex-shrink-0" />
@@ -188,6 +192,19 @@ function HostRow({
         <input type="checkbox" checked={guardrailOn} onChange={onToggleGuardrail} className="accent-amber-500" />
         🛡 guardrail
       </label>
+      {hasCoder56 && (
+        <label
+          title="Independent coder56 finding verifier. Turn off for legacy single-agent execution."
+          className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded-full cursor-pointer select-none ${
+            verifierOn
+              ? 'bg-violet-100 dark:bg-violet-900/40 text-violet-700 dark:text-violet-300'
+              : 'bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400'
+          }`}
+        >
+          <input type="checkbox" checked={verifierOn} onChange={onToggleVerifier} className="accent-violet-500" />
+          ✓ verifier
+        </label>
+      )}
       <div className="flex flex-wrap items-center gap-1.5 ml-auto">
         {agents.map(a => (
           <AgentChip key={a} agent={a} templates={templates} onRemove={() => onAgentRemove(a)} />
@@ -321,6 +338,13 @@ export function TopologyPage() {
     mutateHost(networkId, hostId, h => ({
       ...h,
       guardrail_enabled: !(h.guardrail_enabled ?? hasGuardedAgent(h)),
+    }));
+  };
+
+  const toggleVerifier = (networkId: string, hostId: string) => {
+    mutateHost(networkId, hostId, h => ({
+      ...h,
+      coder56_verifier_enabled: !(h.coder56_verifier_enabled ?? true),
     }));
   };
 
@@ -592,7 +616,9 @@ export function TopologyPage() {
                             agentTypes={agentTypes}
                             templates={templates}
                             guardrailOn={host.guardrail_enabled ?? hasGuardedAgent(host)}
+                            verifierOn={host.coder56_verifier_enabled ?? true}
                             onToggleGuardrail={() => toggleGuardrail(network.id, host.id)}
+                            onToggleVerifier={() => toggleVerifier(network.id, host.id)}
                             onAgentAdd={a => addAgent(network.id, host.id, a)}
                             onAgentRemove={a => removeAgent(network.id, host.id, a)}
                           />

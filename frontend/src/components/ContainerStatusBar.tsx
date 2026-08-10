@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
-import { api } from '@/api-trident';
+import { getContainers } from '@/api';
+import { ContainerState } from '@/types';
 
 export function ContainerStatusBar() {
   const [containers, setContainers] = useState<number>(0);
@@ -7,12 +8,12 @@ export function ContainerStatusBar() {
 
   useEffect(() => {
     const load = () => {
-      api.containers()
-        .then((data: any) => {
-          const all: unknown[] = data?.containers || data || [];
+      getContainers()
+        .then((data) => {
+          const all = data.containers ?? [];
           setContainers(all.length);
           setRunning(
-            all.filter((c: any) => c.state === 'running').length
+            all.filter((c) => c.state === ContainerState.RUNNING).length,
           );
         })
         .catch(() => {});

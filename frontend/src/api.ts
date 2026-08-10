@@ -47,6 +47,9 @@ import type {
   AgentEvent,
   EventType,
 
+  // Timeline / streaming (formerly in trident.ts)
+  TimelineEntry,
+
   // Models for endpoints not in types.ts
   AgentHostStatus,
   JobStatusResponse,
@@ -220,6 +223,31 @@ export async function stopTopology(topologyId: string): Promise<{ message: strin
  */
 export async function saveTopology(topologyId: string, networks: Network[]): Promise<Topology> {
   const response = await apiClient.put<Topology>(`/api/topologies/${topologyId}`, { networks });
+  return response.data;
+}
+
+/**
+ * Persist coder56's verifier mode for one host and, by default, apply it by
+ * regenerating/restarting the changed topology container.
+ */
+export async function setCoder56Verifier(
+  topologyId: string,
+  hostId: string,
+  enabled: boolean,
+  restart = true,
+): Promise<{
+  topology_id: string;
+  host_id: string;
+  enabled: boolean;
+  changed: boolean;
+  restarting: boolean;
+  job_id?: string | null;
+  message: string;
+}> {
+  const response = await apiClient.put(
+    `/api/topologies/${topologyId}/hosts/${hostId}/coder56-verifier`,
+    { enabled, restart },
+  );
   return response.data;
 }
 
@@ -408,6 +436,15 @@ export async function getContainerStats(topologyId: string): Promise<ContainerSt
   return response.data;
 }
 
+/**
+ * List all SCL topology containers. Backend alias of /discover (same shape as
+ * {@link discoverContainers}); used by the container status bar.
+ */
+export async function getContainers(): Promise<ContainerDiscoveryResponse> {
+  const response = await apiClient.get<ContainerDiscoveryResponse>('/api/containers');
+  return response.data;
+}
+
 // =============================================================================
 // Session Management APIs
 // =============================================================================
@@ -573,6 +610,25 @@ export async function planDefender(
 }
 
 // =============================================================================
+// Timeline APIs
+// =============================================================================
+
+/**
+ * Live agent timeline. Backed by the timeline_compat router; response carries an
+ * `entries` array. `runId` optionally scopes to a replay run.
+ */
+export async function getTimeline(
+  agent: string,
+  runId?: string,
+): Promise<{ entries: TimelineEntry[] }> {
+  const response = await apiClient.get<{ entries: TimelineEntry[] }>(
+    `/api/timeline/${agent}`,
+    { params: runId ? { run_id: runId } : {} },
+  );
+  return response.data;
+}
+
+// =============================================================================
 // WebSocket Connection Manager
 // =============================================================================
 
@@ -583,7 +639,7 @@ export interface WebSocketMessage {
 }
 
 export interface WebSocketCallbacks {
-  onMessage?: (event: AgentEvent) => void;
+  onMessage?: (message: Record<string, unknown>) => void;
   onError?: (error: WebSocketError) => void;
   onOpen?: (event: Event) => void;
   onClose?: (event: CloseEvent) => void;
@@ -630,14 +686,11 @@ export class AgentWebSocket {
 
       this.ws.onmessage = (event) => {
         try {
-          const message = JSON.parse(event.data) as WebSocketMessage;
-          const msg = message as Partial<WebSocketMessage & AgentEvent>;
-          if (msg.event_type && msg.event_id) {
-            this.callbacks.onMessage?.(msg as AgentEvent);
-          } else {
-            // Handle messages that don't match AgentEvent format
-            console.warn('Received message without event_type or event_id:', message);
-          }
+          // Forward every parsed message verbatim. Consumers (agent-event feeds,
+          // defender event feeds) filter by shape themselves — the prior code only
+          // forwarded AgentEvent-shaped messages and silently dropped the rest.
+          const message = JSON.parse(event.data) as Record<string, unknown>;
+          this.callbacks.onMessage?.(message);
         } catch (error) {
           this.callbacks.onError?.(
             new WebSocketError('Failed to parse WebSocket message', event)
@@ -914,6 +967,7 @@ export default {
   startTopology,
   stopTopology,
   saveTopology,
+  setCoder56Verifier,
   createTopology,
   getTopologyJob,
 
@@ -935,6 +989,7 @@ export default {
   getContainerDetails,
   getContainerByHost,
   getContainerStats,
+  getContainers,
 
   // Session Management
   listSessions,
@@ -968,6 +1023,9 @@ export default {
   getDefendedHosts,
   getPlannerHealth,
   planDefender,
+
+  // Timeline
+  getTimeline,
 
   // HTTP Client
   httpClient: apiClient,

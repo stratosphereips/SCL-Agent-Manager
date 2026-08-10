@@ -4,7 +4,7 @@
  * Surfaces: status counters, enable/defended-host controls, a live SLIPS alert
  * feed, a manual plan inspector, and a best-effort WebSocket event log.
  */
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Shield,
   ShieldAlert,
@@ -28,6 +28,7 @@ import {
   getTopologies,
   getTopology,
   getErrorMessage,
+  createEventWebSocket,
   type Topology,
   type DefenderStatus,
   type DefenderAlert,
@@ -171,39 +172,22 @@ export function DefenderPage() {
     };
   }, [topologyId]);
 
-  // ---- best-effort live event stream (raw WS; defender events are {type,data}) ----
-  const wsRef = useRef<WebSocket | null>(null);
+  // ---- best-effort live event stream (defender events are {type, data}) ----
+  // Reuses the shared AgentWebSocket helper (api.ts createEventWebSocket) instead
+  // of a hand-rolled WebSocket — same /ws/events URL, now with reconnect/ping.
   useEffect(() => {
-    const wsUrl =
-      (import.meta.env.VITE_WS_BASE_URL as string | undefined) ??
-      `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`;
-    let ws: WebSocket | null = null;
-    try {
-      ws = new WebSocket(`${wsUrl}/ws/events`);
-      wsRef.current = ws;
-      ws.onmessage = (ev) => {
-        try {
-          const m = JSON.parse(ev.data);
-          if (typeof m?.type === 'string' && m.type.startsWith('defender_')) {
-            setEvents((prev) =>
-              [{ type: m.type, data: m.data ?? {}, at: Date.now() }, ...prev].slice(0, 50)
-            );
-          }
-        } catch {
-          /* ignore */
+    const ws = createEventWebSocket({
+      onMessage: (m) => {
+        const type = m.type;
+        if (typeof type === 'string' && type.startsWith('defender_')) {
+          setEvents((prev) =>
+            [{ type, data: m.data ?? {}, at: Date.now() }, ...prev].slice(0, 50),
+          );
         }
-      };
-      ws.onerror = () => {};
-    } catch {
-      /* ignore */
-    }
-    return () => {
-      try {
-        ws?.close();
-      } catch {
-        /* ignore */
-      }
-    };
+      },
+    });
+    ws.connect();
+    return () => ws.disconnect();
   }, []);
 
   const toggleHost = (id: string) =>

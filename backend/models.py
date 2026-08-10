@@ -856,7 +856,10 @@ class MetricsResponse(BaseModel):
 # instead of sending the whole directive as a single prompt. The backend
 # phase-driver polls the active session's message stream to detect turn-end
 # (= phase completion), then auto-advances or pauses for operator review.
-# Empty `phases` => legacy single-shot.
+# Empty `phases` => the backend synthesizes a threat-model-driven default plan
+# (_default_threatmodel_phases in coder56.py) so the run still executes as a
+# phased native_subagents engagement (Phase 0 threat model -> ... ), not legacy
+# single-shot.
 # -----------------------------------------------------------------------------
 
 class PhaseSpec(BaseModel):
@@ -1018,7 +1021,9 @@ class LaunchRequest(BaseModel):
     # Per-phase orchestration (optional). When non-empty the run executes one
     # phase at a time (one coder56 session per phase) with a review gate between
     # phases; the whole `directive` above is still written to goal.txt as the
-    # guardrail's authoritative engagement scope. Empty => legacy single-shot.
+    # guardrail's authoritative engagement scope. Empty => the backend synthesizes
+    # a threat-model-driven default plan (_default_threatmodel_phases) so the run
+    # is still a phased native_subagents engagement, not legacy single-shot.
     phases: List[PhaseSpec] = Field(default_factory=list)
     phase_mode: PhaseMode = Field(default=PhaseMode.REVIEW_EACH)
     # How phases are coordinated: backend-driven session-per-phase vs a single
@@ -1252,6 +1257,13 @@ class EngagementCreate(BaseModel):
     objective: str = Field(default="", description="Engagement objective")
     roe: str = Field(default="", description="Rules of engagement")
     status: EngagementStatus = EngagementStatus.PLANNING
+    # C1 TARGET-IDENTITY: a machine-verifiable fingerprint of the target app so a
+    # repointed host (accion_del_sur -> greedy_cars) is detected, not silently
+    # inherited. Captured/confirmed by Phase 0; persisted on the engagement JSON
+    # (sibling of plan[]). Shape: expected_app/marker_method/marker_path/marker_match/
+    # canary_hash/banner_fragments/captured_at. Empty dict = operator left it blank;
+    # Phase 0 chooses a marker and populates it.
+    target_fingerprint: Dict[str, Any] = Field(default_factory=dict)
 
 
 class Engagement(EngagementCreate):
@@ -1276,6 +1288,7 @@ class EngagementUpdate(BaseModel):
     objective: Optional[str] = None
     roe: Optional[str] = None
     status: Optional[EngagementStatus] = None
+    target_fingerprint: Optional[Dict[str, Any]] = None
 
 
 class FindingUpdate(BaseModel):

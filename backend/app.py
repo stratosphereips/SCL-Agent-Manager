@@ -262,6 +262,17 @@ async def lifespan(app: FastAPI):
         # Start background tasks
         await background_tasks.start()
 
+        # REC #17: sweep every existing engagement and close the reportwriter gap
+        # (reportwriter_input.json present but no report.json/report.html) left by
+        # prior backend sessions, and advance status out of planning where
+        # findings exist. Best-effort; never blocks startup on a report failure.
+        try:
+            from .routers.coder56 import _reconcile_all_engagement_reports
+            await _reconcile_all_engagement_reports()
+            logger.info("Engagement reportwriter reconcile sweep complete")
+        except Exception as e:
+            logger.warning(f"Engagement reportwriter reconcile sweep skipped: {e}")
+
         logger.info("Agent Manager startup complete")
 
     except Exception as e:

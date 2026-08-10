@@ -81,6 +81,10 @@ PROVIDER_PRESETS: dict[str, dict[str, str]] = {
     "openrouter": {
         "LLM_URL": "https://openrouter.ai/api/v1",
     },
+    "nvidia": {
+        "LLM_URL": "http://scl-nvidia-proxy:8448/v1",
+        "LLM_MODEL": "nvidia/nemotron-3-ultra-550b-a55b",
+    },
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────

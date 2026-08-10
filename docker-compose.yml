@@ -36,6 +36,21 @@ services:
       - scl-playground-net
     restart: unless-stopped
 
+  # NVIDIA NEMOTRON proxy for opencode: de-streams nemotron responses and injects
+  # the chat_template_kwargs / reasoning_budget NVIDIA requires (opencode 1.18.3's
+  # openai-compatible provider can't send these itself). Forwards the client's
+  # Authorization header to NVIDIA's upstream, so NO secret is baked into the
+  # image/compose. Reached by containers on scl-playground-net as
+  # http://scl-nvidia-proxy:8448/v1 (see backend/routers/settings.py PROVIDER_PRESETS).
+  nvidia-proxy:
+    build: ./nvidia-proxy
+    image: scl-nvidia-proxy:0.1
+    container_name: scl-nvidia-proxy
+    hostname: scl-nvidia-proxy
+    restart: unless-stopped
+    networks:
+      - scl-playground-net
+
 volumes:
   agent_state:
 

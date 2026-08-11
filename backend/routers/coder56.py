@@ -60,6 +60,7 @@ from ..models import (
     DecideRequest,
     Engagement,
     EngagementCreate,
+    EngagementMode,
     EngagementStatus,
     EngagementUpdate,
     Finding,
@@ -93,6 +94,7 @@ from ..models import (
 from ..services.session_capture import OUTPUTS_DIR, resolve_run_id
 from ..services.mitre_catalog import catalog as mitre_catalog
 from ..services.owasp_catalog import catalog as owasp_catalog
+from ..services.api_security_catalog import catalog as api_security_catalog
 from ..services.report_renderer import render_report, render_client_report
 from ..services.docker_client import create_docker_client
 from ..services.engagement_metrics import build_engagement_metrics
@@ -1275,8 +1277,21 @@ async def _finalize_run(req: LaunchRequest, container_id: str, *, topology_id: s
     # default Phase 0..3 skeleton so the run goes through coder56_lead + Phase 0 +
     # _lead_driver + finalization, instead of degrading to legacy single-shot
     # (which bypassed the entire methodology restructure). run_planned_run always
-    # passes non-empty phases, so it is unaffected. See _default_threatmodel_phases.
-    run_phases = list(req.phases) or _default_threatmodel_phases(req.directive)
+    # passes non-empty phases, so it is unaffected. The empty-phases skeleton is
+    # MODE-SELECTED (NETWORK = _default_threatmodel_phases, unchanged; API/WEBAPP
+    # = the OWASP WSTG v4.2 spine from _default_api_phases/_default_webapp_phases,
+    # each leading with a recon-first Phase R). Explicitly drafted phases keep
+    # their own mode-appropriate skeletons (drafted upstream); this only fires
+    # when req.phases is empty.
+    _emode = req.engagement_mode or EngagementMode.NETWORK
+    if list(req.phases):
+        run_phases = _dedup_phase_plan(list(req.phases))
+    elif _emode == EngagementMode.API:
+        run_phases = _dedup_phase_plan(_default_api_phases(req.directive))
+    elif _emode == EngagementMode.WEBAPP:
+        run_phases = _dedup_phase_plan(_default_webapp_phases(req.directive))
+    else:
+        run_phases = _dedup_phase_plan(_default_threatmodel_phases(req.directive))
 
     _atomic_write(_run_meta_path(run_id), {
         "run_id": run_id,
@@ -1286,6 +1301,11 @@ async def _finalize_run(req: LaunchRequest, container_id: str, *, topology_id: s
         "host_id": host_id,
         "isolated": isolated,
         "criticality": req.criticality.value,
+        # Operator-selected planner frame (NETWORK default = byte-for-byte no
+        # regression). Persisted into the manifest so the empty-phases fallback
+        # and _dedup_phase_plan (where req is out of scope) read it back from
+        # meta, not from req again.
+        "engagement_mode": _emode.value,
         # Guardrail judge-unavailable fallback (live-toggled via judge_fail.txt;
         # mirrored here so the console can display the current value).
         "judge_fail": "escalate",
@@ -2005,6 +2025,191 @@ def _default_threatmodel_phases(directive: str) -> List[PhaseSpec]:
     ]
 
 
+def _ensure_research_phase_if_needed(obj: Dict[str, Any], target: str,
+                                     rules_of_engagement: str) -> Dict[str, Any]:
+    """Prepend a recon-first Phase R (is_research_phase=True) when the OpenAPI/
+    Swagger spec, the role set, or the tech stack is NOT explicitly stated in the
+    drafted plan. Phase R resolves exactly the unknowns that, unresolved, recreate
+    the de1e6112 re-recon loop, and PERSISTS them so every later phase reads them
+    as ground truth (the prior_findings block elevates a research phase's output to
+    authoritative fact in _compile_phase_directive). No-op (returns obj unchanged)
+    if a research phase is already present or all three unknowns are stated.
+
+    Idempotent and additive: never removes or reorders drafted phases."""
+    if not isinstance(obj, dict):
+        return obj
+    phases = obj.get("phases")
+    if not isinstance(phases, list):
+        phases = []
+        obj["phases"] = phases
+
+    def _field(p: Any, name: str, default: Any = "") -> Any:
+        """Read a field from a dict OR a pydantic PhaseSpec (the drafted plan and
+        the API/WEBAPP skeletons hold different shapes)."""
+        if isinstance(p, dict):
+            return p.get(name, default)
+        return getattr(p, name, default)
+
+    # Already has a research phase => nothing to do (idempotent across re-drafts).
+    for p in phases:
+        if _field(p, "is_research_phase", False):
+            return obj
+    blob = " ".join(str(x or "") for x in (obj.get("objective", ""), obj.get("target", ""),
+                                           target, rules_of_engagement,
+                                           obj.get("rules_of_engagement", ""))).lower()
+    phases_blob = " ".join(str(_field(p, "objective", "")) + " " + str(_field(p, "note", ""))
+                           for p in phases).lower()
+    blob = f"{blob} {phases_blob}"
+    has_spec = bool(re.search(r"swagger|openapi|spec\b|/v[0-9]+/api-docs|springdoc", blob))
+    has_roles = bool(re.search(r"\b(role|principal|tenant|admin|chief|doctor|nurse|user)[ s]*(set|list|group|=)",
+                               blob)) or bool(re.search(r"PRINCIPAL\||role\s*[:=]\s*\w", blob))
+    has_stack = bool(re.search(r"spring|tomcat|maria\s*db|postgres|node|express|django|flask|nginx|apache|java\b|\bjdk",
+                               blob))
+    if has_spec and has_roles and has_stack:
+        return obj  # nothing unknown to resolve
+    phase_r = PhaseSpec(
+        objective=(
+            "Phase R — RESEARCH/RECON FIRST (before any testing). Determine and PERSIST as ground "
+            "truth: is this an API? locate + harvest the OpenAPI/Swagger spec; enumerate the tech "
+            "stack (framework, DB, server versions); enumerate EVERY role and provision >=2 OWNED "
+            "principals in DIFFERENT role groups (seeded creds only; RoE-supreme — never create "
+            "accounts). Write each fact to /outputs/$RUN_ID/memory/MEMORY.md: TARGET_IDENTITY|, "
+            "OPENAPI_SPEC|path=…|endpoint_count=…, TECH_STACK|…, and one "
+            "PRINCIPAL|id=…|group=…|role=…|token_loc=<FILE path>| per group. Do NOT exploit. "
+            "End with ### PHASE DONE ###."
+        ),
+        tactic_id="TA0043", technique_ids=[], note="Phase R recon-first research (ground truth)",
+        tools=[], checklist=[],
+        is_research_phase=True,
+    )
+    obj["phases"] = [phase_r] + list(phases)
+    return obj
+
+
+def _default_api_phases(directive: str) -> List[PhaseSpec]:
+    """Mode-selected skeleton for EngagementMode.API: Phase R (recon-first ground
+    truth) + one PhaseSpec per OWASP API Security Top-10 (2023) category API1..API9
+    (API10 is unsafe-consumption / white-box-only and is folded into Phase Z),
+    ordered RISK-FIRST so the integrity classes lead, + a coverage-synthesis Phase Z
+    that mandates a WSTG-structured summary. Every write-category phase mandates
+    cross-role PUT/DELETE/PATCH (the de1e6112 zero-write-coverage gap)."""
+    # Risk-first order: BOLA, BFLA, mass-assignment, business-logic lead (the
+    # integrity questions on a clinical/EHR target), then auth, consumption, SSRF,
+    # misconfig, inventory.
+    risk_order = ["API1", "API5", "API3", "API6", "API2", "API4", "API7", "API8", "API9"]
+    by_id = {c["id"]: c for c in api_security_catalog()["categories"]}
+    phases: List[PhaseSpec] = [
+        PhaseSpec(
+            objective=(
+                "Phase R — RESEARCH/RECON FIRST (before any testing). Determine and PERSIST as ground "
+                "truth: is this an API? locate + harvest the OpenAPI/Swagger spec; enumerate the tech "
+                "stack (framework, DB, server versions); enumerate EVERY role and provision >=2 OWNED "
+                "principals in DIFFERENT role groups (seeded creds only; RoE-supreme — never create "
+                "accounts). Write each fact to /outputs/$RUN_ID/memory/MEMORY.md: TARGET_IDENTITY|, "
+                "OPENAPI_SPEC|path=…|endpoint_count=…, TECH_STACK|…, and one "
+                "PRINCIPAL|id=…|group=…|role=…|token_loc=<FILE path>| per group. Do NOT exploit. "
+                "End with ### PHASE DONE ###."
+            ),
+            tactic_id="TA0043", technique_ids=[], note="Phase R recon-first research (ground truth)",
+            tools=[], checklist=[],
+            is_research_phase=True,
+        )
+    ]
+    write_methods = ("PUT", "PATCH", "DELETE")
+    for cid in risk_order:
+        cat = by_id.get(cid)
+        if not cat:
+            continue
+        tmpl = cat.get("objective_template", "") or ""
+        checklist = list(cat.get("checklist", []))
+        # Every write-category phase MUST mandate cross-role PUT/DELETE/PATCH (the
+        # de1e6112 gap: zero cross-role writes were ever sent).
+        checklist.append(
+            "Cross-role WRITE matrix: for every state-changing verb in this category "
+            f"({', '.join(write_methods)}), send it from >=2 owned principals in DISTINCT role "
+            "groups and capture the authorization differential (who can create/alter/delete what)."
+        )
+        phases.append(PhaseSpec(
+            objective=tmpl,
+            tactic_id="TA0043", technique_ids=[],
+            note=f"{cid} {cat.get('name', '')}",
+            tools=list(cat.get("tools", [])),
+            checklist=checklist,
+            api_category=cid,
+        ))
+    phases.append(PhaseSpec(
+        objective=(
+            "Phase Z — SYNTHESIZE COVERAGE + WSTG-STRUCTURED SUMMARY. Confirm coverage BY SURFACE "
+            "ITEM and BY API category (API1-API9 tested vs untested), frame confirmed findings as "
+            "attack paths with business impact, surface any could_not_test / NOT_CONFIRMABLE items "
+            "honestly, and write the engagement summary. For any API category whose objective is met, "
+            "emit `CATEGORY OBJECTIVE MET (<api_id>) — <evidence>`. Explicitly note API10 (unsafe "
+            "consumption of third-party APIs) as a white-box follow-up if not observable."
+        ),
+        tactic_id="TA0043", technique_ids=[], note="Coverage synthesis + WSTG summary",
+        tools=[], checklist=[],
+    ))
+    return phases
+
+
+def _default_webapp_phases(directive: str) -> List[PhaseSpec]:
+    """Mode-selected skeleton for EngagementMode.WEBAPP: Phase R (recon-first ground
+    truth) + one PhaseSpec per OWASP Top-10 (2021) category A01..A10, ordered
+    RISK-FIRST, + a coverage-synthesis Phase Z that mandates a WSTG-structured
+    summary. Mirrors _default_api_phases on the web-app catalog."""
+    # Risk-first order: Broken Access Control, Injection, Auth failures lead.
+    risk_order = ["A01", "A03", "A07", "A04", "A05", "A10", "A02", "A06", "A08", "A09"]
+    by_id = {c["id"]: c for c in owasp_catalog()["categories"]}
+    phases: List[PhaseSpec] = [
+        PhaseSpec(
+            objective=(
+                "Phase R — RESEARCH/RECON FIRST (before any testing). Determine and PERSIST as ground "
+                "truth: enumerate the attack surface (endpoints, parameters, roles); enumerate the tech "
+                "stack (framework, server versions); enumerate EVERY role and provision >=2 OWNED "
+                "principals in DIFFERENT role groups (seeded creds only; RoE-supreme — never create "
+                "accounts). Write each fact to /outputs/$RUN_ID/memory/MEMORY.md: TARGET_IDENTITY|, "
+                "TECH_STACK|…, and one PRINCIPAL|id=…|group=…|role=…|token_loc=<FILE path>| per group. "
+                "Do NOT exploit. End with ### PHASE DONE ###."
+            ),
+            tactic_id="TA0043", technique_ids=[], note="Phase R recon-first research (ground truth)",
+            tools=[], checklist=[],
+            is_research_phase=True,
+        )
+    ]
+    write_methods = ("POST", "PUT", "PATCH", "DELETE")
+    for cid in risk_order:
+        cat = by_id.get(cid)
+        if not cat:
+            continue
+        tmpl = cat.get("objective_template", "") or ""
+        checklist = list(cat.get("checklist", []))
+        checklist.append(
+            "Cross-role WRITE matrix: for every state-changing verb "
+            f"({', '.join(write_methods)}), send it from >=2 owned principals in DISTINCT role "
+            "groups and capture the authorization differential."
+        )
+        phases.append(PhaseSpec(
+            objective=tmpl,
+            tactic_id="TA0043", technique_ids=[],
+            note=f"{cid} {cat.get('name', '')}",
+            tools=list(cat.get("tools", [])),
+            checklist=checklist,
+            api_category=cid,
+        ))
+    phases.append(PhaseSpec(
+        objective=(
+            "Phase Z — SYNTHESIZE COVERAGE + WSTG-STRUCTURED SUMMARY. Confirm coverage BY SURFACE "
+            "ITEM and BY OWASP category (A01-A10 tested vs untested), frame confirmed findings as "
+            "attack paths with business impact, surface any could_not_test / NOT_CONFIRMABLE items "
+            "honestly, and write the engagement summary. For any category whose objective is met, "
+            "emit `CATEGORY OBJECTIVE MET (<owasp_id>) — <evidence>`."
+        ),
+        tactic_id="TA0043", technique_ids=[], note="Coverage synthesis + WSTG summary",
+        tools=[], checklist=[],
+    ))
+    return phases
+
+
 # Live driver tasks, keyed by run_id. One driver per run; idempotent arming.
 _phase_drivers: Dict[str, "asyncio.Task"] = {}
 
@@ -2159,8 +2364,101 @@ def _is_substantive_summary(text: str) -> bool:
     return False
 
 
+def _resolve_run_paths(text: str, run_id: str) -> str:
+    """Replace the literal `$RUN_ID` token with the real run id everywhere it
+    appears in agent-facing text. Without this, the agent expands `$RUN_ID` in
+    its own shell — where RUN_ID may be unset or the legacy fixed sandbox value —
+    producing a LITERAL `/outputs/$RUN_ID/` dir that persists across runs and is
+    pre-filled with OTHER engagements' findings (cross-engagement contamination;
+    observed on run de1e6112). Resolving server-side means the agent always sees
+    the real path and can never create/read the literal dir. No-op when run_id is
+    falsy so callers can apply it unconditionally."""
+    if not text or not run_id:
+        return text or ""
+    return text.replace("$RUN_ID", run_id)
+
+
+# A3: phase numbers are DERIVED from the array index at render time, never stored
+# in the objective text. This strips a leading "Phase N —" / "=== PHASE N: ==="
+# label so a duplicated Phase-0 objective can't shift every later label by one
+# (the de1e6112 off-by-one: index 8 carried the "PHASE 7" label => frontend "9").
+_RE_PHASE_LABEL_PREFIX = re.compile(r"^\s*=*\s*PHASE\s+\d+\s*[:\-–—]\s*", re.IGNORECASE)
+
+
+def _strip_phase_label(text: str) -> str:
+    """Remove a leading phase-number label so the displayed number is always the
+    array index (index+1). No-op on objectives that don't start with one."""
+    if not text:
+        return text or ""
+    return _RE_PHASE_LABEL_PREFIX.sub("", text.lstrip()).strip()
+
+
+def _phase_objective_key(spec: Any) -> str:
+    """Normalized objective for duplicate detection (label-stripped + casefolded)."""
+    if isinstance(spec, dict):
+        obj = spec.get("objective") or ""
+    else:
+        obj = getattr(spec, "objective", "") or ""
+    return _strip_phase_label(str(obj)).casefold()
+
+
+def _dedup_phase_plan(phases: List[Any]) -> List[Any]:
+    """A4: drop a phase whose normalized objective duplicates the immediately
+    preceding phase's (the dup-Phase-0 failure mode). Non-adjacent repeats (a
+    legit re-test) are preserved. Later phases render by index, so removing one
+    does not desync numbering."""
+    if not phases:
+        return phases
+    out: List[Any] = []
+    for p in phases:
+        key = _phase_objective_key(p)
+        if key and out and key == _phase_objective_key(out[-1]):
+            logger.warning("phase plan: dropping consecutive duplicate objective (%.60s)", key)
+            continue
+        out.append(p)
+    return out
+
+
+# A1: ATT&CK tactics that REQUIRE a host/OS foothold and have no web-app analogue.
+# When the engagement grants only application-level access (HTTP + seeded app
+# credentials, no SSH/RDP/host shell), these phases find nothing and burn the run
+# (de1e6112: privesc + host-credential-extraction + exfil-sim produced nothing and
+# looped for ~44h). Discovery/Persistence/Evasion/Collection are KEPT — they have
+# web forms (endpoint/role enumeration, account backdoor, bulk-data export).
+_HOST_COMPROMISE_TACTICS = {"TA0004", "TA0006", "TA0008", "TA0010", "TA0011"}
+
+
+def _infer_target_class(target: str, rules_of_engagement: str) -> str:
+    """Coarse target class from scope + RoE text: 'web' (HTTP/S app/API, no host
+    shell), 'host' (SSH/RDP/SMB/AD/host-OS creds), or 'mixed'."""
+    blob = f"{target or ''} {rules_of_engagement or ''}".lower()
+    has_web = bool(re.search(r"https?://|api|rest|web ?app|swagger|endpoint|/auth|jwt|bearer|login", blob))
+    has_host = bool(re.search(r"\bssh\b|\brdp\b|\bsmb\b|active directory|\bkerberos\b|/etc/|root@|host shell|os credent", blob))
+    if has_host and has_web:
+        return "mixed"
+    if has_host:
+        return "host"
+    return "web"  # default — these ranges are overwhelmingly web/API
+
+
+def _filter_phases_for_target(phases: List[Any], target_class: str) -> List[Any]:
+    """A1: drop host-compromise-only phases when the target grants no host access.
+    Never empties the plan (falls back to the original list). Idempotent."""
+    if target_class == "host" or not phases:
+        return phases
+    kept: List[Any] = []
+    for p in phases:
+        tac = ((p.get("tactic_id") if isinstance(p, dict) else getattr(p, "tactic_id", "")) or "")
+        if tac.upper() in _HOST_COMPROMISE_TACTICS:
+            logger.info("applicability filter (%s target): dropping %s phase", target_class, tac.upper())
+            continue
+        kept.append(p)
+    return kept or list(phases)
+
+
 def _compile_phase_directive(full_directive: str, phase_index: int, total: int,
-                             objective: str, prior_findings: Optional[List[str]] = None) -> str:
+                             objective: str, prior_findings: Optional[List[str]] = None,
+                             pf_is_research: Optional[List[bool]] = None) -> str:
     """Build the prompt for a single phase. The FULL engagement directive is
     included as the authorized-scope context (it is also the guardrail's
     goal.txt), and the phase objective is layered on top. When `prior_findings`
@@ -2170,7 +2468,22 @@ def _compile_phase_directive(full_directive: str, phase_index: int, total: int,
     agent is told to work ONLY this phase and to end with a sentinel marker the
     driver watches. Earlier phase prose is copied into later phase prompts as an
     explicit handoff; shared engagement memory remains the authoritative durable
-    record and parallel-work bus."""
+    record and parallel-work bus.
+
+    When `pf_is_research` marks an earlier phase as a research phase (Phase R),
+    that phase's persisted output is elevated to AUTHORITATIVE GROUND TRUTH in the
+    header — later phases read the spec/roles/stack it persisted as fact and must
+    NOT re-enumerate, re-probe, or re-fingerprint them (kills the de1e6112 re-recon
+    loop)."""
+    research_header = ""
+    if prior_findings and pf_is_research and any(pf_is_research):
+        research_header = (
+            " PHASE R (RESEARCH) OUTPUT IS GROUND TRUTH: the OpenAPI spec location, "
+            "endpoint inventory, tech stack, and role set an earlier Phase R persisted to "
+            "/outputs/$RUN_ID/memory/MEMORY.md are authoritative. Read them first; derive "
+            "KNOWN/GAPS/DELTA; do NOT re-enumerate the spec, re-probe roles, or re-fingerprint "
+            "the stack."
+        )
     prior_block = ""
     if prior_findings:
         chunks = []
@@ -2192,6 +2505,7 @@ def _compile_phase_directive(full_directive: str, phase_index: int, total: int,
         "FULL ENGAGEMENT DIRECTIVE (your authorized scope — stay strictly within it):\n"
         f"{full_directive.strip()}\n\n"
         f"{PHASE0_TARGET_VALIDATION_BLOCK}\n"
+        f"{research_header}"
         f"{prior_block}"
         "THIS PHASE'S OBJECTIVE:\n"
         f"{objective.strip()}\n\n"
@@ -2270,23 +2584,35 @@ async def _start_phase(run_id: str, index: int, addr: str, revised_objective: Op
         return entry["session_id"]
 
     spec = phases[index]
-    objective = (revised_objective or spec.get("objective") or "").strip() \
+    objective = _strip_phase_label(
+        (revised_objective or spec.get("objective") or "").strip()
         or f"Execute phase {index + 1} of the authorized engagement (see full directive)."
+    )
     # Carry each earlier phase's captured result forward as context. Index-aligned
     # (incl. '' for phases that produced nothing) so the 'PHASE N findings' labels
     # in the prompt match the real phase numbers; junk fallbacks are blanked so we
     # never forward placeholder noise like '(no summary emitted ...)'.
+    # pf_is_research is read per-phase from the manifest's is_research_phase flag
+    # so _compile_phase_directive can elevate a Phase R's persisted output to
+    # authoritative ground truth in the prompt header.
     _JUNK_RESULT_PREFIXES = ("(no summary emitted", "(no activity captured",
                              "(phase timed out", "[phase timed out")
     prior_findings: List[str] = []
+    pf_is_research: List[bool] = []
     for i in range(index):
         if i < len(rt):
             r = (rt[i].get("result") or "").strip()
             prior_findings.append("" if r.startswith(_JUNK_RESULT_PREFIXES) else r)
+        else:
+            prior_findings.append("")
+        _spec_i = phases[i] if i < len(phases) else {}
+        pf_is_research.append(bool(_spec_i.get("is_research_phase")) if isinstance(_spec_i, dict) else False)
     prompt = _compile_phase_directive(
         meta.get("directive") or "", index, len(phases), objective,
         prior_findings=prior_findings or None,
+        pf_is_research=pf_is_research or None,
     )
+    prompt = _resolve_run_paths(prompt, run_id)
 
     from ..services.opencode_client import create_session_async, send_prompt_async
     cres = await create_session_async(host=addr, port=4096, title=f"Phase {index + 1}: {objective[:40]}")
@@ -2396,6 +2722,37 @@ def _arm_driver(run_id: str) -> None:
     _phase_drivers[run_id] = asyncio.create_task(_phase_driver(run_id))
 
 
+# A2: no-progress stop-condition. If this many CONSECUTIVE phases each produce
+# zero NEW verifier-CONFIRMED findings, the run is making no forward progress
+# (de1e6112: privesc + cred-extraction + exfil-sim found nothing for ~44h). Force
+# finalize instead of burning the whole phase chain.
+NO_PROGRESS_PHASE_LIMIT = 2
+# A5: per-phase tool-call cap (context-growth bound). A phase that fires this many
+# tool calls without completing is in a loop (de1e6112 phase 7: ~700 commands).
+# Force-complete it so the run moves on instead of growing context unbounded.
+PHASE_MAX_TOOL_CALLS = 120
+
+
+def _count_confirmed_verdicts(run_id: str) -> int:
+    """Count of verifier-CONFIRMED findings for a run. Each finding is a
+    <slug>.jsonl in OUTPUTS_DIR/<run_id>/verifier/; a CONFIRMED one carries a
+    VERDICT record. Drives the no-progress stop-condition (A2)."""
+    vdir = OUTPUTS_DIR / run_id / "verifier"
+    if not vdir.exists():
+        return 0
+    n = 0
+    for f in vdir.glob("*.jsonl"):
+        try:
+            for line in f.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if (('"verdict"' in line and "CONFIRMED" in line)
+                        or ('"ok_to_report"' in line and '"YES"' in line)):
+                    n += 1
+                    break
+        except Exception:
+            continue
+    return n
+
+
 async def _phase_driver(run_id: str) -> None:
     """Background loop: poll the active phase's session, detect turn-end, and
     either auto-advance or pause for review. Re-reads the manifest each tick so
@@ -2415,9 +2772,12 @@ async def _phase_driver(run_id: str) -> None:
         return
 
     tracked_cur = -2
+    tracked_epoch = 0
     last_sig = None
     stable_since: Optional[float] = None
     phase_started_local = 0.0
+    confirmed_at_phase_start = 0
+    tool_cap_hit = False
 
     while True:
         await asyncio.sleep(PHASE_POLL_S)
@@ -2435,12 +2795,19 @@ async def _phase_driver(run_id: str) -> None:
         if not sess:
             break
 
-        # Reset idle/stable tracking whenever the active phase changes.
-        if cur != tracked_cur:
+        # Reset idle/stable tracking whenever the active phase changes OR the
+        # operator interrupts+restarts it (interrupt_epoch bump) — otherwise a
+        # restarted phase inherits the old phase_started_local and times out at
+        # once. Re-tracking on epoch makes a mid-phase interrupt a clean fresh start.
+        cur_epoch = int(meta.get("interrupt_epoch", 0))
+        if cur != tracked_cur or cur_epoch != tracked_epoch:
             tracked_cur = cur
+            tracked_epoch = cur_epoch
             last_sig = None
             stable_since = None
             phase_started_local = time.time()
+            confirmed_at_phase_start = _count_confirmed_verdicts(run_id)
+            tool_cap_hit = False
 
         res = await get_session_messages_async(session_id=sess, host=addr, port=4096)
         msgs = res.get("messages", []) if res.get("success") else []
@@ -2474,8 +2841,12 @@ async def _phase_driver(run_id: str) -> None:
         # cold start; a phase needing more can raise timeout_seconds.
         timed_out = (now - phase_started_local) >= max_s
 
+        tool_calls = sig[3] if sig else 0
         complete = False
         if timed_out:
+            complete = True
+        elif tool_calls >= PHASE_MAX_TOOL_CALLS:
+            tool_cap_hit = True
             complete = True
         elif sentinel and not pending_tool:
             complete = True
@@ -2505,11 +2876,23 @@ async def _phase_driver(run_id: str) -> None:
         if timed_out:
             summary = (summary + "\n[phase timed out — operator review]").strip() \
                 if summary else "(phase timed out — no activity captured; review agent session)"
+        elif tool_cap_hit:
+            summary = (summary + f"\n[phase force-completed at {PHASE_MAX_TOOL_CALLS}-tool-call cap — possible loop]").strip()
         elif not summary:
             summary = "(no activity captured — review agent session)"
 
+        # A2: no-progress stop. Count new CONFIRMED findings since this phase
+        # started; if N consecutive phases produced none, finalize instead of
+        # auto-advancing into more empty phases (de1e6112 looped ~44h on empties).
+        confirmed_now = _count_confirmed_verdicts(run_id)
+        meta["no_progress_phases"] = 0 if confirmed_now > confirmed_at_phase_start \
+            else int(meta.get("no_progress_phases", 0)) + 1
+        no_progress_stop = int(meta["no_progress_phases"]) >= NO_PROGRESS_PHASE_LIMIT
+        if no_progress_stop:
+            summary = (summary + f"\n[NO-PROGRESS STOP — {meta['no_progress_phases']} consecutive phases with no new confirmed finding]").strip()
+
         is_last = cur >= len(phases) - 1
-        will_advance = (not is_last) and (mode == PhaseMode.AUTO_CONTINUE.value)
+        will_advance = (not is_last) and (mode == PhaseMode.AUTO_CONTINUE.value) and (not no_progress_stop)
         new_status = PhaseStatus.COMPLETED.value if will_advance else PhaseStatus.AWAITING_REVIEW.value
         rt[cur] = {
             **entry,
@@ -2702,7 +3085,7 @@ def _compile_lead_directive(meta: Dict[str, Any]) -> str:
     directive = (meta.get("directive") or "").strip()
     phase_lines = []
     for i, p in enumerate(phases):
-        obj = (p.get("objective") or "").strip() or f"(phase {i + 1}: see directive)"
+        obj = _strip_phase_label((p.get("objective") or "").strip()) or f"(phase {i + 1}: see directive)"
         line = f"  Phase {i + 1}: {obj}"
         tools = p.get("tools") or []
         if tools:
@@ -2724,7 +3107,7 @@ def _compile_lead_directive(meta: Dict[str, Any]) -> str:
             "PACING (AUTO mode): execute all phases back-to-back. After the final phase, write a "
             "concise ENGAGEMENT SUMMARY."
         )
-    return (
+    _lead = (
         "=== AUTHORIZED ENGAGEMENT (sanctioned cyber-range exercise) ===\n"
         "You are the LEAD coordinator. Execute the engagement below PHASE BY PHASE by delegating "
         "each phase to the coder56_phase subagent via the task tool.\n\n"
@@ -2757,9 +3140,10 @@ def _compile_lead_directive(meta: Dict[str, Any]) -> str:
         "3. Follow the PACING rule above.\n"
         "=== END ==="
     )
+    return _resolve_run_paths(_lead, meta.get("run_id", ""))
 
 
-async def _graceful_finalize_session(session_id: str, addr: str, timeout_s: int = 75) -> None:
+async def _graceful_finalize_session(session_id: str, addr: str, timeout_s: int = 75, run_id: str = "") -> None:
     """P1-3: best-effort graceful wrap-up BEFORE a backstop gates/kills a running
     phase or verifier session. Sends one short 'emit your final summary / verdict
     now' turn and waits bounded for a response. Never raises — a wedged session
@@ -2770,15 +3154,16 @@ async def _graceful_finalize_session(session_id: str, addr: str, timeout_s: int 
         return
     try:
         from ..services.opencode_client import send_prompt_async
+        _fin_prompt = (
+            "ENGAGEMENT TIME BUDGET EXPIRED — wrap up NOW in one short turn. Emit your final "
+            "structured report (WHAT YOU DID / WHAT YOU FOUND / NEXT STEP). If you are verifying "
+            "or mid-verification, FIRST append your VERDICT record to /outputs/$RUN_ID/verifier/<slug>.jsonl "
+            "(step j) and emit the === VERIFIER VERDICT === block. Do not start new commands — "
+            "summarize from what you already have, then stop."
+        )
         await send_prompt_async(
             session_id=session_id,
-            prompt=(
-                "ENGAGEMENT TIME BUDGET EXPIRED — wrap up NOW in one short turn. Emit your final "
-                "structured report (WHAT YOU DID / WHAT YOU FOUND / NEXT STEP). If you are verifying "
-                "or mid-verification, FIRST append your VERDICT record to /outputs/$RUN_ID/verifier/<slug>.jsonl "
-                "(step j) and emit the === VERIFIER VERDICT === block. Do not start new commands — "
-                "summarize from what you already have, then stop."
-            ),
+            prompt=_resolve_run_paths(_fin_prompt, run_id),
             host=addr, port=4096, async_mode=False, timeout=timeout_s,
         )
     except Exception as exc:
@@ -3190,7 +3575,7 @@ async def _lead_driver(run_id: str) -> None:
             if (stalled or hard_cap) and 0 <= gate_idx < len(rt):
                 _gchild = rt[gate_idx].get("session_id", "")
                 if _gchild:
-                    await _graceful_finalize_session(_gchild, addr)
+                    await _graceful_finalize_session(_gchild, addr, run_id=run_id)
 
             # Gate logic.
             done = False
@@ -3206,8 +3591,8 @@ async def _lead_driver(run_id: str) -> None:
                     if 0 <= gate_idx < len(rt) and rt[gate_idx].get("status") not in (PhaseStatus.AWAITING_REVIEW.value, PhaseStatus.COMPLETED.value):
                         rt[gate_idx]["status"] = PhaseStatus.AWAITING_REVIEW.value
                         prev = rt[gate_idx].get("result", "")
-                        rt[gate_idx]["result"] = (prev + f"\n[phase finalized under time budget — partial result; full findings in {_run_memory_path(run_id)}, verifier verdicts in /outputs/$RUN_ID/verifier/]").strip() \
-                            if prev else f"[phase finalized under time budget — partial result; full findings in {_run_memory_path(run_id)}, verifier verdicts in /outputs/$RUN_ID/verifier/]"
+                        rt[gate_idx]["result"] = (prev + f"\n[phase finalized under time budget — partial result; full findings in {_run_memory_path(run_id)}, verifier verdicts in /outputs/{run_id}/verifier/]").strip() \
+                            if prev else f"[phase finalized under time budget — partial result; full findings in {_run_memory_path(run_id)}, verifier verdicts in /outputs/{run_id}/verifier/]"
                     gated_through = gate_idx
                     gated_now = True
                     changed = True
@@ -3296,8 +3681,8 @@ async def _lead_driver(run_id: str) -> None:
                     if 0 <= gate_idx < len(rt) and rt[gate_idx].get("status") not in (PhaseStatus.AWAITING_REVIEW.value, PhaseStatus.COMPLETED.value):
                         rt[gate_idx]["status"] = PhaseStatus.AWAITING_REVIEW.value
                         prev = rt[gate_idx].get("result", "")
-                        rt[gate_idx]["result"] = (prev + f"\n[phase finalized under time budget — partial result; full findings in {_run_memory_path(run_id)}, verifier verdicts in /outputs/$RUN_ID/verifier/]").strip() \
-                            if prev else f"[phase finalized under time budget — partial result; full findings in {_run_memory_path(run_id)}, verifier verdicts in /outputs/$RUN_ID/verifier/]"
+                        rt[gate_idx]["result"] = (prev + f"\n[phase finalized under time budget — partial result; full findings in {_run_memory_path(run_id)}, verifier verdicts in /outputs/{run_id}/verifier/]").strip() \
+                            if prev else f"[phase finalized under time budget — partial result; full findings in {_run_memory_path(run_id)}, verifier verdicts in /outputs/{run_id}/verifier/]"
                     gated_now = True
                     changed = True
                     done = True
@@ -3469,6 +3854,57 @@ async def advance_phase(run_id: str, n: int, req: AdvanceRequest) -> Dict[str, A
     session_id = await _start_phase(run_id, n, addr, revised_objective=req.revised_objective)
     _arm_driver(run_id)
     return {"status": "running", "run_id": run_id, "phase": n, "session_id": session_id}
+
+
+class InterruptRequest(BaseModel):
+    revised_objective: Optional[str] = None
+
+
+@router.post("/runs/{run_id}/interrupt")
+async def interrupt_run(run_id: str, req: InterruptRequest) -> Dict[str, Any]:
+    """A6: cancel the in-flight phase turn and (optionally) restart the current
+    phase with a revised objective. A native_subagents phase otherwise CANNOT be
+    steered mid-turn — /guide drops a message the model is free to ignore
+    (de1e6112: nemotron ignored two operator overrides for ~25 min and kept
+    looping). This aborts the opencode session outright and starts a fresh one.
+    Bumps interrupt_epoch so the driver treats the restart as a clean new phase
+    (no stale phase_started_local → instant timeout)."""
+    _valid_token(run_id, "run_id")
+    meta = _read_run_meta(run_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="No run manifest found.")
+    rt = meta.get("phase_runtime") or []
+    cur = meta.get("current_phase", -1)
+    if not (0 <= cur < len(rt)):
+        raise HTTPException(status_code=409, detail="Run has no active phase to interrupt.")
+    container_id = meta.get("container_id", "")
+    if not container_id:
+        raise HTTPException(status_code=409, detail="No container for run.")
+    from ..services.container_addr import get_container_address
+    from ..services.opencode_client import _ensure_network_connectivity, abort_session_async
+    await _ensure_network_connectivity(container_id)
+    addr = await get_container_address(container_id)
+
+    entry = rt[cur]
+    sess = entry.get("session_id", "")
+    # 1) Abort the in-flight turn so the looping agent stops immediately.
+    if sess:
+        try:
+            await abort_session_async(session_id=sess, host=addr, port=4096)
+        except Exception as exc:
+            logger.warning("interrupt[%s] abort of %s failed (continuing): %s", run_id, sess, exc)
+    # 2) Mark the phase re-runnable + bump epoch so the driver re-tracks cleanly.
+    entry["status"] = PhaseStatus.AWAITING_REVIEW.value
+    entry["session_id"] = ""
+    rt[cur] = entry
+    meta["phase_runtime"] = rt
+    meta["interrupt_epoch"] = int(meta.get("interrupt_epoch", 0)) + 1
+    _atomic_write(_run_meta_path(run_id), meta)
+    # 3) Restart the phase fresh (new session), optionally with a revised objective.
+    new_sess = await _start_phase(run_id, cur, addr, revised_objective=req.revised_objective)
+    _arm_driver(run_id)
+    return {"status": "restarted", "run_id": run_id, "phase": cur,
+            "session_id": new_sess, "revised_objective": bool((req.revised_objective or "").strip())}
 
 
 @router.patch("/runs/{run_id}/phase-mode")
@@ -3806,18 +4242,76 @@ _HEXSTRIKE_MCP_TOOLS_NOTE = (
 
 
 async def _draft_goal_plan(objective: str, target: str, rules_of_engagement: str,
-                           depth: str = "standard") -> Dict[str, Any]:
+                           depth: str = "standard",
+                           engagement_mode: EngagementMode = EngagementMode.NETWORK) -> Dict[str, Any]:
     """LLM-draft a scoped engagement plan (objective + MITRE phased chain) from a
     free-text objective. Shared by /goal/draft and the per-OWASP-category phase
     drafter. Always returns a valid (possibly empty-fielded) draft object — never
     throws. On refusal/failure returns declined:true with a template skeleton so
-    the operator can fill it in."""
-    system_msg = (
-        "You are an authorized engagement planner for a SANCTIONED, ISOLATED cyber-range "
-        "security exercise. You help a red-team operator structure a scoped, rules-bound "
-        "engagement plan aligned to the MITRE ATT&CK kill chain. You always provide concrete "
-        "planning for this authorized context."
-    )
+    the operator can fill it in.
+
+    The planner frame is MODE-SELECTED: NETWORK (default, byte-for-byte no
+    regression) keeps the threat-model + ATT&CK-label system prompt; API/WEBAPP
+    switch to the OWASP WSTG v4.2 spine with the API Security Top-10 (2023) /
+    Top-10 (2021) risk model, FORCE the web-app target filter (so host-compromise
+    tactics cannot enter), and prepend a recon-first Phase R when the spec/roles/
+    stack are not stated."""
+    if engagement_mode == EngagementMode.API:
+        system_msg = (
+            "You are an authorized engagement planner for a SANCTIONED, ISOLATED cyber-range "
+            "security exercise. The risk model for THIS engagement is the OWASP API Security "
+            "Top-10 (2023) [API1-API10]; the testing spine is OWASP WSTG v4.2. Plan ONE phase per "
+            "API category, RISK-FIRST: for a clinical/EHR system lead with API1 BOLA, API5 BFLA on "
+            "writes, API3 mass-assignment, API6 business-logic. Every write-category phase MUST "
+            "mandate cross-role PUT/DELETE/PATCH and capture the authorization differential across "
+            ">=2 owned principals in DISTINCT role groups. OMIT host-compromise tactics (TA0004/6/8/"
+            "10/11) — there is no host foothold to exercise them. If the OpenAPI/Swagger spec, role "
+            "set, or tech stack is NOT explicitly stated in the objective, FIRST plan a recon-first "
+            "Phase R (is_research_phase=true) that persists ground truth (OpenAPI spec path, endpoint "
+            "inventory, tech stack, and one PRINCIPAL per role group with token_loc=<FILE path>) to "
+            "/outputs/$RUN_ID/memory/MEMORY.md and is consumed as authoritative fact by every later "
+            "phase. You always provide concrete planning for this authorized context."
+        )
+        _label_line = (
+            "Use OWASP API category ids (API1-API10) as the phase label; ORDER PHASES RISK-FIRST "
+            "(API1/API5/API3/API6 first). Each phase MUST include a `tools` array with 2-4 recommended "
+            "tools and a `checklist` array listing 3-6 concrete goals. Keep scope tight to the stated "
+            "target. No commentary outside the JSON."
+        )
+    elif engagement_mode == EngagementMode.WEBAPP:
+        system_msg = (
+            "You are an authorized engagement planner for a SANCTIONED, ISOLATED cyber-range "
+            "security exercise. The risk model for THIS engagement is the OWASP Top-10 (2021) "
+            "[A01-A10]; the testing spine is OWASP WSTG v4.2. Plan application-layer phases — "
+            "authentication, authorization/role matrix, injection, session/secrets, business logic, "
+            "data exposure — and OMIT host-compromise phases (privilege escalation, host credential "
+            "extraction, lateral movement, exfiltration, C2; ATT&CK TA0004/6/8/10/11) that cannot "
+            "apply without a host foothold. If the attack surface, role set, or tech stack is NOT "
+            "explicitly stated, FIRST plan a recon-first Phase R (is_research_phase=true) that "
+            "persists ground truth to /outputs/$RUN_ID/memory/MEMORY.md and is consumed as "
+            "authoritative fact by every later phase. You always provide concrete planning for this "
+            "authorized context."
+        )
+        _label_line = (
+            "Use OWASP category ids (A01-A10) as the phase label; ORDER PHASES RISK-FIRST (A01/A03/"
+            "A07 first). Each phase MUST include a `tools` array with 2-4 recommended tools and a "
+            "`checklist` array listing 3-6 concrete goals. Keep scope tight to the stated target. "
+            "No commentary outside the JSON."
+        )
+    else:
+        system_msg = (
+            "You are an authorized engagement planner for a SANCTIONED, ISOLATED cyber-range "
+            "security exercise. You help a red-team operator structure a scoped, rules-bound "
+            "engagement plan aligned to the MITRE ATT&CK kill chain. You always provide concrete "
+            "planning for this authorized context."
+        )
+        _label_line = (
+            "Use real ATT&CK tactic IDs (TA0043 Recon, TA0001 Initial Access, TA0002 Execution, "
+            "TA0003 Persistence, TA0004 Privilege Escalation, TA0005 Defense Evasion, TA0006 "
+            "Credential Access, TA0007 Discovery, TA0008 Lateral Movement, TA0009 Collection, "
+            "TA0011 Command and Control, TA0010 Exfiltration) and technique IDs. Keep scope tight "
+            "to the stated target. No commentary outside the JSON."
+        )
     user_msg = (
         f"Draft a scoped engagement plan for this authorized objective:\n\"\"\"\n{objective.strip()}\n\"\"\"\n"
         + (f"\nAuthorized target/scope: {target.strip()}\n" if target.strip() else "")
@@ -3843,10 +4337,7 @@ async def _draft_goal_plan(objective: str, target: str, rules_of_engagement: str
         "available MCP tool'; a bare name means 'install this CLI'. "
         + _HEXSTRIKE_MCP_TOOLS_NOTE
         + " "
-        "Use real ATT&CK tactic IDs (TA0043 Recon, TA0001 Initial Access, TA0002 Execution, TA0003 Persistence, "
-        "TA0004 Privilege Escalation, TA0005 Defense Evasion, TA0006 Credential Access, TA0007 Discovery, "
-        "TA0008 Lateral Movement, TA0009 Collection, TA0011 Command and Control, TA0010 Exfiltration) and technique IDs. "
-        "Keep scope tight to the stated target. No commentary outside the JSON."
+        + _label_line
     )
 
     text = await _llm_chat(user_msg, system_msg)
@@ -3871,6 +4362,18 @@ async def _draft_goal_plan(objective: str, target: str, rules_of_engagement: str
     obj.setdefault("target", target.strip())
     obj.setdefault("rules_of_engagement", rules_of_engagement.strip())
     obj.setdefault("phases", [])
+    if engagement_mode in (EngagementMode.API, EngagementMode.WEBAPP):
+        # Mode-selected: a Phase R is prepended when the spec/roles/stack are not
+        # stated, and the web-app target filter is FORCED (never inferred) so no
+        # host-compromise tactic (TA0004/6/8/10/11) can enter the plan even if the
+        # model regresses to a kill chain — the de1e6112 6-of-9-unreachable failure
+        # mode becomes structurally impossible.
+        obj = _ensure_research_phase_if_needed(obj, target, rules_of_engagement)
+        obj["phases"] = _filter_phases_for_target(obj.get("phases") or [], "web")
+    else:
+        # A1: drop host-compromise phases that can't apply to a web/API target.
+        obj["phases"] = _filter_phases_for_target(
+            obj.get("phases") or [], _infer_target_class(target, rules_of_engagement))
     obj.setdefault("summary", "")
     # C2: guarantee the threat-model + risk-priorities keys exist even if the model
     # omits them (callers read them unconditionally to drive risk-first ordering).
@@ -3883,8 +4386,13 @@ async def _draft_goal_plan(objective: str, target: str, rules_of_engagement: str
 @router.post("/goal/draft")
 async def draft_goal(req: GoalDraftRequest) -> Dict[str, Any]:
     """Ask the LLM to draft a scoped engagement chain + RoE from the objective.
-    Thin wrapper over _draft_goal_plan (shared with the OWASP phase drafter)."""
-    return await _draft_goal_plan(req.objective, req.target, req.rules_of_engagement, req.depth)
+    Thin wrapper over _draft_goal_plan (shared with the OWASP phase drafter).
+    Threads req.engagement_mode so the planner frame is operator-selected
+    (NETWORK default = byte-for-byte no regression; API/WEBAPP = WSTG spine)."""
+    return await _draft_goal_plan(
+        req.objective, req.target, req.rules_of_engagement, req.depth,
+        engagement_mode=req.engagement_mode or EngagementMode.NETWORK,
+    )
 
 
 # =============================================================================
@@ -4118,8 +4626,15 @@ async def draft_owasp_plan(engagement_id: str, req: OwaspPlanRequest) -> Dict[st
         # operator should set a real scope before running any.
         target = (eng.get("name") or "the engagement target").strip()
     eng_prefix = (req.objective if req.objective is not None else (eng.get("objective") or "")).strip()
+    # Mode-selected catalog (forward-compatible): NETWORK/WEBAPP use the OWASP
+    # Top-10 (2021) web catalog; API uses the OWASP API Security Top-10 (2023)
+    # catalog (api_security_catalog.py). engagement_mode is read defensively so the
+    # current OwaspPlanRequest (no field yet) stays byte-for-byte on owasp_catalog;
+    # a future request field selects the API catalog without changing this handler.
+    _plan_mode = getattr(req, "engagement_mode", None) or EngagementMode.NETWORK
+    _catalog = (api_security_catalog() if _plan_mode == EngagementMode.API else owasp_catalog())
     plan: List[Dict[str, Any]] = []
-    for cat in owasp_catalog()["categories"]:
+    for cat in _catalog["categories"]:
         tmpl = cat.get("objective_template", "") or ""
         try:
             obj = tmpl.format(target=target)
@@ -4172,7 +4687,15 @@ async def draft_planned_run_phases(engagement_id: str, owasp_id: str, req: Plann
     # Reinforce the OWASP focus so the planner tailors the kill-chain to it.
     focus_obj = f"[OWASP Top 10 {owasp_id} — {pr.get('title', '')}] {objective}".strip()
 
-    draft = await _draft_goal_plan(objective=focus_obj, target=target, rules_of_engagement=roe, depth=req.depth)
+    # Mode-selected planner frame (forward-compatible): the OWASP-plan path
+    # defaults to NETWORK (the web Top-10 catalog); API mode is selected only if
+    # the request carries engagement_mode=API. Read defensively so the current
+    # PlannedPhaseDraftRequest (no field yet) stays byte-for-byte unchanged.
+    _plan_mode = getattr(req, "engagement_mode", None) or EngagementMode.NETWORK
+    draft = await _draft_goal_plan(
+        objective=focus_obj, target=target, rules_of_engagement=roe, depth=req.depth,
+        engagement_mode=_plan_mode,
+    )
     phases: List[Dict[str, Any]] = []
     for ph in draft.get("phases") or []:
         phases.append({
@@ -4256,14 +4779,14 @@ async def run_planned_run(engagement_id: str, owasp_id: str) -> Dict[str, Any]:
     # Drafted phases present => phased native_subagents run (the normal-run path).
     drafted = [p for p in (pr.get("phases") or []) if (p.get("objective") or p.get("note") or "").strip()]
     if drafted:
-        phase_specs = [PhaseSpec(
+        phase_specs = _dedup_phase_plan([PhaseSpec(
             objective=(p.get("objective") or p.get("note") or "").strip(),
             tactic_id=p.get("tactic_id") or "TA0043",
             technique_ids=list(p.get("technique_ids") or []),
             note=p.get("note", ""),
             tools=list(p.get("tools") or []),
             checklist=list(p.get("checklist") or []),
-        ) for p in drafted]
+        ) for p in drafted])
         mitre_phases = [MitrePhaseSelection(
             tactic_id=p.tactic_id, technique_ids=p.technique_ids,
             note=p.objective or p.note, tools=p.tools, checklist=p.checklist,
@@ -5290,6 +5813,12 @@ def _extract_verifier_findings(run_id: str) -> List[Dict[str, Any]]:
             "recommendation": reco,
             "status": "open",
             "cwe_hint": cwe,
+            # Propagate the explicit defect-family label (§2.2(c)) so the
+            # cross-verdict retraction backstop can bucket findings on the same
+            # stable key as their verdict records. Empty when the verifier omitted
+            # it; the retraction bucket then falls back to family@method|path.
+            "defect": str(verdict.get("defect") or "").strip().lower(),
+            "route": route,
         })
     return out
 
@@ -5436,6 +5965,165 @@ def _merge_findings(base: Dict[str, Any], other: Dict[str, Any]) -> Dict[str, An
     return out
 
 
+# Verdicts that, appearing LATER on the same defect bucket than a CONFIRMED,
+# contradict it and trigger retraction of the earlier confirmed finding.
+_RETRACTION_VERDICTS = {"NOT_A_VULN", "INCONCLUSIVE", "NOT_CONFIRMABLE"}
+
+
+def _verdict_defect_bucket(rec: Dict[str, Any]) -> str:
+    """Stable, SCOPEd defect-bucket key for cross-verdict retraction. GENERIC for
+    any vuln class — NOT crypto/auth-specific. Bucket = the explicit `defect`
+    label (the kebab family the verifier records, e.g. `jwt-key-confusion`,
+    `idor`, `bfla`, `sqli`); when no explicit label exists, fall back to
+    `<inferred-family>@<METHOD>|<normalized-path>` so two genuinely-distinct
+    defects on the same route do NOT collapse into one bucket (the false-retraction
+    risk a loose keyword bag would create). The route component is always present
+    in the fallback so the bucket never spans routes."""
+    defect = str(rec.get("defect") or "").strip().lower()
+    if defect:
+        return defect
+    # Fallback family: infer from the canonical CWE (or the verdict's own class
+    # tokens) so a BOLA and a data-exposure on the same route stay distinct.
+    family = ""
+    cwe = str(rec.get("cwe_hint") or rec.get("cwe") or "").strip().lower()
+    if cwe:
+        family = cwe
+    else:
+        blob = " ".join(str(rec.get(k) or "") for k in
+                        ("claim", "route", "reason", "title", "description")).lower()
+        cwe_inferred = _canonical_cwe({"title": rec.get("claim", ""),
+                                       "description": rec.get("reason", ""),
+                                       "affected_asset": rec.get("route", "")})
+        if cwe_inferred:
+            family = cwe_inferred
+        else:
+            # Last resort: a coarse class token from the prose, else 'unknown'.
+            fm = re.search(r"\b(idor|bola|bfla|sqli|sql[- ]?injection|ssrf|xss|"
+                           r"cmd[- ]?injection|mass[- ]?assignment|jwt|auth|crypto|"
+                           r"deserializ|rate[- ]?limit)\b", blob)
+            family = fm.group(1) if fm else "unknown"
+    # Route component: METHOD | normalized-path (empty route => the bucket is the
+    # family alone; still scope-safe because the family is defect-specific).
+    route_blob = str(rec.get("route") or rec.get("affected_asset") or
+                     rec.get("title") or rec.get("claim") or "")
+    mm = _RE_METHOD.search(route_blob)
+    method = mm.group(1).upper() if mm else ""
+    epm = _RE_ENDPOINT.search(route_blob)
+    path = _normalize_path(epm.group(0)) if epm else ""
+    route_key = f"{method}|{path}" if path else ""
+    return f"{family}@{route_key}" if route_key else family
+
+
+def _retract_contradicted_findings(engagement: Dict[str, Any],
+                                   run_id: str) -> Dict[str, str]:
+    """GENERIC cross-verdict retraction backstop (§2.3(ii)). For ONE run, read
+    EVERY verdict shape in /outputs/<run_id>/verifier/ — both *.jsonl (line-by-line
+    VERDICT records, the shape _extract_verifier_findings globs) AND *.json (the
+    *-verdict.json / *verdict*.json downgrade files _extract_verifier_findings
+    MISSES, which is how the de1e6112 jwt-hs512 INCONCLUSIVE downgrade slipped past
+    the confirmed jwt-hmac-key-confusion HIGH). Bucket by explicit `defect` label
+    else defect-family@normalized-method-path (see _verdict_defect_bucket). If a
+    bucket holds a LATER NOT_A_VULN / INCONCLUSIVE / NOT_CONFIRMABLE alongside an
+    earlier CONFIRMED, the confirmed finding must be retracted.
+
+    Returns a {bucket_key: retraction_note} map for buckets whose confirmed
+    finding is contradicted by a later weaker verdict. _draft_findings_inprocess
+    applies the downgrade (verified=False, severity='info', annotated
+    verifier_verdict) to any merged finding in a retracted bucket — _merge_findings
+    only ever upgrades, so this is the missing downgrade path. Works for ANY defect
+    family, not only crypto/auth."""
+    if not run_id:
+        return {}
+    vdir = OUTPUTS_DIR / run_id / "verifier"
+    if not vdir.exists():
+        return {}
+    # Collect verdict records from BOTH file shapes, preserving a stable
+    # file-then-line ordering so 'later' is well-defined. *.jsonl: each non-blank
+    # line is a JSON record; pick the step=='VERDICT' one. *.json: the whole file
+    # is one JSON object (or a list); if it carries verdict/ok_to_report/claim
+    # fields, treat the object itself (or each element) as a verdict record.
+    seq = 0
+    bucket_records: Dict[str, List[Dict[str, Any]]] = {}
+
+    def _ingest(rec: Any) -> None:
+        nonlocal seq
+        if not isinstance(rec, dict):
+            return
+        is_verdict = (str(rec.get("step", "")).upper() == "VERDICT"
+                      or "verdict" in rec
+                      or "ok_to_report" in rec)
+        if not is_verdict:
+            return
+        v = str(rec.get("verdict", "")).upper()
+        ok = str(rec.get("ok_to_report", "")).upper()
+        confirmed = (v == "CONFIRMED" or ok == "YES")
+        if not confirmed and v not in _RETRACTION_VERDICTS:
+            return  # only CONFIRMED + the weakening verdicts participate
+        rec2 = dict(rec)
+        rec2["_seq"] = seq
+        rec2["_confirmed"] = confirmed
+        rec2["_v"] = v or ("CONFIRMED" if confirmed else "")
+        bk = _verdict_defect_bucket(rec2)
+        if not bk:
+            return
+        bucket_records.setdefault(bk, []).append(rec2)
+        seq += 1
+
+    for jf in sorted(vdir.glob("*.jsonl"), key=lambda p: p.name):
+        try:
+            text = jf.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        for ln in text.splitlines():
+            if not ln.strip():
+                continue
+            try:
+                d = json.loads(ln)
+            except Exception:
+                continue
+            _ingest(d)
+    for jf in sorted(vdir.glob("*.json"), key=lambda p: p.name):
+        try:
+            text = jf.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            continue
+        if isinstance(parsed, list):
+            for el in parsed:
+                _ingest(el)
+        else:
+            _ingest(parsed)
+
+    retracted: Dict[str, str] = {}
+    for bk, recs in bucket_records.items():
+        if not any(r.get("_confirmed") for r in recs):
+            continue  # no confirmed finding in this bucket — nothing to retract
+        if not any((not r.get("_confirmed")) and r.get("_v") in _RETRACTION_VERDICTS
+                   for r in recs):
+            continue  # no later weakening verdict — no contradiction
+        # Order by sequence; a weaker verdict at a HIGHER sequence than any
+        # confirmed one is a genuine later contradiction.
+        ordered = sorted(recs, key=lambda r: r.get("_seq", 0))
+        first_confirmed_seq = next((r.get("_seq", 0) for r in ordered if r.get("_confirmed")), None)
+        weaker = next((r for r in ordered
+                       if (not r.get("_confirmed")) and r.get("_v") in _RETRACTION_VERDICTS
+                       and r.get("_seq", 0) >= (first_confirmed_seq or 0)), None)
+        if weaker is None:
+            continue
+        wv = weaker.get("_v") or "INCONCLUSIVE"
+        wslug = str(weaker.get("slug") or weaker.get("id") or weaker.get("route")
+                    or bk)[:80]
+        retracted[bk] = (
+            f"retracted — later verdict {wslug} downgraded same defect ({bk}) to "
+            f"{wv}; confirmed finding demoted to info (cross-verdict retraction "
+            f"backstop)."
+        )
+    return retracted
+
+
 def _draft_findings_inprocess(engagement: Dict[str, Any],
                               run_ids: List[str]) -> List[Dict[str, Any]]:
     """Gather FindingCreate-shaped findings for the given runs, agent-free. Per run:
@@ -5448,7 +6136,19 @@ def _draft_findings_inprocess(engagement: Dict[str, Any],
     run_to_owasp = {p.get("run_id"): (p.get("owasp_id"), p.get("title"))
                     for p in plan if p.get("run_id")}
     merged: Dict[str, Dict[str, Any]] = {}
+    # §2.3(ii) cross-verdict retraction backstop, accumulated across runs. A
+    # confirmed finding whose defect bucket (explicit `defect` label else
+    # family@method|path) is contradicted by a LATER NOT_A_VULN/INCONCLUSIVE/
+    # NOT_CONFIRMABLE verdict in the same bucket is downgraded to info. GENERIC
+    # for any vuln class. _merge_findings only upgrades; this is the missing
+    # downgrade path. Applied AFTER the cross-run merge so a contradicted finding
+    # is retracted regardless of which run contributed it.
+    retracted_buckets: Dict[str, str] = {}
     for rid in run_ids:
+        try:
+            retracted_buckets.update(_retract_contradicted_findings(engagement, rid))
+        except Exception as exc:
+            logger.warning("retract_contradicted[%s] failed: %s", rid, exc)
         by_key: Dict[str, Dict[str, Any]] = {}
         # Verifier (first) wins the within-run merge as `base`.
         for finds in (_extract_verifier_findings(rid), _extract_emission_findings(rid)):
@@ -5465,6 +6165,20 @@ def _draft_findings_inprocess(engagement: Dict[str, Any],
         for f in by_key.values():
             k = _dedup_key(f)
             merged[k] = _merge_findings(merged[k], f) if k in merged else f
+    if retracted_buckets:
+        for f in merged.values():
+            bk = _verdict_defect_bucket(f)
+            note = retracted_buckets.get(bk)
+            if not note:
+                continue
+            # DOWNGRADE (the path _merge_findings cannot take): demote the
+            # confirmed finding to info + annotate the verdict that contradicted it.
+            f["verified"] = False
+            f["severity"] = "info"
+            prior_vv = str(f.get("verifier_verdict") or "").strip()
+            f["verifier_verdict"] = (f"{prior_vv} — {note}").strip(" —")[:500]
+            logger.info("retract_contradicted: demoted finding '%s' (bucket=%s)",
+                        str(f.get("title", ""))[:80], bk)
     return list(merged.values())
 
 
@@ -6111,6 +6825,14 @@ async def get_owasp_catalog() -> Dict[str, Any]:
     """OWASP Top 10 (2021) category catalog for the goal-builder / OWASP plan
     drafting. Mirrors /mitre/catalog."""
     return owasp_catalog()
+
+
+@router.get("/api-security/catalog")
+async def get_api_security_catalog() -> Dict[str, Any]:
+    """OWASP API Security Top-10 (2023) category catalog (API1-API10) for the
+    goal-builder / API engagement-plan drafting. Mirrors /owasp/catalog and
+    /mitre/catalog."""
+    return api_security_catalog()
 
 
 @router.get("/hosts/busy")

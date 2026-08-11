@@ -268,8 +268,11 @@ async def lifespan(app: FastAPI):
         # findings exist. Best-effort; never blocks startup on a report failure.
         try:
             from .routers.coder56 import _reconcile_all_engagement_reports
-            await _reconcile_all_engagement_reports()
-            logger.info("Engagement reportwriter reconcile sweep complete")
+            # Run as a background task: full per-engagement LLM report generation
+            # can take minutes and was blocking the lifespan, so uvicorn never
+            # bound 8080 (HTTP 000). Sweep is best-effort; it must not gate startup.
+            asyncio.create_task(_reconcile_all_engagement_reports())
+            logger.info("Engagement reportwriter reconcile sweep scheduled (background)")
         except Exception as e:
             logger.warning(f"Engagement reportwriter reconcile sweep skipped: {e}")
 

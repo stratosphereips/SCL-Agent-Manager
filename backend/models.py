@@ -875,6 +875,25 @@ class PhaseSpec(BaseModel):
     note: str = Field(default="", description="Optional operator note / detail")
     tools: List[str] = Field(default_factory=list, description="Recommended tools for this phase")
     checklist: List[str] = Field(default_factory=list, description="Goals/tasks checklist for this phase")
+    # WebApp/API-mode phase tags (additive; empty/false => NETWORK-mode behavior).
+    api_category: str = Field(default="", description="For webapp/api mode: the OWASP id this phase targets (A01-A10 or API1-API10)")
+    is_research_phase: bool = Field(default=False, description="True for Phase R: recon-first research whose persisted output is ground truth for later phases")
+
+
+class EngagementMode(str, Enum):
+    """Operator-selected engagement mode backing the planner frame.
+
+    NETWORK (the default, byte-for-byte no-regression) drives the existing
+    MITRE ATT&CK kill-chain + host-compromise skeleton. WEBAPP/API switch the
+    planner to an OWASP WSTG v4.2 spine with the OWASP Top-10 (2021) / OWASP
+    API Security Top-10 (2023) risk model respectively (see api_security_catalog.py).
+    Threaded end-to-end through launch()/draft_goal()/the OWASP-plan drafter and
+    persisted into the run manifest; read back from manifest/meta (not req) where
+    req is out of scope (empty-phases fallback + _dedup_phase_plan).
+    """
+    NETWORK = "network"   # MITRE ATT&CK kill-chain + host-compromise (CURRENT DEFAULT)
+    WEBAPP  = "webapp"    # OWASP WSTG v4.2 spine, OWASP Top-10 (2021) risk model
+    API     = "api"       # OWASP WSTG v4.2 spine, OWASP API Security Top-10 (2023) risk model
 
 
 class PhaseMode(str, Enum):
@@ -987,6 +1006,7 @@ class GoalDraftRequest(BaseModel):
     target: str = Field(default="", description="Authorized target IP/CIDR/host")
     rules_of_engagement: str = Field(default="", description="Optional RoE / constraints")
     depth: str = Field(default="standard", description="brief | standard | thorough")
+    engagement_mode: EngagementMode = Field(default=EngagementMode.NETWORK)
 
 
 class GoalCompileRequest(BaseModel):
@@ -1033,6 +1053,13 @@ class LaunchRequest(BaseModel):
     # only for back-compat with old manifests; the launch path no longer selects it.
     # Only meaningful when `phases` is non-empty.
     orchestration: Orchestration = Field(default=Orchestration.NATIVE_SUBAGENTS)
+    # Operator-selected engagement mode: NETWORK (default — kill-chain + host
+    # compromise, byte-for-byte no-regression) vs WEBAPP/API (OWASP WSTG v4.2
+    # spine + Top-10 2021 / API Security Top-10 2023 risk model). Threaded into
+    # the run manifest/meta and read back by the empty-phases fallback +
+    # _dedup_phase_plan (req is out of scope there). Default NETWORK keeps every
+    # existing run/endpoint identical.
+    engagement_mode: EngagementMode = Field(default=EngagementMode.NETWORK)
     # Optional link to an Engagement (a grouped pentest project). When set, the
     # run is registered under OUTPUTS_DIR/engagements/<engagement_id>.json and
     # the run manifest carries engagement_id back so the UI can scope to it.

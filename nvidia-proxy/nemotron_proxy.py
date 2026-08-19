@@ -56,7 +56,15 @@ def auth_headers(request) -> dict:
 
 
 def _is_transient(status: int, body: bytes) -> bool:
-    if status in (429, 502, 503, 504):
+    # Retry the whole transient family. nvidia/nemotron-3-ultra-550b-a55b (a huge
+    # hosted model) intermittently returns 404 (the model IS listed in /v1/models
+    # but cold/routing blips) and 500 even though the identical call succeeds
+    # seconds later — observed ~30% failure rate (504/404/500/502) on an
+    # otherwise-healthy key. Treating 404/500 as transient lets MAX_RETRIES ride
+    # through the blip instead of failing the guardrail verdict on a single
+    # 404/500, which starves the judge of verdicts and trips the run's
+    # circuit-breaker halt (run erpnext-pentest-8c2f1a-20260813-000254).
+    if status in (404, 408, 429, 500, 502, 503, 504):
         return True
     if status == 400:
         # NVIDIA rate-limit surfaces as 400 "ResourceExhausted ... limit reached"

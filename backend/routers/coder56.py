@@ -1958,7 +1958,12 @@ RUN_SNAPSHOT_CADENCE_S = 300
 # itself is unreachable, so every command escalates and the agent cannot make real
 # progress. Reference run b1425481 = 88/88 dead-judge escalates, yet all 4 phases
 # were marked 'completed'. Hard-pause instead of burning retries / faking success.
-GUARDRAIL_CIRCUIT_BREAKER_N = 3
+# Raised 3 -> 6: the nemotron proxy now retries intermittent upstream 404/500/5xx
+# (nemotron_proxy._is_transient), so a single NVIDIA blip no longer produces a
+# dead verdict. 6 gives margin against CLUSTERED blips while still halting on a
+# genuinely-sustained judge outage (a dead verdict = 4 guardrail attempts x 4 proxy
+# retries of failed calls, so 6 in a row is unambiguously a down judge, not noise).
+GUARDRAIL_CIRCUIT_BREAKER_N = 6
 # A verdict is 'dead-judge' when the JUDGE produced no usable output (vs a genuine
 # refuse/escalate the judge deliberately returned). tokens.total==0 = judge call
 # returned empty body (http 0 / connection fail / parse fail); these reason
@@ -6157,8 +6162,8 @@ def _dedup_key(f: Dict[str, Any]) -> str:
     one finding routinely landed on different keys and survived as duplicates
     (the owasp2 login-rate-limit and donor-email-exposure pairs). Using the
     _canonical_cwe (inferred when the literal tag is missing) makes the key
-    stable so duplicates collapse, while METHOD/role still keep BFLA-vs-BOLA
-    and different-attacker-role distinct. The trailing PARAM dimension (8c2f1a
+    stable so duplicates collapse, while METHOD/role still keep BFLA-vs-BOLA and
+    different-attacker-role distinct. The trailing PARAM dimension (8c2f1a
     postmortem) keeps two distinct injection points on one route — order_by vs
     group_by SQLi — separate; it is empty whenever no parameter is derivable, so
     parameter-less restatements of one finding still merge as before.
@@ -7156,7 +7161,7 @@ async def engagement_report(engagement_id: str) -> HTMLResponse:
     8c2f1a postmortem defects 2 + 4: before serving a cached report this runs an
     idempotent late-verdict harvest (a ghost verifier can append CONFIRMED
     verdicts hours after the lead-driver exit — they were never picked up) and
-    treats a cache older than the engagement's findings as stale. Both are
+    treats a cache older than the engagement's updated_at as stale. Both are
     cheap (jsonl reads + a stat) and this endpoint is called rarely, so they do
     not sit in any hot path."""
     _valid_token(engagement_id, "engagement_id")

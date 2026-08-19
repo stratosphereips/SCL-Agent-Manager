@@ -950,14 +950,22 @@ async def _check_opencode_http(container_id: str) -> bool:
             stderr=asyncio.subprocess.PIPE
         )
 
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(),
-            timeout=5
-        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=5
+            )
+        except asyncio.TimeoutError:
+            # wait_for cancels communicate() but leaves the docker-exec child
+            # running. Kill it or every timed-out probe leaks a process (and
+            # its ThreadedChildWatcher thread) until the host is drained.
+            process.kill()
+            await process.wait()
+            return False
 
         return process.returncode == 0
 
-    except (asyncio.TimeoutError, FileNotFoundError):
+    except (asyncio.TimeoutError, FileNotFoundError, ProcessLookupError):
         return False
 
 

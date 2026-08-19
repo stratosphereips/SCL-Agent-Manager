@@ -625,7 +625,10 @@ async def get_agent_assignments_async(
 ) -> List[AgentStateAssignment]:
     """Get current agent assignments derived from topology.json (single source),
     enriched with live container state where the container is running."""
-    assignments = _derive_assignments(topology_id, host_id)
+    # _derive_assignments performs synchronous HTTP calls to the topology
+    # plugin. Keep that I/O off Uvicorn's event loop so an assignment refresh
+    # cannot stall unrelated API requests.
+    assignments = await asyncio.to_thread(_derive_assignments, topology_id, host_id)
 
     async with create_docker_client() as docker:
         for a in assignments:

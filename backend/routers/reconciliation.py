@@ -251,7 +251,13 @@ class ReconciliationService:
         Returns:
             Dict mapping host_id to desired state
         """
-        assignments = get_agent_assignments(topology_id=topology_id)
+        # get_agent_assignments performs synchronous HTTP calls to the topology
+        # plugin. Periodic reconciliation runs in the API process, so move that
+        # I/O to a worker thread instead of pausing every request on the event loop.
+        assignments = await asyncio.to_thread(
+            get_agent_assignments,
+            topology_id=topology_id,
+        )
 
         desired_state = {}
         for assignment in assignments:

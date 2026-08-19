@@ -6,6 +6,7 @@ Implements container discovery and management endpoints:
 - GET /api/containers/{container_id} - Get detailed container info with agents
 """
 
+import asyncio
 import logging
 from typing import Dict, List, Optional, Any
 
@@ -233,7 +234,10 @@ async def list_containers_endpoint(
                         f"Unknown host_type '{host_type_str}' for container {c.container_name}, using UNKNOWN"
                     )
             enriched_containers.append(
-                _enrich_container_from_topology(ContainerInfo(**container_dict))
+                await asyncio.to_thread(
+                    _enrich_container_from_topology,
+                    ContainerInfo(**container_dict),
+                )
             )
 
         return ContainerDiscoveryResponse(
@@ -359,7 +363,10 @@ async def discover_containers(
                 )
 
                 enriched_containers.append(
-                    _enrich_container_from_topology(container_info)
+                    await asyncio.to_thread(
+                        _enrich_container_from_topology,
+                        container_info,
+                    )
                 )
 
             return ContainerDiscoveryResponse(

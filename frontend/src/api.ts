@@ -492,7 +492,11 @@ export async function getSessionMessages(
  * Create a new session
  */
 export async function createSession(request: SessionCreateRequest): Promise<SessionInfo> {
-  const response = await apiClient.post<SessionInfo>('/api/sessions', request);
+  // The backend waits for the initial agent turn (up to 120 seconds). Do not
+  // apply the client's 30-second default to this intentionally long request.
+  const response = await apiClient.post<SessionInfo>('/api/sessions', request, {
+    timeout: 150000,
+  });
   return response.data;
 }
 
@@ -505,7 +509,8 @@ export async function sendPrompt(
 ): Promise<AgentResponse> {
   const response = await apiClient.post<AgentResponse>(
     `/api/sessions/${sessionId}/prompt`,
-    request
+    request,
+    { timeout: 150000 }
   );
   return response.data;
 }

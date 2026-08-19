@@ -11,6 +11,7 @@ import { ContainerState } from '@/types';
 function AgentPanel({
   assignment,
   template,
+  sessions,
   isGuarded,
   verifierEnabled,
   verifierApplying,
@@ -18,57 +19,64 @@ function AgentPanel({
 }: {
   assignment: AgentStateAssignment;
   template?: AgentTemplate;
+  sessions: SessionInfo[];
   isGuarded?: boolean;
   verifierEnabled?: boolean;
   verifierApplying?: boolean;
   onToggleVerifier?: () => void;
 }) {
-  const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeSession, setActiveSession] = useState<SessionInfo | null>(null);
   const [messages, setMessages] = useState<SessionMessage[]>([]);
   const [goal, setGoal] = useState('');
   const [isStarting, setIsStarting] = useState(false);
 
-  // Poll for session updates and messages
+  const mySessions = useMemo(() => sessions.filter(s =>
+    s.container_id === assignment.container_id &&
+    s.agent_type === assignment.agent_type
+  ), [sessions, assignment.container_id, assignment.agent_type]);
+
+  // Keep the selected session valid as the page-level session poll updates.
   useEffect(() => {
-    let mounted = true;
-    
-    const poll = async () => {
+    setActiveSession(current => {
+      if (current && mySessions.some(s => s.session_id === current.session_id)) {
+        return current;
+      }
+      return mySessions[0] ?? null;
+    });
+  }, [mySessions]);
+
+  // Poll only this panel's active session messages, scheduling the next poll
+  // after the previous request finishes so slow requests never overlap.
+  useEffect(() => {
+    if (!activeSession) {
+      setMessages([]);
+      return;
+    }
+
+    let cancelled = false;
+    let timer: number | undefined;
+
+    const pollMessages = async () => {
       try {
-        // Fetch sessions for this agent
-        const allSessions = await api.listSessions();
-        const mySessions = allSessions.filter(s => 
-          s.container_id === assignment.container_id && 
-          s.agent_type === assignment.agent_type
-        );
-        
-        if (mounted) {
-          setSessions(mySessions);
-          if (mySessions.length > 0 && !activeSession) {
-            setActiveSession(mySessions[0]);
-          }
-        }
-        
-        // Fetch messages for active session
-        const currentSession = activeSession || (mySessions.length > 0 ? mySessions[0] : null);
-        if (currentSession) {
-          const msgs = await api.getSessionMessages(currentSession.session_id);
-          if (mounted) {
-            setMessages(msgs);
-          }
+        const msgs = await api.getSessionMessages(activeSession.session_id);
+        if (!cancelled) {
+          setMessages(msgs);
         }
       } catch (err) {
         console.error("Error polling session data", err);
+      } finally {
+        if (!cancelled) {
+          timer = window.setTimeout(pollMessages, 3000);
+        }
       }
     };
-    
-    poll();
-    const interval = setInterval(poll, 3000);
+
+    pollMessages();
     return () => {
-      mounted = false;
-      clearInterval(interval);
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [assignment, activeSession]);
+  }, [activeSession?.session_id]);
 
   const handleStartGoal = async () => {
     if (!goal.trim()) return;
@@ -194,6 +202,7 @@ export function AgentsPage() {
   const { replay } = useReplayContext();
   const [assignments, setAssignments] = useState<AgentStateAssignment[]>([]);
   const [templates, setTemplates] = useState<Record<string, AgentTemplate>>({});
+  const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [runningTopologyIds, setRunningTopologyIds] = useState<Set<string>>(new Set());
   const [topologyDetails, setTopologyDetails] = useState<Record<string, Topology>>({});
   const [verifierApplying, setVerifierApplying] = useState<Record<string, boolean>>({});
@@ -201,17 +210,57 @@ export function AgentsPage() {
 
   useEffect(() => {
     if (replay.replayId) return; // don't poll live management data while a replay is loaded
+    let cancelled = false;
+    let timer: number | undefined;
+
     async function loadData() {
       try {
-        const [assigns, tpls, containersResp] = await Promise.all([
-          api.getAgentAssignments(),
+        const [tplsResult, containersResult] = await Promise.allSettled([
           api.getAgentTemplates(),
           api.discoverContainers({ state: ContainerState.RUNNING, includeStopped: false })
         ]);
-        setAssignments(assigns);
-        setTemplates(tpls.agents);
-        const runningIds = new Set(containersResp.containers.map((c: ContainerInfo) => c.topology_id).filter(Boolean));
+
+        if (cancelled) return;
+
+        if (tplsResult.status === 'fulfilled') {
+          setTemplates(tplsResult.value.agents);
+        } else {
+          console.error("Failed to load agent templates", tplsResult.reason);
+        }
+
+        if (containersResult.status === 'rejected') {
+          console.error("Failed to discover running containers", containersResult.reason);
+          return;
+        }
+
+        const runningIds = new Set<string>(
+          containersResult.value.containers
+            .map((c: ContainerInfo) => c.topology_id)
+            .filter((id): id is string => Boolean(id))
+        );
         setRunningTopologyIds(runningIds);
+
+        // Only request assignments for running topologies. The unfiltered
+        // endpoint loads every saved topology and is unnecessarily expensive.
+        const assignmentResults = await Promise.allSettled(
+          Array.from(runningIds).map(topologyId =>
+            api.getAgentAssignments({ topologyId })
+          )
+        );
+        if (cancelled) return;
+        const successfulAssignments = assignmentResults.filter(
+          (result): result is PromiseFulfilledResult<AgentStateAssignment[]> =>
+            result.status === 'fulfilled'
+        );
+        const assigns = assignmentResults.flatMap(result => {
+          if (result.status === 'fulfilled') return result.value;
+          console.error("Failed to load assignments for a running topology", result.reason);
+          return [];
+        });
+        // Preserve the last good data if every assignment request failed.
+        if (runningIds.size === 0 || successfulAssignments.length > 0) {
+          setAssignments(assigns);
+        }
 
         // Fetch full topology details for running topologies so we can read guardrail_enabled per host.
         const details: Record<string, Topology> = {};
@@ -225,16 +274,46 @@ export function AgentsPage() {
             }
           })
         );
-        setTopologyDetails(details);
+        if (!cancelled) setTopologyDetails(details);
       } catch (err) {
         console.error("Failed to load agent data", err);
       } finally {
-        setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+          timer = window.setTimeout(loadData, 10000);
+        }
       }
     }
     loadData();
-    const interval = setInterval(loadData, 10000);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [replay.replayId]);
+
+  // Fetch the global session list once for the page and share it with all
+  // panels. Previously every panel fetched the same list independently.
+  useEffect(() => {
+    if (replay.replayId) return;
+    let cancelled = false;
+    let timer: number | undefined;
+
+    const pollSessions = async () => {
+      try {
+        const nextSessions = await api.listSessions();
+        if (!cancelled) setSessions(nextSessions);
+      } catch (err) {
+        console.error("Failed to load sessions", err);
+      } finally {
+        if (!cancelled) timer = window.setTimeout(pollSessions, 3000);
+      }
+    };
+
+    pollSessions();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
   }, [replay.replayId]);
 
   const activeAssignments = assignments.filter(a => runningTopologyIds.has(a.topology_id));
@@ -371,6 +450,7 @@ export function AgentsPage() {
               key={a.id}
               assignment={a}
               template={templates[a.agent_type]}
+              sessions={sessions}
               isGuarded={hostGuardedMap[`${a.topology_id}:${a.host_id}`] ?? false}
               verifierEnabled={hostVerifierMap[`${a.topology_id}:${a.host_id}`] ?? true}
               verifierApplying={verifierApplying[`${a.topology_id}:${a.host_id}`] ?? false}

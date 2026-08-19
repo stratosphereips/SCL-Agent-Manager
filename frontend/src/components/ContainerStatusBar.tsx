@@ -7,20 +7,30 @@ export function ContainerStatusBar() {
   const [running, setRunning] = useState<number>(0);
 
   useEffect(() => {
-    const load = () => {
-      getContainers()
-        .then((data) => {
-          const all = data.containers ?? [];
-          setContainers(all.length);
-          setRunning(
-            all.filter((c) => c.state === ContainerState.RUNNING).length,
-          );
-        })
-        .catch(() => {});
+    let cancelled = false;
+    let timer: number | undefined;
+
+    const load = async () => {
+      try {
+        const data = await getContainers();
+        if (cancelled) return;
+        const all = data.containers ?? [];
+        setContainers(all.length);
+        setRunning(
+          all.filter((c) => c.state === ContainerState.RUNNING).length,
+        );
+      } catch {
+        // Keep the last known counts during a transient backend failure.
+      } finally {
+        if (!cancelled) timer = window.setTimeout(load, 10000);
+      }
     };
+
     load();
-    const interval = setInterval(load, 5000);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
   }, []);
 
   return (
@@ -40,4 +50,3 @@ export function ContainerStatusBar() {
     </div>
   );
 }
-

@@ -3213,6 +3213,52 @@ def _read_verdicts_tail(run_id: str, limit: int = 64) -> List[Dict[str, Any]]:
     return out
 
 
+def _last_assistant_text(messages: List[Dict[str, Any]]) -> str:
+    """Last non-empty assistant text part from an opencode message list. Mirrors the
+    role/parts shape consumed in _lead_driver (role in m["role"] or m["info"]["role"];
+    text in parts where type=="text"). Used by the result-capture fallback (FIX#3)."""
+    for m in reversed(messages or []):
+        if not isinstance(m, dict):
+            continue
+        if (m.get("role") or (m.get("info") or {}).get("role")) != "assistant":
+            continue
+        for p in reversed(m.get("parts") or []):
+            if isinstance(p, dict) and p.get("type") == "text" and (p.get("text") or "").strip():
+                return p["text"]
+    return ""
+
+
+def _phase_had_tool_calls(run_id: str, started_at: str, completed_at: str) -> bool:
+    """True if any guardrail verdict was logged in [started_at, completed_at]. Every
+    bash + MCP tool call is guardrail-gated, so a verdict in-window == the phase
+    executed real work. Used by the AUTO completion gate (FIX#4) to reject hollow
+    'completed' phases (0 tool calls, e.g. a model spawn-crash). Fails open (True)
+    on a missing started_at or read error so a glitch can't falsely gate a phase."""
+    if not started_at:
+        return True
+    try:
+        path = _guardrail_dir(run_id) / "verdicts.ndjson"
+        if not path.exists():
+            return False
+        lo = started_at[:19]
+        hi = (completed_at or _now_iso())[:19]
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                ts = (obj.get("ts") or obj.get("timestamp") or "")[:19]
+                if ts and lo <= ts <= hi:
+                    return True
+        return False
+    except Exception:
+        return True
+
+
 def _verdict_is_dead_judge(v: Dict[str, Any]) -> bool:
     """True when the JUDGE itself produced no usable verdict (not a deliberate
     refuse/escalate). Matches run b1425481: 88/88 verdicts decision='escalate',
@@ -3442,7 +3488,20 @@ async def _lead_driver(run_id: str) -> None:
                         changed = True
                     continue
                 if (not entry.get("result")) or (entry.get("status") in (PhaseStatus.PENDING.value, PhaseStatus.RUNNING.value)):
-                    entry["result"] = parsed.get("result") or ""
+                    _result = parsed.get("result") or ""
+                    # FIX#3 result-capture fallback: the Lead's structured summary is
+                    # sometimes empty even though the phase subagent did real work
+                    # (erpnext Phase 1 enumerated 11 users but phase_runtime.result
+                    # was recorded as "" — starved the finding-driven re-planner).
+                    # Pull the phase CHILD session's last assistant text directly.
+                    if not _result and child:
+                        try:
+                            cres = await get_session_messages_async(session_id=child, host=addr, port=4096)
+                            if cres.get("success"):
+                                _result = _last_assistant_text(cres.get("messages", []))
+                        except Exception as exc:
+                            logger.warning("lead_driver[%s] phase %d result fallback failed: %s", run_id, idx, exc)
+                    entry["result"] = _result
                     # VERIFIER-GATE GUARD (advisory, non-blocking): if this phase's
                     # OWN findings region asserts a vulnerability but shows no
                     # ## VERIFIER CALLS / OK TO REPORT: YES and no === VERIFIER
@@ -3475,7 +3534,24 @@ async def _lead_driver(run_id: str) -> None:
                     # In AUTO mode a returned task is a completed phase even
                     # while the Lead moves on. Keeping it "running" makes the UI
                     # and /guide target the previous child during the next phase.
-                    entry["status"] = PhaseStatus.COMPLETED.value
+                    # FIX#4 no-op gate: a phase that produced NO result AND made NO
+                    # tool calls (zero guardrail verdicts in its window) did no real
+                    # work — a model non-response/spawn-crash (erpnext Phase 4/5).
+                    # Do NOT stamp it COMPLETED; flag AWAITING_REVIEW so the hollow
+                    # green checkmark can't masquerade as done. The run continues.
+                    _did_work = bool((entry.get("result") or "").strip()) or _phase_had_tool_calls(
+                        run_id, entry.get("started_at") or "", entry.get("completed_at") or _now_iso())
+                    if _did_work:
+                        entry["status"] = PhaseStatus.COMPLETED.value
+                    else:
+                        entry["status"] = PhaseStatus.AWAITING_REVIEW.value
+                        _prev_r = entry.get("result", "") or ""
+                        entry["result"] = (_prev_r + "\n[BACKEND NO-OP GATE: phase returned with no "
+                                           "captured result and zero tool calls in its window — likely a "
+                                           "model non-response/spawn-crash. NOT marked complete; operator "
+                                           "review required.]").strip()
+                        logger.warning("lead_driver[%s] phase %d returned with no work (0 tool calls, "
+                                       "empty result) — flagged AWAITING_REVIEW", run_id, idx)
                     changed = True
 
             n_completed = sum(1 for _, s in tasks if s == "completed")

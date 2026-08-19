@@ -4980,6 +4980,12 @@ def _merge_confirmed_findings_into_engagement(engagement_id: str, run_id: str) -
             "discovered_via_run_id": run_id,
             "verified": True,
             "verifier_verdict": str(cand.get("verifier_verdict") or "")[:500],
+            # 8c2f1a postmortem defect: persist the candidate's explicit CWE tag.
+            # Without it the stored finding re-infers its CWE from prose on the
+            # next harvest ("...Injection..." -> cwe-89) while the candidate keys
+            # on its literal cwe_hint (cwe-1236) — asymmetric _dedup_key means
+            # every harvest pass appends a fresh duplicate of the same finding.
+            "cwe_hint": str(cand.get("cwe_hint") or "")[:200] or None,
             "commands": list(cand.get("commands") or [])[:40],
             "owasp_id": oid or None,
             "id": _new_id(),
@@ -5784,7 +5790,17 @@ def _extract_verifier_findings(run_id: str) -> List[Dict[str, Any]]:
         route = str(verdict.get("route") or "")
         reason = str(verdict.get("reason") or "")
         intended = str(verdict.get("intended_behavior") or "")
-        ident = route or claim[:80]
+        # 8c2f1a postmortem (defect 1 companion): the `seen` identity used to be
+        # `route or claim[:80]`, which DROPPED the second of two genuinely
+        # distinct verdicts sharing one route (order_by SQLi + group_by SQLi on
+        # /api/resource/User) before dedup ever ran. Identity is now the
+        # finding's own dedup key (METHOD|path|CWE|role|param) with the slug
+        # appended — per-file unique, so restatements across files still merge
+        # later via _dedup_key while two distinct defects on one route survive.
+        try:
+            ident = f"{_dedup_key({'title': claim, 'affected_asset': route, 'description': reason})}|{jf.stem}"
+        except Exception:
+            ident = f"{claim[:80]}|{jf.stem}"
         if ident in seen:
             continue
         seen.add(ident)
@@ -5904,24 +5920,83 @@ def _canonical_cwe(f: Dict[str, Any]) -> str:
         return raw
     blob = " ".join(str(f.get(k) or "") for k in
                     ("title", "title_raw", "description", "body", "affected_asset"))
+    # An explicit literal tag in the prose ("Stored CSV/Formula Injection
+    # (CWE-1236) ...") beats vocabulary inference: without this, a finding
+    # stored without its cwe_hint re-infers cwe-89 from the word "Injection"
+    # while its verifier candidate keys on the literal cwe-1236 — asymmetric
+    # _dedup_key, one new duplicate per harvest pass (8c2f1a postmortem).
+    m = re.search(r"\bcwe-\d{1,5}\b", blob, re.I)
+    if m:
+        return m.group(0).lower()
     for pat, cwe in _VULNCLASS_TO_CWE:
         if pat.search(blob):
             return cwe
     return ""
 
 
+# Parameter / injection-point dimension (erpnext 8c2f1a postmortem defect 1).
+# Two genuinely DISTINCT findings on one route can differ ONLY by the parameter
+# they inject into — SQLi in `order_by` vs SQLi in `group_by` on
+# /api/resource/User — for which METHOD|path|CWE|role are all identical, so both
+# the auto-merge and the draft merge collapsed them into ONE finding (base's
+# order_by title + the longer group_by description: the operator could not tell
+# them apart and re-added the duplicate). The forms below pull the parameter
+# identifier out of the finding's own evidence; bare-word recognition is limited
+# to a small, unambiguous vocabulary so ordinary prose never invents a dimension.
+_RE_PARAM_ASSIGNED = re.compile(
+    r"\bparam(?:eter)?s?\s*[:=]\s*[\"']?([A-Za-z_][A-Za-z0-9_.\-]{0,40})", re.I)
+_RE_PARAM_NAMED = re.compile(
+    r"\b(?:the\s+)?([A-Za-z_][A-Za-z0-9_.\-]{0,40})\s+parameter\b", re.I)
+_RE_PARAM_QUERY = re.compile(r"[?&]([A-Za-z_][A-Za-z0-9_]{0,40})=", re.I)
+_RE_PARAM_KNOWN = re.compile(r"\b(order[\s_]+by|group[\s_]+by|debug|searchfield)\b", re.I)
+# "<entity> <field_name> field" phrasing ("Customer customer_name field") — the
+# 8c2f1a CSV-injection finding names its injection point this way and none of
+# the forms above matched, collapsing the param dimension to ''. Tried LAST so
+# existing derivable params are unchanged.
+_RE_PARAM_FIELD = re.compile(r"\b([a-z_][a-z0-9_]{1,40})\s+field\b")
+
+
+def _param_key(f: Dict[str, Any]) -> str:
+    """Normalized parameter / injection-point identifier for a finding.
+
+    '' when none is derivable — findings without a parameter token then keep the
+    previous (empty-dimension) key behaviour, so a restatement that omits the
+    parameter still merges with one that names it. The explicit multi-word
+    vocabulary (_RE_PARAM_KNOWN) is tried FIRST so "order_by parameter" and
+    "the order by parameter" normalize identically (the single-token forms would
+    otherwise capture the trailing word "by" from the spaced spelling)."""
+    blob = " ".join(str(f.get(k) or "") for k in
+                    ("title", "title_raw", "description", "body",
+                     "affected_asset", "evidence", "route"))
+    m = _RE_PARAM_KNOWN.search(blob)
+    if m:
+        return re.sub(r"\s+", "_", m.group(1).lower())
+    for rx in (_RE_PARAM_ASSIGNED, _RE_PARAM_QUERY, _RE_PARAM_NAMED):
+        m = rx.search(blob)
+        if m:
+            return re.sub(r"[^a-z0-9_]+", "_", m.group(1).lower().strip("_")) or ""
+    m = _RE_PARAM_FIELD.search(blob)
+    if m:
+        return m.group(1).lower()
+    return ""
+
+
 def _dedup_key(f: Dict[str, Any]) -> str:
     """Stable identity for one issue across sources AND runs.
 
-    Canonical key = METHOD | normalized_path | canonical_CWE | role, computed the
-    SAME way for every candidate (verifier-anchored or emission). Previously the
-    strict METHOD|PATH|CWE|role fingerprint was used only when method AND cwe were
-    both present, with a noisy vuln-class|endpoint fallback otherwise — and since
-    the agent tags CWE inconsistently, two restatements of one finding routinely
-    landed on different keys and survived as duplicates (the owasp2 login-rate-limit
-    and donor-email-exposure pairs). Using the _canonical_cwe (inferred when the
-    literal tag is missing) makes the key stable so duplicates collapse, while
-    METHOD/role still keep BFLA-vs-BOLA and different-attacker-role distinct.
+    Canonical key = METHOD | normalized_path | canonical_CWE | role | param,
+    computed the SAME way for every candidate (verifier-anchored or emission).
+    Previously the strict METHOD|PATH|CWE|role fingerprint was used only when
+    method AND cwe were both present, with a noisy vuln-class|endpoint fallback
+    otherwise — and since the agent tags CWE inconsistently, two restatements of
+    one finding routinely landed on different keys and survived as duplicates
+    (the owasp2 login-rate-limit and donor-email-exposure pairs). Using the
+    _canonical_cwe (inferred when the literal tag is missing) makes the key
+    stable so duplicates collapse, while METHOD/role still keep BFLA-vs-BOLA
+    and different-attacker-role distinct. The trailing PARAM dimension (8c2f1a
+    postmortem) keeps two distinct injection points on one route — order_by vs
+    group_by SQLi — separate; it is empty whenever no parameter is derivable, so
+    parameter-less restatements of one finding still merge as before.
 
     Falls back to a normalized title only when no endpoint path is derivable."""
     blob = f"{f.get('title') or f.get('title_raw') or ''} {f.get('affected_asset', '')} {f.get('description', '')}"
@@ -5929,11 +6004,27 @@ def _dedup_key(f: Dict[str, Any]) -> str:
     method = mm.group(1).upper() if mm else ""
     epm = _RE_ENDPOINT.search(f"{f.get('affected_asset', '')} {f.get('title') or f.get('title_raw') or ''}")
     path = _normalize_path(epm.group(0)) if epm else ""
+    # Junk single-token asset ("/Formula" — _RE_ENDPOINT grabbed the capitalized
+    # word "Formula" out of a title like "Stored CSV/Formula Injection"): when
+    # the derived path is one bare segment but the prose names a real multi-
+    # segment route, prefer the real route. Conservative: the override only
+    # fires for single-segment paths, so genuine /login-style endpoints and all
+    # properly extracted paths keep their existing keys (8c2f1a postmortem).
+    if path and "/" not in path.lstrip("/") and " " not in path:
+        desc = f"{f.get('description', '')} {f.get('route', '')} {f.get('evidence', '')}"
+        # First multi-segment route in the prose wins (a single-token path can
+        # ALSO appear mid-prose — "Stored CSV/Formula Injection in POST
+        # /api/resource/Customer" — so search() alone may re-find the junk).
+        for better in _RE_ENDPOINT.finditer(desc):
+            cand = _normalize_path(better.group(0))
+            if cand and "/" in cand.lstrip("/"):
+                path = cand
+                break
     cwe = _canonical_cwe(f)
     rm = re.search(r"\b(ROLE_[A-Z_]+)\b", blob)
     role = rm.group(1).lower() if rm else ""
     if path:
-        return f"{method}|{path}|{cwe}|{role}"
+        return f"{method}|{path}|{cwe}|{role}|{_param_key(f)}"
     return re.sub(r"\s+", " ", f.get("title") or f.get("title_raw") or "").strip().lower()[:60]
 
 

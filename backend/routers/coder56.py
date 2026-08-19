@@ -403,6 +403,25 @@ def _engagement_path(engagement_id: str) -> Path:
     return _engagements_dir() / f"{engagement_id}.json"
 
 
+def _report_cache_paths(engagement_id: str) -> tuple:
+    """The cached report artifacts for one engagement (html + json)."""
+    out_dir = _engagements_dir()
+    return (out_dir / f"{engagement_id}.report.html",
+            out_dir / f"{engagement_id}.report.json")
+
+
+def _invalidate_report_cache(engagement_id: str) -> None:
+    """Unlink the engagement's cached report.html/report.json so the next
+    GET report.html regenerates from the CURRENT findings (8c2f1a postmortem
+    defect 4: the client report showed 1 finding while the ledger had 3, and
+    a GET hours later still served the stale file). Best-effort, never raises."""
+    try:
+        for p in _report_cache_paths(engagement_id):
+            p.unlink(missing_ok=True)
+    except Exception as exc:
+        logger.debug("invalidate_report_cache[%s]: %s", engagement_id, exc)
+
+
 def _read_engagement(engagement_id: str) -> Optional[Dict[str, Any]]:
     path = _engagement_path(engagement_id)
     if not path.exists():
@@ -5005,18 +5024,57 @@ def _merge_confirmed_findings_into_engagement(engagement_id: str, run_id: str) -
     return added
 
 
+def _harvest_late_verdicts(engagement_id: str, engagement: Optional[Dict[str, Any]] = None) -> int:
+    """Idempotent re-scan of an engagement's runs for verifier-CONFIRMED findings
+    (8c2f1a postmortem defect 2).
+
+    Verdicts were harvested ONLY from the lead-driver exit hook — but a ghost/
+    late verifier can append a CONFIRMED verdict HOURS after the driver exited
+    (8c2f1a: a CONFIRMED 7.5-HIGH at 14:10, 4.5h after the 09:44 driver exit),
+    and that finding then never reached the ledger or the report. This helper
+    re-runs the same per-run merge (`_merge_confirmed_findings_into_engagement`)
+    for every run linked to the engagement. It is IDEMPOTENT — the merge skips
+    any dedup key already present, so re-scanning a fully-harvested engagement
+    appends nothing — and cheap (reading verifier/*.jsonl only). Skips runs with
+    no manifest. Called from the report.html GET (rare, never a hot path) and
+    `_reconcile_reportwriter`; never raises. Returns the number of NEW findings."""
+    if not engagement_id:
+        return 0
+    eng = engagement if engagement is not None else _read_engagement(engagement_id)
+    if not eng:
+        return 0
+    added = 0
+    for rid in (eng.get("run_ids") or []):
+        if not rid or not _read_run_meta(rid):
+            continue
+        try:
+            added += _merge_confirmed_findings_into_engagement(engagement_id, rid)
+        except Exception as exc:
+            logger.warning("harvest_late_verdicts[%s] run %s failed: %s",
+                           engagement_id, rid, exc)
+    if added:
+        logger.info("harvest_late_verdicts[%s]: %d late confirmed finding(s) merged",
+                    engagement_id, added)
+    return added
+
+
 @router.post("/engagements/{engagement_id}/findings")
 async def create_finding(engagement_id: str, req: FindingCreate) -> Dict[str, Any]:
     _valid_token(engagement_id, "engagement_id")
     eng = _read_engagement(engagement_id)
     if not eng:
         raise HTTPException(status_code=404, detail="Engagement not found")
-    fid = _new_id()
-    now = _now_iso()
-    finding = {**req.dict(), "id": fid, "engagement_id": engagement_id,
-               "created_at": now, "updated_at": now}
-    _add_finding(eng, finding)
-    _write_engagement(engagement_id, eng)
+    # Serialize the read-modify-write against harvest/reconcile/report paths
+    # that hold the same per-engagement lock (8c2f1a postmortem defect).
+    async with _engagement_lock(engagement_id):
+        eng = _read_engagement(engagement_id) or eng
+        fid = _new_id()
+        now = _now_iso()
+        finding = {**req.dict(), "id": fid, "engagement_id": engagement_id,
+                   "created_at": now, "updated_at": now}
+        _add_finding(eng, finding)
+        _write_engagement(engagement_id, eng)
+    _invalidate_report_cache(engagement_id)
     return {"engagement": _public(eng), "finding": finding}
 
 
@@ -5027,15 +5085,20 @@ async def update_finding(engagement_id: str, finding_id: str, req: FindingUpdate
     eng = _read_engagement(engagement_id)
     if not eng:
         raise HTTPException(status_code=404, detail="Engagement not found")
-    findings = eng.get("findings") or []
-    for f in findings:
-        if f.get("id") == finding_id:
-            for k, v in req.dict(exclude_unset=True).items():
-                f[k] = v
-            f["updated_at"] = _now_iso()
-            eng["updated_at"] = _now_iso()
-            _write_engagement(engagement_id, eng)
-            return {"engagement": _public(eng), "finding": f}
+    # Serialize the read-modify-write against harvest/reconcile/report paths
+    # (same per-engagement lock).
+    async with _engagement_lock(engagement_id):
+        eng = _read_engagement(engagement_id) or eng
+        findings = eng.get("findings") or []
+        for f in findings:
+            if f.get("id") == finding_id:
+                for k, v in req.dict(exclude_unset=True).items():
+                    f[k] = v
+                f["updated_at"] = _now_iso()
+                eng["updated_at"] = _now_iso()
+                _write_engagement(engagement_id, eng)
+                _invalidate_report_cache(engagement_id)
+                return {"engagement": _public(eng), "finding": f}
     raise HTTPException(status_code=404, detail="Finding not found")
 
 
@@ -5046,9 +5109,14 @@ async def delete_finding(engagement_id: str, finding_id: str) -> Dict[str, Any]:
     eng = _read_engagement(engagement_id)
     if not eng:
         raise HTTPException(status_code=404, detail="Engagement not found")
-    eng["findings"] = [f for f in (eng.get("findings") or []) if f.get("id") != finding_id]
-    eng["updated_at"] = _now_iso()
-    _write_engagement(engagement_id, eng)
+    # Serialize the read-modify-write against harvest/reconcile/report paths
+    # (same per-engagement lock).
+    async with _engagement_lock(engagement_id):
+        eng = _read_engagement(engagement_id) or eng
+        eng["findings"] = [f for f in (eng.get("findings") or []) if f.get("id") != finding_id]
+        eng["updated_at"] = _now_iso()
+        _write_engagement(engagement_id, eng)
+    _invalidate_report_cache(engagement_id)
     return {"engagement": _public(eng)}
 
 
@@ -5293,6 +5361,19 @@ _RE_MEMORY_NOTE = re.compile(
     r"|\$RUN_ID/memory"                     # memory path reference
     r"|\(Phase\s+\d",                       # "(Phase N …)" tag on a memory header
     re.I | re.M)
+# 8c2f1a postmortem (ALSO): a `cat >> .../memory/MEMORY.md` BOOKKEEPING command
+# whose body is a pipe-record dump (AUTH_ENDPOINT|…, IDOR_BOLA|…) became a
+# critical-severity finding titled "Append phase 4 findings to memory" — the
+# pipe records carry vuln-class words (IDOR_BOLA), so the vuln-class branch of
+# _has_finding_substance admitted them. An emission whose COMMAND targets the
+# agent's memory store is only a finding when its body carries an AUTHORITATIVE
+# finding marker (FINDING[ / CLAIM[ / VERDICT: / OK TO REPORT / CONFIRMED-by-
+# verifier) — the vuln-class fallback alone must never promote memory notes.
+_RE_MEMORY_BOOKKEEPING = re.compile(r"/memory/", re.I)
+# The authoritative-finding-marker branch of _has_finding_substance, standalone.
+_RE_FINDING_MARKER = re.compile(
+    r"CLAIM\s*\[|FINDING\s*\[|CONFIRMED\s+by\s+coder56_verifier|"
+    r"NOT_A_VULN|OK\s+TO\s+REPORT|VERDICT\s*[:=]", re.I)
 
 
 def _has_finding_substance(c: Dict[str, Any]) -> bool:
@@ -5302,8 +5383,7 @@ def _has_finding_substance(c: Dict[str, Any]) -> bool:
     vuln-class. A bare note like "ENV RESET… DB wiped" that merely contains the
     words "false positive" in passing is NOT a finding and is dropped."""
     body = c["body"]
-    if re.search(r"CLAIM\s*\[|FINDING\s*\[|CONFIRMED\s+by\s+coder56_verifier|"
-                 r"NOT_A_VULN|OK\s+TO\s+REPORT|VERDICT\s*[:=]", body, re.I):
+    if _RE_FINDING_MARKER.search(body):
         return True
     # A phase memory note is recon/negative-result prose, not a finding — never
     # let a bare vuln-class word promote it (the original garbage-draft bug).
@@ -5404,6 +5484,15 @@ def _extract_emission_findings(run_id: str) -> List[Dict[str, Any]]:
     for v in verdicts:
         cmd = str(v.get("command") or "")
         if not _RE_EMISSION.search(cmd):
+            continue
+        # Memory-bookkeeping commands (cat >> .../memory/MEMORY.md) are the agent
+        # persisting ITS OWN running notes, not reporting a finding. Drop the ones
+        # whose body carries NO authoritative finding marker — their pipe-record
+        # dump (IDOR_BOLA|…) would otherwise be promoted into a bogus finding by
+        # the vuln-class fallback in _has_finding_substance (8c2f1a: a critical
+        # "Append phase 4 findings to memory"). A structured FINDING[/CLAIM[
+        # write-up that happens to live in MEMORY.md IS a finding and is kept.
+        if _RE_MEMORY_BOOKKEEPING.search(cmd) and not _RE_FINDING_MARKER.search(cmd):
             continue
         # One emission can consolidate SEVERAL findings (a MEMORY.md write-up with
         # multiple "- FINDING [NEW-N]" blocks). Split those so each becomes its own
@@ -6284,6 +6373,23 @@ def _draft_findings_inprocess(engagement: Dict[str, Any],
     return list(merged.values())
 
 
+def _finding_is_refuted(f: Dict[str, Any]) -> bool:
+    """True when the verifier explicitly REFUTED this finding (8c2f1a postmortem
+    defect 3). Refuted = NOT a verifier-CONFIRMED finding AND the verifier left a
+    negative verdict (NOT_A_VULN / INCONCLUSIVE / NOT_CONFIRMABLE / FALSE
+    POSITIVE / ok_to_report=NO) on it. A merely UNVERIFIED claim (verified False,
+    empty verdict — an emission claim the verifier never looked at) is NOT
+    refuted and stays addable; only an explicit refutation excludes it."""
+    if f.get("verified") is True:
+        return False
+    vv = str(f.get("verifier_verdict") or "").upper()
+    if "OK TO REPORT: NO" in vv or "OK_TO_REPORT: NO" in vv:
+        return True
+    return any(tok in vv for tok in
+               ("NOT_A_VULN", "INCONCLUSIVE", "NOT_CONFIRMABLE",
+                "FALSE POSITIVE", "REFUTED", "RULED OUT"))
+
+
 def _coerce_reporter_findings(raw_findings: List[Any]) -> List[Dict[str, Any]]:
     """Normalize merged finding dicts into FindingCreate-shaped suggestions. Does
     NOT raise on empty — a genuinely finding-less set is a valid (if uninteresting)
@@ -6491,18 +6597,33 @@ async def draft_findings(engagement_id: str, req: FindingsDraftRequest) -> Dict[
 
     findings = _coerce_reporter_findings(_draft_findings_inprocess(eng, live_runs))
     findings = _sort_findings(findings)
+    # 8c2f1a postmortem defect 3: a REFUTED finding (verifier NOT_A_VULN /
+    # ok_to_report=NO — e.g. the IDOR refutation) was offered as an "Add"-able
+    # suggestion and the operator added it to the client-facing ledger. Refuted
+    # findings are NOT addable; they are returned under `refuted` so the audit
+    # trail (what was tested and ruled out) stays visible without being saved.
+    refuted = [f for f in findings if _finding_is_refuted(f)]
+    findings = [f for f in findings if not _finding_is_refuted(f)]
     coverage = _coverage(eng, findings, engagement_id)
     coverage_ledger = _surface_coverage(engagement_id, findings)
     confirmed = sum(1 for f in findings if f.get("verified"))
     if not findings:
-        return {"findings": [], "coverage": coverage, "coverage_ledger": coverage_ledger,
+        refuted_note = (f" ({len(refuted)} refuted finding(s) excluded — see 'refuted')"
+                        if refuted else "")
+        return {"findings": [], "refuted": refuted, "coverage": coverage,
+                "coverage_ledger": coverage_ledger,
                 "note": (f"No findings found across {len(live_runs)} run(s)"
                          + (f" for {req.owasp_id}" if req.owasp_id else "")
-                         + " — neither verifier verdicts nor emission logs produced a CONFIRMED/claimed finding.")}
+                         + " — neither verifier verdicts nor emission logs produced a CONFIRMED/claimed finding."
+                         + refuted_note)}
     note = (f"Drafted {len(findings)} finding(s) ({confirmed} verifier-confirmed) from "
             f"{len(live_runs)} run(s)" + (f" for {req.owasp_id}" if req.owasp_id else "")
             + " — review, edit, and save the ones you keep.")
-    return {"findings": findings, "coverage": coverage, "coverage_ledger": coverage_ledger, "note": note}
+    if refuted:
+        note += (f" {len(refuted)} refuted finding(s) (NOT_A_VULN / ok_to_report=NO) excluded "
+                 "from suggestions; see 'refuted' for the audit trail.")
+    return {"findings": findings, "refuted": refuted, "coverage": coverage,
+            "coverage_ledger": coverage_ledger, "note": note}
 
 
 # =============================================================================
@@ -6603,11 +6724,30 @@ async def _run_reportwriter_agent(engagement_id: str, eng: Dict[str, Any],
     out_rel = f"engagements/{engagement_id}.report.json"
     out_host = OUTPUTS_DIR / out_rel
     out_container = f"/outputs/{out_rel}"
+    # 8c2f1a postmortem defect 4c: do NOT unlink the previous report.json up
+    # front. Unlinking at the start and then hanging left new input + stale HTML
+    # + no JSON. The agent overwrites the output path itself; a previous report
+    # is left intact if this pass fails, so the worst case is "old report", not
+    # "no report". Completion is detected by the file CHANGING (or appearing),
+    # so a leftover previous report cannot false-positive as fresh output.
     try:
         out_host.parent.mkdir(parents=True, exist_ok=True)
-        out_host.unlink(missing_ok=True)
+        _prev_stat = out_host.stat() if out_host.exists() else None
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Report setup failed (output path): {exc}")
+    _prev_ident = (_prev_stat.st_ino, _prev_stat.st_mtime_ns, _prev_stat.st_size) if _prev_stat else None
+
+    def _output_ready() -> bool:
+        """True once the agent's output differs from (or appears after) whatever
+        report.json was there before the pass started."""
+        try:
+            if not out_host.exists():
+                return False
+            st = out_host.stat()
+        except OSError:
+            return False
+        return ((st.st_ino, st.st_mtime_ns, st.st_size) != _prev_ident
+                if _prev_stat is not None else True)
 
     try:
         container_id = await _ensure_sandbox()
@@ -6660,7 +6800,7 @@ async def _run_reportwriter_agent(engagement_id: str, eng: Dict[str, Any],
     appeared = False
     while time.monotonic() < deadline:
         await asyncio.sleep(5)
-        if out_host.exists():
+        if _output_ready():
             appeared = True
             break
         try:
@@ -6783,6 +6923,22 @@ async def _reconcile_reportwriter(engagement_id: str, *, force: bool = False) ->
         json_path = out_dir / f"{engagement_id}.report.json"
         html_path = out_dir / f"{engagement_id}.report.html"
 
+        # 8c2f1a postmortem defect 2: harvest LATE verifier verdicts BEFORE the
+        # findings gate below, so a ghost verifier's CONFIRMED finding (written
+        # hours after the lead-driver exit) reaches the ledger and this pass
+        # regenerates the report instead of finding "no findings" and skipping.
+        # Idempotent: the merge skips existing dedup keys, so a re-run of this
+        # reconcile adds nothing and the staleness gate stays closed. The
+        # engagement lock mirrors the lead-driver exit hook's read-merge-write.
+        try:
+            async with _engagement_lock(engagement_id):
+                harvested = _harvest_late_verdicts(engagement_id, eng)
+            if harvested:
+                eng = _read_engagement(engagement_id) or eng
+        except Exception as exc:
+            logger.warning("reconcile_reportwriter[%s] harvest failed: %s",
+                           engagement_id, exc)
+
         # Gather findings: saved first, else draft in-process from run artifacts
         # (so the report is never empty when runs produced CONFIRMED verdicts).
         findings = eng.get("findings") or []
@@ -6806,6 +6962,26 @@ async def _reconcile_reportwriter(engagement_id: str, *, force: bool = False) ->
                 needs_run = True
         if not needs_run:
             regenerated = False
+            # The agent JSON is fresh — but the cached report.html may have been
+            # rendered by an OLDER renderer (schema fixes, e.g. the
+            # description/impact/evidence/recommendation finding-body mapping and
+            # the nested crown-jewel coverage shape landed 2026-08-17). Re-render
+            # from the existing agent JSON whenever report.html is older than
+            # report.json; no agent call, cheap and idempotent.
+            try:
+                if json_path.exists() and (
+                        not html_path.exists()
+                        or html_path.stat().st_mtime < json_path.stat().st_mtime):
+                    report = json.loads(json_path.read_text(encoding="utf-8"))
+                    detail = _engagement_detail(eng)
+                    verdicts_by_run = {rid: _read_verdicts_raw(rid, 200)
+                                       for rid in (eng.get("run_ids") or [])}
+                    html = render_client_report(eng, report, detail["runs"],
+                                                mitre_catalog(), verdicts_by_run)
+                    html_path.write_text(html, encoding="utf-8")
+            except Exception as exc:
+                logger.warning("reconcile_reportwriter[%s] re-render failed: %s",
+                               engagement_id, exc)
         else:
             # Always (re)write the agent input from the CURRENT findings so the
             # input is never stale relative to a saved-finding edit.
@@ -6899,12 +7075,48 @@ async def write_engagement_report(engagement_id: str) -> HTMLResponse:
 async def engagement_report(engagement_id: str) -> HTMLResponse:
     """Serve the client-ready report: the agent-authored version if it has been
     generated (POST .../report/write) and cached, else the deterministic fallback.
-    Self-contained, print-ready; the user prints / saves as PDF via the toolbar."""
+    Self-contained, print-ready; the user prints / saves as PDF via the toolbar.
+
+    8c2f1a postmortem defects 2 + 4: before serving a cached report this runs an
+    idempotent late-verdict harvest (a ghost verifier can append CONFIRMED
+    verdicts hours after the lead-driver exit — they were never picked up) and
+    treats a cache older than the engagement's findings as stale. Both are
+    cheap (jsonl reads + a stat) and this endpoint is called rarely, so they do
+    not sit in any hot path."""
     _valid_token(engagement_id, "engagement_id")
     eng = _read_engagement(engagement_id)
     if not eng:
         raise HTTPException(status_code=404, detail="Engagement not found")
-    cached = OUTPUTS_DIR / "engagements" / f"{engagement_id}.report.html"
+    # Defect 2: re-harvest late verifier verdicts into the ledger. When new
+    # findings land, re-read the engagement so the regenerated report includes
+    # them (and invalidate the cache below so it cannot be served stale). The
+    # engagement lock mirrors the lead-driver exit hook's read-merge-write.
+    try:
+        async with _engagement_lock(engagement_id):
+            harvested = _harvest_late_verdicts(engagement_id, eng)
+        if harvested:
+            eng = _read_engagement(engagement_id) or eng
+            _invalidate_report_cache(engagement_id)
+    except Exception as exc:
+        logger.warning("report_html[%s] late-verdict harvest failed: %s", engagement_id, exc)
+    cached, _report_json = _report_cache_paths(engagement_id)
+    # Defect 4b: a cache older than the engagement's FINDINGS is stale —
+    # regenerate. The newest finding timestamp (not engagement.updated_at) is the
+    # signal: updated_at also moves on metadata-only writes (a status advance
+    # that follows report generation), which would wrongly discard a fresh
+    # agent-authored report. Finding-create/update/delete additionally unlink the
+    # cache outright (see the findings handlers).
+    if cached.exists():
+        try:
+            finding_ts = max(
+                (_parse_iso_ts(str(f.get("updated_at") or f.get("created_at") or "")) or 0)
+                for f in (eng.get("findings") or [])
+            ) if (eng.get("findings") or []) else 0
+            if finding_ts and cached.stat().st_mtime < finding_ts:
+                _invalidate_report_cache(engagement_id)
+                cached, _report_json = _report_cache_paths(engagement_id)
+        except (OSError, ValueError):
+            pass
     if cached.exists():
         return HTMLResponse(cached.read_text(encoding="utf-8", errors="ignore"))
     detail = _engagement_detail(eng)

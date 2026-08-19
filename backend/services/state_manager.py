@@ -343,11 +343,30 @@ class StateManager:
 
         Args:
             operation: Operation dict with type, target, timestamp, etc.
+
+        Dedupes on (operation_type, topology_id, host_id, agents_needed) —
+        the periodic reconciler re-emits the same recreate intents forever
+        (nothing removes them once the topology/host is gone), which grew
+        the state file to 18MB+/54k entries and wedged the event loop on
+        the sync json parse of every request.
         """
         state = self._read_state()
 
         if "reconciliation" not in state:
             state["reconciliation"] = self._get_default_state()["reconciliation"]
+
+        def _key(op: Dict[str, Any]):
+            return (
+                op.get("operation_type"),
+                op.get("topology_id"),
+                op.get("host_id"),
+                tuple(op.get("agents_needed") or []),
+            )
+
+        new_key = _key(operation)
+        pending = state["reconciliation"]["pending_operations"]
+        if any(isinstance(existing, dict) and _key(existing) == new_key for existing in pending):
+            return  # already queued — don't inflate the queue
 
         operation["added_at"] = datetime.utcnow().isoformat()
         state["reconciliation"]["pending_operations"].append(operation)

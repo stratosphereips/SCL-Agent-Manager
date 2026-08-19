@@ -7,8 +7,10 @@ container operations, session handling, and state reconciliation.
 """
 
 import asyncio
+import faulthandler
 import logging
 import os
+import signal
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Dict, Any, Optional, Set
@@ -54,6 +56,14 @@ from .routers.reconciliation import get_reconciliation_service
 # =============================================================================
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+# Dump all thread stacks on SIGUSR1 so a wedged event loop can be diagnosed
+# from outside the container (docker kill -s USR1 <container>). Works even when
+# the loop is fully blocked — faulthandler runs on a dedicated thread.
+try:
+    faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+except (ValueError, OSError):  # not main thread / unsupported platform
+    pass
 RECONCILE_INTERVAL_SECONDS = int(os.getenv("RECONCILE_INTERVAL_SECONDS", "300"))  # 5 minutes
 IMAGE_BUILD_INTERVAL_SECONDS = int(os.getenv("IMAGE_BUILD_INTERVAL_SECONDS", "3600"))  # 1 hour
 # The defender auto_responder is a no-op when no topology has the defender enabled,

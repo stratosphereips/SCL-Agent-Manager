@@ -523,10 +523,27 @@ RISK_COLORS = {
 }
 
 
-def _risk_badge(risk: str) -> str:
-    r = (risk or "").strip().capitalize()
+def _risk_badge(risk, tally: Dict[str, int] = None) -> str:
+    # The glm reportwriter may emit overall_risk as a plain string ("Critical"),
+    # an object {"rating": ..., "rationale": ...} — or free prose ("HIGH /
+    # CRITICAL. The ..."), because the agent writes narrative before the badge.
+    # Accept both structured forms; when the value is unrecognized prose, scan
+    # it for a risk word (most severe wins) instead of silently defaulting to
+    # Medium — a prose "HIGH / CRITICAL" must not badge as Medium.
+    if isinstance(risk, dict):
+        risk = risk.get("rating") or ""
+    text = (risk or "").strip()
+    r = text.capitalize()
+    if r not in RISK_COLORS and text:
+        lowered = text.lower()
+        for band in ("critical", "high", "medium", "low"):
+            if band in lowered:
+                r = band.capitalize()
+                break
     if r not in RISK_COLORS:
-        r = "Medium"
+        # Last resort: derive the band from the findings tally (any Critical
+        # finding => Critical; else the worst present severity).
+        r = next((s.capitalize() for s in SEV_ORDER if (tally or {}).get(s)), "Medium")
     fg, bg = RISK_COLORS[r]
     return f'<span class="sev" style="background:{bg};color:{fg}">Overall risk: {r}</span>'
 
@@ -542,7 +559,7 @@ def _client_exec_summary(report: Dict[str, Any], tally: Dict[str, int]) -> str:
         f'<span class="chip" style="background:{SEV_COLORS[s][1]};color:{SEV_COLORS[s][0]}">'
         f'{tally[s]} {s.upper()}</span>' for s in SEV_ORDER if tally.get(s))
     parts = [f"<p>{_md(report.get('executive_summary'))}</p>",
-             f"<p>{_risk_badge(report.get('overall_risk'))}</p>"]
+             f"<p>{_risk_badge(report.get('overall_risk'), tally)}</p>"]
     if report.get("overall_risk_rationale"):
         parts.append(f"<p><b>Risk rationale.</b> {_md(report.get('overall_risk_rationale'))}</p>")
     if chips:
@@ -560,10 +577,126 @@ def _client_scope(eng: Dict[str, Any]) -> str:
 
 
 def _client_methodology(report: Dict[str, Any]) -> str:
-    md = report.get("methodology_summary")
+    md = report.get("methodology_summary") or report.get("methodology")
     if not md:
-        return ""
+        # The reportwriter may omit methodology (it focuses on findings).
+        # Emit the standard house methodology so section numbering stays
+        # contiguous rather than silently dropping section 3.
+        md = ("Phased grey-box web-application assessment: attack-surface mapping "
+              "and technology fingerprinting; threat-model-driven coverage by crown "
+              "jewel across authenticated roles; targeted vulnerability validation "
+              "(injection, authentication, authorization/business-logic and "
+              "information-disclosure classes) with per-claim independent "
+              "verification against the live target; marker-tagged (non-destructive) "
+              "mutations only. Every reported finding carries the decisive evidence "
+              "and exact reproduction steps; claims that failed verification are "
+              "excluded from this report.")
     return f'<section><h2 class="sec">3. Methodology</h2>{_md(md)}</section>'
+
+
+def _client_coverage(report: Dict[str, Any], engagement: Dict[str, Any],
+                     findings: List[Dict[str, Any]], number: str = "4") -> str:
+    """Surface-coverage section from the report-writer agent's `coverage_ledger`
+    rendering: the agent emits `coverage_matrix` (one row per threat-model
+    crown jewel), `attack_paths` and `coverage_gaps`. Rendered when the agent
+    supplied them; falls back to `_owasp_coverage` (the per-OWASP-category plan
+    matrix) — the client report uses whichever source of truth the engagement
+    actually has."""
+    # The glm reportwriter emits coverage_matrix as a NESTED object:
+    # {"crown_jewels": [{id, name, affected_asset, verdict, linked_findings,
+    #   sub_surfaces: {<group>: [{method, path, role, params, status,
+    #   outcome, evidence}]}, totals}], "coverage_gaps": [...],
+    # "cross_cutting_defense_in_depth": [...], "observations_below_reporting_threshold": [...],
+    # "ledger_totals": {...}}. Older shapes used a flat row list. Normalize both.
+    cm = report.get("coverage_matrix")
+    nested_cj: List[Dict[str, Any]] = []
+    nested_gaps: List[Any] = []
+    if isinstance(cm, dict):
+        nested_cj = [c for c in (cm.get("crown_jewels") or []) if isinstance(c, dict)]
+        nested_gaps = list(cm.get("coverage_gaps") or [])
+    matrix = [m for m in (cm if isinstance(cm, list) else [])
+              if isinstance(m, dict) and (m.get("crown_jewel") or m.get("asset"))]
+    paths = [p for p in (report.get("attack_paths") or []) if isinstance(p, dict)]
+    gaps = [g for g in (report.get("coverage_gaps") or nested_gaps) if isinstance(g, dict)]
+    if not (matrix or paths or gaps or nested_cj):
+        return _owasp_coverage(engagement, findings, number=number)
+    blocks = []
+    if nested_cj:
+        # Per-crown-jewel card: verdict line + sub-surface coverage table.
+        for cj in nested_cj:
+            refs = ", ".join(str(r) for r in (cj.get("linked_findings") or [])) or "—"
+            sub_rows = []
+            for group, items in (cj.get("sub_surfaces") or {}).items():
+                if not isinstance(items, list):
+                    continue
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    sub_rows.append(
+                        f"<tr><td>{_escape(str(group))}</td>"
+                        f"<td class='mono'>{_escape(str(it.get('method') or ''))} {_escape(str(it.get('path') or '—'))}</td>"
+                        f"<td>{_escape(str(it.get('role') or '—'))}</td>"
+                        f"<td>{_escape(str(it.get('status') or '—'))}</td>"
+                        f"<td>{_escape(str(it.get('outcome') or it.get('evidence') or '—'))}</td></tr>")
+            blocks.append(
+                f"<h3>{_escape(str(cj.get('id') or ''))} — {_escape(str(cj.get('name') or 'Crown jewel'))}</h3>"
+                f"<p><b>Asset:</b> <span class='mono'>{_escape(str(cj.get('affected_asset') or '—'))}</span>"
+                f" &nbsp; <b>Verdict:</b> {_escape(str(cj.get('verdict') or '—'))}"
+                f" &nbsp; <b>Findings:</b> {_escape(refs)}</p>"
+                + (f'<table><thead><tr><th>Sub-surface</th><th>Element</th><th>Role</th>'
+                   f'<th>Status</th><th>Outcome</th></tr></thead><tbody>{"".join(sub_rows)}</tbody></table>'
+                   if sub_rows else ""))
+        for label, key in (("Cross-cutting defense-in-depth observations", "cross_cutting_defense_in_depth"),
+                           ("Observations below reporting threshold", "observations_below_reporting_threshold")):
+            items = [o for o in (cm.get(key) or []) if isinstance(o, dict)]
+            if items:
+                blocks.append(f"<h3>{label}</h3><ul>" + "".join(
+                    f"<li>{_md(str(o.get('observation') or o.get('note') or next(iter(o.values()), '')))}</li>"
+                    for o in items) + "</ul>")
+        lt = cm.get("ledger_totals")
+        if isinstance(lt, dict) and lt:
+            blocks.append("<h3>Coverage ledger totals</h3><p class='muted'>"
+                          + ", ".join(f"{_escape(str(k))}: {_escape(str(v))}"
+                                      for k, v in lt.items()) + "</p>")
+    if matrix:
+        rows = []
+        for m in matrix:
+            refs = ", ".join(str(r) for r in (m.get("verified_findings") or [])) or "—"
+            rows.append(
+                f"<tr><td><b>{_escape(str(m.get('crown_jewel') or '—'))}</b></td>"
+                f"<td>{_escape(str(m.get('asset') or '—'))}</td>"
+                f"<td>{_escape(str(m.get('surface_elements_examined') or '—'))}</td>"
+                f"<td>{_escape(str(m.get('outcome') or '—'))}</td>"
+                f"<td>{_escape(refs)}</td></tr>")
+        blocks.append(
+            f'<h3>Coverage matrix (attack surface examined, by crown jewel)</h3>'
+            f'<table><thead><tr><th>Crown jewel</th><th>Assets</th><th>Surface elements</th>'
+            f'<th>Outcome</th><th>Findings</th></tr></thead><tbody>{"".join(rows)}</tbody></table>')
+        notable = [str(n) for m in matrix for n in (m.get("notable") or []) if str(n).strip()]
+        if notable:
+            blocks.append('<h3>Notable observations</h3><ul>'
+                          + "".join(f"<li>{_md(n)}</li>" for n in notable) + "</ul>")
+    if paths:
+        blocks.append("<h3>Attack paths</h3>")
+        for p in paths:
+            steps = "".join(
+                f"<li><b>Step {s.get('step', i + 1)}.</b> {_escape(str(s.get('action') or ''))}"
+                f" <span class='muted'>→ {_escape(str(s.get('result') or ''))}</span></li>"
+                for i, s in enumerate([s for s in (p.get("steps") or []) if isinstance(s, dict)]))
+            refs = ", ".join(str(r) for r in (p.get("finding_refs") or [])) or "—"
+            blocks.append(
+                f"<p><b>{_escape(str(p.get('id') or ''))} {_escape(str(p.get('name') or ''))}</b>"
+                f" <span class='muted'>(findings: {_escape(refs)})</span></p>"
+                + (f"<ol>{steps}</ol>" if steps else ""))
+    if gaps:
+        blocks.append("<h3>Coverage gaps (not verified clean)</h3><ul>"
+                      + "".join(
+                          f"<li><b>{_escape(str(g.get('surface') or '—'))}</b> — "
+                          f"{_md(str(g.get('observation') or ''))} "
+                          f"<span class='muted'>Gap: {_escape(str(g.get('why_gap') or '—'))}</span></li>"
+                          for g in gaps) + "</ul>")
+    return (f'<section><h2 class="sec">{number}. Coverage, Attack Paths &amp; Gaps</h2>'
+            + "".join(blocks) + "</section>")
 
 
 def _client_findings(findings: List[Dict[str, Any]]) -> str:
@@ -577,6 +710,16 @@ def _client_findings(findings: List[Dict[str, Any]]) -> str:
         cvss = f"{float(cvss):.1f}" if _is_num(cvss) else "—"
         oid = f.get("owasp_id")
         oid_html = f'<span class="owasp">OWASP {_escape(oid)}</span>' if oid else ""
+        # The reporter agent emits description/impact/evidence/recommendation
+        # (the schema baked into coder56_reporter.md and every backend
+        # extraction path); older/internal shapes used what_it_is/business_
+        # impact/proof/remediation. Accept both — first non-empty wins.
+        def _f(*keys: str):
+            for k in keys:
+                v = f.get(k)
+                if v and str(v).strip():
+                    return v
+            return None
         cards.append(f"""
 <div class="finding" style="border-left-color:{SEV_COLORS.get(sev, SEV_COLORS['info'])[0]}">
   <div class="head">
@@ -585,17 +728,17 @@ def _client_findings(findings: List[Dict[str, Any]]) -> str:
   </div>
   <div class="asset"><b>Affected asset:</b> {_escape(f.get('affected_asset') or '—')}</div>
   <dl class="meta">
-    {_meta_row('What it is', f.get('what_it_is'))}
-    {_meta_row('Why it matters', f.get('business_impact'))}
-    {_meta_row('How we proved it', f.get('proof'))}
-    {_meta_row('How to fix', f.get('remediation'))}
+    {_meta_row('What it is', _f('what_it_is', 'description'))}
+    {_meta_row('Why it matters', _f('business_impact', 'impact'))}
+    {_meta_row('How we proved it', _f('proof', 'evidence'))}
+    {_meta_row('How to fix', _f('remediation', 'recommendation'))}
   </dl>
 </div>""")
     return f'<section><h2 class="sec">5. Findings</h2>{"".join(cards)}</section>'
 
 
 def _client_conclusion(report: Dict[str, Any]) -> str:
-    c = report.get("conclusion")
+    c = report.get("conclusion") or report.get("executive_summary")
     if not c:
         return ""
     return f'<section><h2 class="sec">6. Conclusion</h2>{_md(c)}</section>'
@@ -617,7 +760,7 @@ def render_client_report(engagement: Dict[str, Any], report: Dict[str, Any],
         + _client_exec_summary(report, tally)
         + _client_scope(engagement)
         + _client_methodology(report)
-        + _owasp_coverage(engagement, findings, number="4")
+        + _client_coverage(report, engagement, findings, number="4")
         + _client_findings(findings)
         + _client_conclusion(report)
         + _appendix(runs, verdicts_by_run)

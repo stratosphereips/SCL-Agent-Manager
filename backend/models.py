@@ -1018,6 +1018,7 @@ class GoalCompileRequest(BaseModel):
     rules_of_engagement: str = Field(default="")
     phases: List[MitrePhaseSelection] = Field(default_factory=list)
     stop_conditions: str = Field(default="")
+    credentials: str = Field(default="", description="Pre-existing owned/seeded credentials, injected into the directive (lead + all phases).")
 
 
 class GoalDirective(BaseModel):
@@ -1291,6 +1292,7 @@ class EngagementCreate(BaseModel):
     # canary_hash/banner_fragments/captured_at. Empty dict = operator left it blank;
     # Phase 0 chooses a marker and populates it.
     target_fingerprint: Dict[str, Any] = Field(default_factory=dict)
+    credentials: str = Field(default="", description="Seeded/owned credentials for this engagement (injected into every run's directive).")
 
 
 class Engagement(EngagementCreate):
@@ -1316,6 +1318,7 @@ class EngagementUpdate(BaseModel):
     roe: Optional[str] = None
     status: Optional[EngagementStatus] = None
     target_fingerprint: Optional[Dict[str, Any]] = None
+    credentials: Optional[str] = None
 
 
 class FindingUpdate(BaseModel):

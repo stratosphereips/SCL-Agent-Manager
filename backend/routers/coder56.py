@@ -4014,6 +4014,11 @@ def _compile_directive(req: GoalCompileRequest) -> str:
         lines.append("")
         lines.append("AUTHORIZED SCOPE (target ONLY — all activity must stay within this):")
         lines.append(req.target.strip())
+    if req.credentials.strip():
+        lines.append("")
+        lines.append("SEEDED CREDENTIALS (pre-existing OWNED credentials — authenticate with these; "
+                     "never guess passwords or create accounts):")
+        lines.append(req.credentials.strip())
     if req.rules_of_engagement.strip():
         lines.append("")
         lines.append("RULES OF ENGAGEMENT:")
@@ -4560,6 +4565,12 @@ def _compile_owasp_directive(pr: Dict[str, Any], eng: Dict[str, Any]) -> str:
         lines.append("")
         lines.append("AUTHORIZED SCOPE (target ONLY — all activity must stay within this):")
         lines.append(target)
+    creds = (eng.get("credentials") or "").strip()
+    if creds:
+        lines.append("")
+        lines.append("SEEDED CREDENTIALS (pre-existing OWNED credentials — authenticate with these; "
+                     "never guess passwords or create accounts):")
+        lines.append(creds)
     roe = (eng.get("roe") or "").strip()
     if roe:
         lines.append("")

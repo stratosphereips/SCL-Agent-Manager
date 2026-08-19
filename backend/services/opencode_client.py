@@ -28,10 +28,29 @@ from ..models import (
     SessionMetrics,
     SessionState,
 )
+from .docker_client import create_docker_client
 
 # Track networks we've already connected to avoid repeated commands
 _CONNECTED_NETWORKS: Set[str] = set()
 _AGENT_MANAGER_CONTAINER = os.getenv("AGENT_MANAGER_CONTAINER_NAME", "scl-agent-manager-dashboard")
+
+
+async def _agent_manager_networks() -> set:
+    """Return the network names the agent-manager container is ACTUALLY attached
+    to right now, via the docker socket (the dashboard container has no `docker`
+    CLI, so the old subprocess path silently no-op'd). Used to verify
+    connectivity without trusting the in-memory _CONNECTED_NETWORKS cache: a
+    topology recreate (compose down/up) severs this out-of-band attachment, but
+    the cache would still claim we're joined — the dashboard then can't reach the
+    host's opencode on :4096 and the launch 504s on readiness."""
+    try:
+        async with create_docker_client() as docker:
+            me = await docker.docker.containers.get(_AGENT_MANAGER_CONTAINER)
+            info = await me.show()
+        nets = (info.get("NetworkSettings") or {}).get("Networks") or {}
+        return set(nets.keys())
+    except Exception:
+        return set()
 
 
 logger = logging.getLogger(__name__)
@@ -90,67 +109,39 @@ async def _ensure_network_connectivity(container_id: str) -> bool:
     global _CONNECTED_NETWORKS
 
     try:
-        # Get container info to find its network
-        inspect_cmd = [
-            "docker", "inspect", container_id,
-            "--format", "{{json .NetworkSettings.Networks}}"
-        ]
+        async with create_docker_client() as docker:
+            # Target container's network (topology containers typically have one).
+            target = await docker.docker.containers.get(container_id)
+            target_info = await target.show()
+            networks = (target_info.get("NetworkSettings") or {}).get("Networks") or {}
+            if not networks:
+                logger.debug(f"Container {container_id[:12]} has no networks")
+                return False
+            network_name = next(iter(networks.keys()))
 
-        result = subprocess.run(
-            inspect_cmd,
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-
-        if result.returncode != 0:
-            logger.debug(f"Could not inspect container {container_id[:12]}: {result.stderr}")
-            return False
-
-        import json
-        networks = json.loads(result.stdout)
-
-        # Get the first network (topology containers typically have one network)
-        if not networks:
-            logger.debug(f"Container {container_id[:12]} has no networks")
-            return False
-
-        network_name = list(networks.keys())[0]
-
-        # Skip if we're already connected to this network
-        if network_name in _CONNECTED_NETWORKS:
-            logger.debug(f"Already connected to network {network_name}")
-            return True
-
-        # Connect agent-manager to this network
-        logger.info(f"Connecting agent-manager to network {network_name}")
-
-        connect_cmd = [
-            "docker", "network", "connect", network_name, _AGENT_MANAGER_CONTAINER
-        ]
-
-        result = subprocess.run(
-            connect_cmd,
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-
-        if result.returncode == 0:
-            _CONNECTED_NETWORKS.add(network_name)
-            logger.info(f"Successfully connected to network {network_name}")
-            return True
-        else:
-            # Already connected is not an error
-            if "already connected" in result.stderr.lower():
+            # Skip only if ACTUALLY connected (the cache is stale after a topology
+            # recreate severs the out-of-band attachment — see _agent_manager_networks).
+            if network_name in await _agent_manager_networks():
                 _CONNECTED_NETWORKS.add(network_name)
                 return True
-            logger.warning(f"Failed to connect to network {network_name}: {result.stderr}")
-            return False
 
-    except subprocess.TimeoutExpired:
-        logger.warning(f"Timeout connecting to network for container {container_id[:12]}")
-        return False
+            # Connect the agent-manager to this network via the docker socket.
+            logger.info(f"Connecting agent-manager to network {network_name}")
+            try:
+                network = await docker.docker.networks.get(network_name)
+                await network.connect({"Container": _AGENT_MANAGER_CONTAINER})
+                _CONNECTED_NETWORKS.add(network_name)
+                logger.info(f"Successfully connected to network {network_name}")
+                return True
+            except Exception as exc:
+                # Already connected is not an error (aiodocker raises a DockerError
+                # whose message mentions "already" / "exists" in that case).
+                msg = str(exc).lower()
+                if "already" in msg or "exists" in msg:
+                    _CONNECTED_NETWORKS.add(network_name)
+                    return True
+                logger.warning(f"Failed to connect to network {network_name}: {exc}")
+                return False
     except Exception as e:
         logger.debug(f"Error ensuring network connectivity: {e}")
         return False

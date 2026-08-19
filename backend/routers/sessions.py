@@ -315,6 +315,11 @@ async def get_messages(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    # The manager is attached to topology networks dynamically. A manager
+    # container rebuild drops those out-of-band attachments, so restore the
+    # target network before resolving/fetching a persisted session.
+    await _ensure_network_connectivity(session.get("container_id"))
+
     host_addr = await _get_container_address(session.get("container_id"))
 
     result = await get_session_messages_async(

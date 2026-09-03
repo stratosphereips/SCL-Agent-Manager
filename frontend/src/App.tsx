@@ -8,9 +8,13 @@ import { DefenderPage } from './pages/DefenderPage';
 import { ReplayPage } from './pages/ReplayPage';
 import './index.css';
 
+// Base path of the app, derived from the serving URL ('' at the root, or
+// '/plugins/agent-manager' when embedded in the StratoCyberLab dashboard).
+const appBasePath = new URL('.', document.baseURI).pathname.replace(/\/+$/, '');
+
 function App() {
   return (
-    <BrowserRouter>
+    <BrowserRouter basename={appBasePath || undefined}>
       <Routes>
         <Route element={<Layout />}>
           <Route path="/" element={<Navigate to="/agents" replace />} />

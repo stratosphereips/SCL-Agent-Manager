@@ -4,6 +4,10 @@ import path from 'path';
 
 // https://vite.dev/config/
 export default defineConfig({
+  // Serve the SPA from any base path. SCL embeds plugin UIs under
+  // /plugins/agent-manager/ on the dashboard origin, so all asset URLs must
+  // be emitted relative to the document instead of root-absolute.
+  base: './',
   plugins: [react()],
   resolve: {
     alias: {

@@ -75,10 +75,18 @@ import type {
 // Configuration
 // =============================================================================
 
+// Derive the base path this app is served from.
+// '' when served at the root of its own origin (http://host:9005/), or
+// '/plugins/agent-manager' when embedded in the StratoCyberLab dashboard
+// iframe (the dashboard reverse-proxies that prefix to this service).
+// Computed from the document URL so all requests keep the prefix without
+// hardcoding it.
+const APP_BASE_PATH = new URL('.', document.baseURI).pathname.replace(/\/+$/, '');
+
 // Use empty string so axios makes same-origin requests (works for any host).
 // Falls back to localhost:8000 only if the env var is truly absent (undefined).
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000';
-const WS_BASE_URL = import.meta.env.VITE_WS_BASE_URL ?? 'ws://localhost:8000';
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || APP_BASE_PATH;
+const WS_BASE_URL = import.meta.env.VITE_WS_BASE_URL || APP_BASE_PATH;
 
 // =============================================================================
 // Error Types

@@ -54,6 +54,19 @@ services:
       - SEMIF_REVIEW_THRESHOLD=${SEMIF_REVIEW_THRESHOLD:-0.60}
       - SEMIF_TIMEOUT_S=${SEMIF_TIMEOUT_S:-300}
       - SEMIF_EVAL_LOG_ENABLED=${SEMIF_EVAL_LOG_ENABLED:-true}
+      # kev inline guardrail (local trained Jev-pattern decision models; no key).
+      # The sidecar runs outside this compose file and binds loopback; from a
+      # container use KEV_URL=http://host.docker.internal:8009/v1/systemone
+      # (or the host IP), started with e.g.
+      #   python -m kev.serve --run jaredpalmer/kev-9b --port 8009
+      # (on the CPU bench box: kev/cpu_int8_serve.py, the int8 weight-only shim).
+      - KEV_URL=${KEV_URL:-http://127.0.0.1:8009/v1/systemone}
+      - KEV_MODEL=${KEV_MODEL:-jaredpalmer/kev-9b}
+      - KEV_API_KEY=${KEV_API_KEY:-}
+      - KEV_BLOCK_THRESHOLD=${KEV_BLOCK_THRESHOLD:-0.90}
+      - KEV_REVIEW_THRESHOLD=${KEV_REVIEW_THRESHOLD:-0.60}
+      - KEV_TIMEOUT_S=${KEV_TIMEOUT_S:-300}
+      - KEV_EVAL_LOG_ENABLED=${KEV_EVAL_LOG_ENABLED:-true}
     networks:
       - playground-net
     restart: unless-stopped
@@ -79,4 +92,6 @@ volumes:
 networks:
   playground-net:
     external: true
-    name: playground-net
+    # Local box network is scl-playground-net (plugin convention); the compose
+    # KEY stays playground-net so service references are untouched.
+    name: scl-playground-net

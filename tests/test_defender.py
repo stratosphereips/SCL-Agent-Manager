@@ -198,7 +198,13 @@ class TestAutoResponderEdgeCases:
              patch("backend.services.defender.auto_responder.send_prompt_async", new=AsyncMock(return_value={"success": True})), \
              patch("backend.services.defender.auto_responder.list_sessions_async", new=AsyncMock(return_value={"success": True, "sessions": {"sess-1": "completed"}})), \
              patch("backend.services.defender.auto_responder.get_session_messages_async", new=AsyncMock(return_value={"success": True, "messages": []})), \
-             patch("backend.services.defender.auto_responder._ensure_network_connectivity", new=AsyncMock(return_value=True)):
+             patch("backend.services.defender.auto_responder._ensure_network_connectivity", new=AsyncMock(return_value=True)), \
+             patch("backend.services.defender.auto_responder.SESSION_MAX_WAIT", 0.2), \
+             patch("backend.services.defender.auto_responder.SESSION_POLL_INTERVAL", 0.05):
+            # 2026-11-12 poll-race fix: a never-busy session no longer
+            # completes on the first idle poll — it polls until the deadline.
+            # This mock never reports busy, so sub-second deadline patches are
+            # required to keep this (dedup-focused) test fast.
 
             fresh_store.set_defended("topo-1", ["host-1"], True)
             alert = {"topology_id": "topo-1", "attackid": "brute", "confidence": 0.95, "destip": "10.0.0.5", "sourceip": "10.0.0.99"}

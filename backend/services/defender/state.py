@@ -60,6 +60,9 @@ class DefenderStore:
             "plans_generated": 0,
             "soc_god_sessions_created": 0,
             "soc_god_sessions_failed": 0,
+            # 2026-11-14 cause-#4 fix: create_session attempts that failed but
+            # were retried (see auto_responder SOC_GOD_CREATE_ATTEMPTS).
+            "soc_god_create_retries": 0,
         }
 
     # ------------------------------------------------------------------ policy

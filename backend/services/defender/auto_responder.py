@@ -100,6 +100,21 @@ SESSION_POLL_INTERVAL = float(os.getenv("DEFENDER_SESSION_POLL_INTERVAL", "3"))
 # working. Env-overridable for tests/smokes.
 SESSION_MAX_WAIT = int(os.getenv("DEFENDER_SESSION_MAX_WAIT", "2100"))
 
+# 2026-11-14 cause-#4 fix (paper-l1-fmfix2): one create_session failure used to
+# be terminal (RuntimeError -> soc_god_sessions_failed, no retry). The dominant
+# failure is transient: opencode's /session handler can stall >30s fetching its
+# models.dev registry/telemetry (observed ~152s, Cloudflare 104.16.x) while the
+# session IS created server-side — opencode writes the 200 to the already-closed
+# socket and the client counted a failure. Retry up to 2 more times with backoff
+# (5s, 15s) before declaring the session failed. Verified: POST /session is NOT
+# idempotent per title (a retry creates a NEW session; the timed-out orphan
+# stays behind, idle and inert) — acceptable: the retry session is the one
+# driven. Env-overridable for tests/smokes.
+SOC_GOD_CREATE_ATTEMPTS = int(os.getenv("DEFENDER_SOC_GOD_CREATE_ATTEMPTS", "3"))
+SOC_GOD_CREATE_RETRY_BACKOFF = tuple(
+    float(x) for x in os.getenv("DEFENDER_SOC_GOD_CREATE_RETRY_BACKOFF", "5,15").split(",")
+)
+
 # High-confidence signal keywords (ported from Trident auto_responder).
 _HIGH_CONFIDENCE_SIGNALS = (
     "confidence: 1", "confidence: 0.9", "confidence: 0.8", "confidence: 1.0",
@@ -374,13 +389,34 @@ class AutoResponder:
             except Exception as exc:
                 logger.debug("pre-send status/abort failed: %s", exc)
 
-        # Create (and mirror) a session if needed.
+        # Create (and mirror) a session if needed. Retries with backoff on
+        # transient create failures (see SOC_GOD_CREATE_ATTEMPTS above).
         if not session_id:
-            created = await create_session_async(
-                host=addr, port=SOC_GOD_PORT, title=f"soc_god defense: {target['name']}"
-            )
+            created: Optional[Dict[str, Any]] = None
+            for attempt in range(1, max(SOC_GOD_CREATE_ATTEMPTS, 1) + 1):
+                created = await create_session_async(
+                    host=addr, port=SOC_GOD_PORT, title=f"soc_god defense: {target['name']}"
+                )
+                if created.get("success"):
+                    break
+                if attempt < SOC_GOD_CREATE_ATTEMPTS:
+                    backoff = SOC_GOD_CREATE_RETRY_BACKOFF[
+                        min(attempt - 1, len(SOC_GOD_CREATE_RETRY_BACKOFF) - 1)
+                    ]
+                    store.incr("soc_god_create_retries")
+                    logger.warning(
+                        "create_session attempt %d/%d failed (%s); retrying in %ss",
+                        attempt, SOC_GOD_CREATE_ATTEMPTS, created.get("error"), backoff,
+                    )
+                    await asyncio.sleep(backoff)
             if not created.get("success"):
-                raise RuntimeError(f"create_session failed: {created.get('error')}")
+                # Every attempt failed: keep the pre-existing failure semantics
+                # — the RuntimeError propagates to _process_alert, which counts
+                # soc_god_sessions_failed and emits defender_session_failed.
+                raise RuntimeError(
+                    f"create_session failed after {SOC_GOD_CREATE_ATTEMPTS} attempt(s): "
+                    f"{created.get('error')}"
+                )
             session_id = created.get("session_id")
             self._sessions[cache_key] = session_id
             store.incr("soc_god_sessions_created")

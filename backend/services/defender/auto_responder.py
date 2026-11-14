@@ -10,6 +10,20 @@ Loop: poll the in-process alert buffer -> high-confidence filter -> 5-min dedup
 container -> plan -> drive soc_god on that host -> mirror the session into
 ``state_manager`` so it shows in the dashboard -> persist its messages to
 OUTPUTS_DIR for the file-backed compat views.
+
+2026-11-12 amendments (verified against live session
+ses_e32f7026cffe: 11 messages, ~49k tokens, ~30 min, executed iptables):
+1. Poll race fix in ``_drive_soc_god``: ``send_prompt_async`` (async mode)
+   returns before opencode registers the user message (~1.1s observed), so
+   the first status poll saw the session idle and falsely declared COMPLETED
+   with an empty transcript. Completion now requires positive evidence of
+   work — at least one busy observation before any idle-based completion —
+   and an empty messages list is never recorded/persisted for a confirmed
+   sent prompt (the session record gets ``messages_unavailable`` and the
+   poller keeps polling until the deadline instead of completing).
+2. ``SESSION_MAX_WAIT`` default raised 240 -> 2100 (env-overridable via
+   ``DEFENDER_SESSION_MAX_WAIT``): real soc_god defense runs take ~30 min,
+   so 240s declared TIMEOUT while the session was still working.
 """
 from __future__ import annotations
 
@@ -41,11 +55,41 @@ from .state import OUTPUTS_DIR, defender_run_id, get_defender_store
 
 logger = logging.getLogger(__name__)
 
+
+def _arm_guardrail_autonomous_mode() -> None:
+    """Point the executor-side guardrail at autonomous enforcement for this run.
+
+    The ClawKeeper guardrail (plugins/guardrail.ts on agent hosts) defaults to
+    mode "medium" when /outputs/<run_id>/guardrail/mode.txt is absent: every
+    judge-flagged command then parks in awaitHumanApproval, and ANY pending
+    approval additionally freezes ALL executor sessions via
+    awaitRunClearOfPending (which polls before every command). The defender
+    surface has no operator approvals UI wired, so that halt is permanent —
+    live failure 2026-11-13 paper-l1-r1: one stale undecided approval
+    (judge verdict unparseable -> escalate) blocked every soc_god bash tool
+    for 90+ minutes while the LLM kept streaming tool calls.
+
+    mode.txt=auto keeps the judge gate but enforces verdicts with no human
+    (execute/sanitize run, refuse returns feedback, no approval, no global
+    halt). Mirrors sessions.py:_forward_goal_to_guardrail, which already does
+    this for coder56; the defender alert-driven path never went through it.
+    Best-effort: never raise into the alert flow.
+    """
+    try:
+        guardrail_dir = OUTPUTS_DIR / defender_run_id() / "guardrail"
+        guardrail_dir.mkdir(parents=True, exist_ok=True)
+        (guardrail_dir / "mode.txt").write_text("auto", encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Could not arm guardrail autonomous mode: %s", exc)
+
 POLL_INTERVAL = int(os.getenv("DEFENDER_POLL_INTERVAL", "5"))
 DEDUP_WINDOW = int(os.getenv("DEFENDER_DEDUP_WINDOW", "300"))
 SOC_GOD_PORT = int(os.getenv("DEFENDER_OPENCODE_PORT", os.getenv("OPENCODE_PORT", "4096")))
 SESSION_POLL_INTERVAL = float(os.getenv("DEFENDER_SESSION_POLL_INTERVAL", "3"))
-SESSION_MAX_WAIT = int(os.getenv("DEFENDER_SESSION_MAX_WAIT", "240"))
+# 2026-11-12: default 240 -> 2100. Real soc_god sessions run ~30 min; 240s
+# declared TIMEOUT (and dropped the cached session) while opencode was still
+# working. Env-overridable for tests/smokes.
+SESSION_MAX_WAIT = int(os.getenv("DEFENDER_SESSION_MAX_WAIT", "2100"))
 
 # High-confidence signal keywords (ported from Trident auto_responder).
 _HIGH_CONFIDENCE_SIGNALS = (
@@ -346,6 +390,11 @@ class AutoResponder:
             target_ip=target.get("ip", "unknown"),
         )
 
+        # Arm autonomous guardrail enforcement BEFORE the first soc_god command
+        # runs, so a judge-flagged command can never park the session (and the
+        # whole executor) in awaitHumanApproval/awaitRunClearOfPending.
+        _arm_guardrail_autonomous_mode()
+
         sent = await send_prompt_async(
             session_id=session_id, prompt=context, host=addr, port=SOC_GOD_PORT,
             agent="soc_god", async_mode=True,
@@ -356,19 +405,36 @@ class AutoResponder:
         await self._emit("defender_prompt_sent", {"session_id": session_id, "target_host": target["name"]})
 
         # Poll for completion (send_prompt_async is fire-and-forget in async mode).
+        #
+        # 2026-11-12 poll-race fix: opencode registers the user message ~1.1s
+        # after send_prompt_async returns, so the first poll(s) can observe an
+        # idle session even though the run is about to start. Treating that
+        # first idle as completion produced false COMPLETED verdicts with an
+        # empty transcript (live: ses_e32f7026cffe ran ~30 min / 11 messages
+        # but was recorded as done with messages: []). Idle is therefore NOT
+        # completion evidence on its own: completion requires at least one
+        # busy observation (positive evidence of work). A session that never
+        # shows busy keeps polling until the deadline below and ends TIMEOUT —
+        # never a false COMPLETED.
         deadline = time.time() + SESSION_MAX_WAIT
         timed_out = True
-        final_state = SessionState.COMPLETED.value
+        final_state = SessionState.TIMEOUT.value
+        saw_busy = False
         while time.time() < deadline:
             try:
                 status = await list_sessions_async(host=addr, port=SOC_GOD_PORT)
                 state = _status_str(status.get("sessions", {}).get(session_id, ""))
-                if not is_session_busy(state):
-                    # parse_session_state never raises (defaults to CREATED) and
-                    # normalizes "done"/"ready"/etc. into a valid SessionState.
+                if is_session_busy(state):
+                    saw_busy = True
+                elif saw_busy:
+                    # Idle AFTER observed work is a real completion.
+                    # parse_session_state never raises (defaults to CREATED)
+                    # and normalizes "done"/"ready"/etc. into a valid
+                    # SessionState.
                     final_state = parse_session_state(state).value
                     timed_out = False
                     break
+                # else: no positive evidence of work yet — keep polling.
             except Exception as exc:
                 logger.debug("poll status failed: %s", exc)
             await asyncio.sleep(SESSION_POLL_INTERVAL)
@@ -381,9 +447,23 @@ class AutoResponder:
         sm.update_session(session_id, {"state": final_state})
 
         # Fetch + persist messages (NEW capability: the session router never writes these).
+        # 2026-11-12: never record/persist an empty transcript for a confirmed
+        # sent prompt — an empty list means we raced the session (or hit the
+        # deadline mid-run), and writing messages: [] clobbers the real
+        # transcript the file-backed compat views would otherwise show once
+        # the run lands. Mark the session record instead.
         try:
             msgs = await get_session_messages_async(session_id=session_id, host=addr, port=SOC_GOD_PORT)
-            self._persist_messages(session_id, msgs.get("messages", []))
+            fetched = msgs.get("messages") or []
+            if fetched:
+                self._persist_messages(session_id, fetched)
+            else:
+                sm.update_session(session_id, {"messages_unavailable": True})
+                logger.warning(
+                    "soc_god session %s ended state=%s with no fetchable messages; "
+                    "recorded messages_unavailable (no empty transcript persisted)",
+                    session_id, final_state,
+                )
         except Exception as exc:
             logger.warning("could not fetch/persist soc_god messages: %s", exc)
 

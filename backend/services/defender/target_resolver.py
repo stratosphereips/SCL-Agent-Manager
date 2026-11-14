@@ -11,6 +11,7 @@ against the running topology plus Docker labels at call time:
   (surfaced as a counter on ``/api/defender/status``).
 """
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from ..docker_client import create_docker_client, get_container_by_host_id, get_container_details
@@ -135,7 +136,33 @@ def alert_text(alert: Dict[str, Any]) -> str:
 
 
 def alert_destip(alert: Dict[str, Any]) -> Optional[str]:
-    return alert.get("destip") or alert.get("dstip")
+    """The alert's victim IP: structured keys first, then text fallback.
+
+    SLIPS vertical/horizontal port-scan evidence reads
+    ``"... new vertical port scan to IP 10.10.20.50 from 10.10.10.12 ..."``
+    while the brute-force detector writes ``"... to 10.10.20.50"``. Forwarders
+    whose destination regex misses the ``to IP <ip>`` wording (2026-11-13
+    live failure: every PORT_SCAN alert lost its destip and died on the
+    defended-host policy gate) still send ``raw``/``description`` text — parse
+    the victim out of it so the policy gate sees a resolvable target.
+    """
+    ip = alert.get("destip") or alert.get("dstip")
+    if ip:
+        return ip
+    for key in ("description", "raw", "note"):
+        val = alert.get(key)
+        if not val:
+            continue
+        m = _DESTIP_TEXT_RE.search(str(val))
+        if m:
+            return m.group(1)
+    return None
+
+
+# ``to IP <ip>`` (scan wording) and ``to <ip>`` (brute-force wording); the
+# "from <ip>" side of the sentence can never match because the match is
+# anchored on the literal "to".
+_DESTIP_TEXT_RE = re.compile(r"\bto\s+(?:IP\s+)?(\d{1,3}(?:\.\d{1,3}){3})")
 
 
 def alert_sourceip(alert: Dict[str, Any]) -> Optional[str]:

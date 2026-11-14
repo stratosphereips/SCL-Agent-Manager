@@ -113,6 +113,25 @@ class TestTargetResolver:
         assert tr.alert_sourceip({"sourceip": "1.2.3.4"}) == "1.2.3.4"
         assert tr.alert_sourceip({"srcip": "1.2.3.4"}) == "1.2.3.4"
 
+    def test_alert_destip_text_fallback_to_ip_wording(self):
+        # 2026-11-13: forwarder regex missed the "to IP <ip>" wording, so scan
+        # alerts arrived with NO structured destip; alert_destip now parses the
+        # victim out of the carried text instead of returning None (which made
+        # the policy gate drop the alert AND poison the dedup key).
+        alert = {
+            "raw": "Src IP 10.10.10.12 . Detected new vertical port scan to IP "
+                   "10.10.20.50 from 10.10.10.12 ... Threat level: high.",
+        }
+        assert tr.alert_destip(alert) == "10.10.20.50"
+        # Brute-force wording ("to <ip>", no "IP" token) still matches.
+        alert2 = {"description": "Detected SSH brute force ... to 10.10.20.50 on ssh 22/tcp"}
+        assert tr.alert_destip(alert2) == "10.10.20.50"
+        # Structured keys win over the text fallback.
+        alert3 = dict(alert2, dstip="10.10.20.99")
+        assert tr.alert_destip(alert3) == "10.10.20.99"
+        # "from <ip>" side never matches as the victim.
+        assert tr.alert_destip({"raw": "from 10.10.10.12 to nowhere"}) is None
+
 
 # =============================================================================
 # Planner tests
@@ -241,6 +260,31 @@ class TestAutoResponderEdgeCases:
             timed_out = await responder._drive_soc_god("topo-1", {"host_id": "host-1", "name": "host-1", "ip": "10.0.0.5"}, "abc123", {"plan": "x"}, alert)
             assert timed_out is True
             # _drive_soc_god doesn't increment the counter; _process_alert does
+
+    @pytest.mark.asyncio
+    async def test_policy_drop_does_not_poison_dedup(self, fresh_store):
+        # 2026-11-13 dedup-after-policy fix: an alert that fails the defended-host
+        # policy gate must NOT be marked seen — the old code marked _seen[h] before
+        # the gate, so every policy-dropped alert silenced its whole threat hash
+        # (topo|src|dst|attackid) for the 300s window and a later well-formed
+        # alert for the same threat was suppressed as a "duplicate" before any
+        # planner call (iterate_socgod.md LINK D).
+        with patch("backend.services.defender.auto_responder.get_defender_store", return_value=fresh_store), \
+             patch("backend.services.defender.auto_responder.target_resolver.resolve_target_by_ip", new=AsyncMock(return_value=None)):
+            fresh_store.set_defended("topo-1", ["host-1"], True)
+            alert = {"topology_id": "topo-1", "attackid": "PORT_SCAN", "confidence": 1.0,
+                     "sourceip": "10.10.10.12"}
+            fresh_store.add_alert(alert)
+            fresh_store.add_alert(alert)
+            fresh_store.add_alert(alert)
+
+            responder = ar.AutoResponder()
+            await responder.run_once()
+            stats = fresh_store.stats()["counters"]
+            # Every copy reached the policy gate (no dedup poisoning), all dropped.
+            assert stats["alerts_dropped_nondefended"] == 3
+            assert stats["alerts_dropped_duplicate"] == 0
+            assert not responder._seen
 
 
 if __name__ == "__main__":

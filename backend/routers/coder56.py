@@ -601,24 +601,35 @@ def _run_memory_path(run_id: str) -> Path:
     return OUTPUTS_DIR / run_id / "memory" / "MEMORY.md"
 
 
-def _phase0_complete(engagement_id: Optional[str]) -> bool:
+def _phase0_complete(engagement_id: Optional[str], run_id: Optional[str] = None) -> bool:
     """Phase 0 is complete enough to advance past when the engagement's shared
     memory carries the THREAT_MODEL| record (fallback: at least TARGET_IDENTITY|).
     The deployed coder56_phase Phase-0 worker emits both per
     PHASE0_TARGET_VALIDATION_BLOCK. Used by the Phase-0 hard guard
     (advance_phase) and the auto-mode nudge (_lead_driver) so glm-5.2 cannot
     skip scoping and dive straight into deep testing (it did on the OpenHospital
-    run — TARGET_IDENTITY| was grabbed but no THREAT_MODEL| was emitted)."""
-    if not engagement_id:
-        return False
-    try:
-        path = _engagement_memory_path(engagement_id)
-        if not path.exists():
-            return False
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return False
-    return ("THREAT_MODEL|" in text) or ("TARGET_IDENTITY|" in text)
+    run — TARGET_IDENTITY| was grabbed but no THREAT_MODEL| was emitted).
+
+    Engagement-less runs: the agent is instructed (system prompt rule 17) to
+    write /outputs/<run_id>/memory/MEMORY.md, so when no engagement is linked
+    the run memory is checked instead — otherwise a phased run launched
+    without an engagement can NEVER pass this gate (engagement_id=None made
+    the old check unconditionally False and the corrective loop span forever)."""
+    candidates = []
+    if engagement_id:
+        candidates.append(_engagement_memory_path(engagement_id))
+    if run_id:
+        candidates.append(_run_memory_path(run_id))
+    for path in candidates:
+        try:
+            if not path.exists():
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        if ("THREAT_MODEL|" in text) or ("TARGET_IDENTITY|" in text):
+            return True
+    return False
 
 
 def _memory_seed_header(eng: Dict[str, Any]) -> str:
@@ -890,7 +901,13 @@ async def _snapshot_opencode_db(run_id: str) -> None:
 
     Best-effort: called on every driver exit (lead + phase, incl. review-gate,
     auto-continue completion, stall/timeout/watchdog kill, graceful finalize);
-    never raises. run_id is _valid_token-validated (no shell metachars)."""
+    never raises. run_id is _valid_token-validated (no shell metachars).
+
+    The in-container steps use python3's stdlib sqlite3 (online .backup()),
+    NOT the sqlite3 CLI: the CLI is absent from some agent flavors (confirmed
+    MISSING on coder56-mcp-noguard) which made every snapshot silently fail
+    ("opencode.db unavailable" in engagement metrics). python3 is guaranteed
+    in agent images (the agents themselves run on it)."""
     try:
         meta = _read_run_meta(run_id)
         container_id = meta.get("container_id", "")
@@ -900,13 +917,14 @@ async def _snapshot_opencode_db(run_id: str) -> None:
         root_session = str(meta.get("session_id") or "")
         launched_ms = _launched_at_epoch_ms(run_id, meta)
         # Back up the live (WAL-open) db first, into opencode.db (full).
+        # python3 sqlite3 .backup() = WAL-consistent online snapshot.
         backup_script = (
             "set -e; "
             "DST='/outputs/" + run_id + "'; "
             "mkdir -p \"$DST\"; "
             "SRC=/root/.local/share/opencode/opencode.db; "
             "if [ -f \"$SRC\" ]; then "
-            "  sqlite3 \"$SRC\" \".backup '$DST/opencode.db'\" && echo SNAP_OK; "
+            "  python3 -c \"import sqlite3,sys; s=sqlite3.connect(sys.argv[1]); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()\" \"$SRC\" \"$DST/opencode.db\" && echo SNAP_OK; "
             "else echo SNAP_NODB; fi"
         )
         async with create_docker_client() as docker_client:
@@ -940,7 +958,7 @@ async def _snapshot_opencode_db(run_id: str) -> None:
                 rebackup = (
                     "set -e; DST='/outputs/" + run_id + "'; "
                     "SRC=/root/.local/share/opencode/opencode.db; "
-                    "sqlite3 \"$SRC\" \".backup '$DST/opencode.db'\" && echo FULL_OK;"
+                    "python3 -c \"import sqlite3,sys; s=sqlite3.connect(sys.argv[1]); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()\" \"$SRC\" \"$DST/opencode.db\" && echo FULL_OK;"
                 )
                 async with create_docker_client() as docker_client:
                     container = await docker_client.docker.containers.get(container_id)
@@ -966,15 +984,16 @@ async def _snapshot_opencode_db(run_id: str) -> None:
         # from _launched_at_epoch_ms, never user-controlled), and root_session is
         # a _valid_token session id — both safe to interpolate.
         keep_root = f" AND id != '{root_session}'" if root_session else ""
+        # Statements pass as argv (no shell/SQL quote nesting); python3 runs
+        # them on the snapshot copy. PRAGMA first so FK cascade is armed.
         filter_script = (
             "set -e; DST='/outputs/" + run_id + "/opencode.db'; "
-            "sqlite3 \"$DST\" \""
-            "PRAGMA foreign_keys=ON; "
-            "DELETE FROM session WHERE time_created < " + str(int(launched_ms)) + keep_root + "; "
-            "DELETE FROM message WHERE time_created < " + str(int(launched_ms)) + "; "
-            "DELETE FROM part WHERE time_created < " + str(int(launched_ms)) + "; "
-            "VACUUM; "
-            "\" && echo FILTER_OK;"
+            "python3 -c \"import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('PRAGMA foreign_keys=ON'); "
+            "[c.execute(q) for q in sys.argv[2:]]; c.commit(); c.execute('VACUUM'); c.close()\" \"$DST\" "
+            "\"DELETE FROM session WHERE time_created < " + str(int(launched_ms)) + keep_root + "\" "
+            "\"DELETE FROM message WHERE time_created < " + str(int(launched_ms)) + "\" "
+            "\"DELETE FROM part WHERE time_created < " + str(int(launched_ms)) + "\" "
+            "&& echo FILTER_OK;"
         )
         fout = b""
         async with create_docker_client() as docker_client:
@@ -1058,7 +1077,7 @@ def _sandbox_env() -> Dict[str, str]:
     return {
         "OPENCODE_API_KEY": os.environ.get("OPENCODE_API_KEY", ""),
         "LLM_URL": os.environ.get("LLM_URL", "https://llm.ai.e-infra.cz/v1"),
-        "LLM_MODEL": os.environ.get("LLM_MODEL", "glm-5.2"),
+        "LLM_MODEL": os.environ.get("LLM_MODEL", "glm-5.3"),
         "SSH_COMPROMISED_USER": "labuser",
         "SSH_COMPROMISED_PASS": os.environ.get("SSH_COMPROMISED_PASS", "strato"),
         "TRIDENT_HOME": "/outputs",
@@ -3574,7 +3593,7 @@ async def _lead_driver(run_id: str) -> None:
             # complete scoping before it grinds into deep testing. The review_each
             # hard gate lives in advance_phase; this covers the auto path.
             if (n_completed >= 1 and not phase0_nudged
-                    and not _phase0_complete(meta.get("engagement_id"))):
+                    and not _phase0_complete(meta.get("engagement_id"), meta.get("run_id") or run_id)):
                 phase0_nudged = True
                 try:
                     await send_prompt_async(
@@ -3893,7 +3912,7 @@ async def advance_phase(run_id: str, n: int, req: AdvanceRequest) -> Dict[str, A
     # THREAT_MODEL| record (fallback TARGET_IDENTITY|). Best-effort nudge the
     # active Phase-0 session to finish scoping; the operator re-advances once it
     # has. Does NOT touch meta (phase 0 stays AWAITING_REVIEW) on refusal.
-    if cur == 0 and not _phase0_complete(meta.get("engagement_id")):
+    if cur == 0 and not _phase0_complete(meta.get("engagement_id"), meta.get("run_id") or run_id):
         try:
             from ..services.container_addr import get_container_address
             from ..services.opencode_client import send_prompt_async, _ensure_network_connectivity
@@ -4229,7 +4248,7 @@ async def _llm_chat(user_msg: str, system_msg: str, max_tokens: int = 8192,
     shared e-infra key, 5xx) and connection blips ARE retried."""
     base_url = os.getenv("LLM_URL", "").rstrip("/")
     api_key = os.getenv("OPENCODE_API_KEY", "")
-    model = os.getenv("LLM_MODEL", "glm-5.2")
+    model = os.getenv("LLM_MODEL", "glm-5.3")
     if not base_url or not api_key:
         if raise_on_fail:
             raise LLMCallError("LLM not configured (LLM_URL / OPENCODE_API_KEY missing)")

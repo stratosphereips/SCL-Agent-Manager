@@ -6,10 +6,11 @@ manual sessions use) instead of direct OpenCode HTTP, and resolves targets
 dynamically via :mod:`target_resolver` instead of hardcoded lab IPs.
 
 Loop: poll the in-process alert buffer -> high-confidence filter -> 5-min dedup
--> resolve the alert's victim to a defended host (policy gate) -> resolve its
-container -> plan -> drive soc_god on that host -> mirror the session into
-``state_manager`` so it shows in the dashboard -> persist its messages to
-OUTPUTS_DIR for the file-backed compat views.
+CHECK -> resolve the alert's victim to a defended host (policy gate) -> dedup
+MARK (only after the gate: policy-dropped alerts must not poison the key) ->
+resolve its container -> plan -> drive soc_god on that host -> mirror the
+session into ``state_manager`` so it shows in the dashboard -> persist its
+messages to OUTPUTS_DIR for the file-backed compat views.
 
 2026-11-12 amendments (verified against live session
 ses_e32f7026cffe: 11 messages, ~49k tokens, ~30 min, executed iptables):
@@ -24,6 +25,14 @@ ses_e32f7026cffe: 11 messages, ~49k tokens, ~30 min, executed iptables):
 2. ``SESSION_MAX_WAIT`` default raised 240 -> 2100 (env-overridable via
    ``DEFENDER_SESSION_MAX_WAIT``): real soc_god defense runs take ~30 min,
    so 240s declared TIMEOUT while the session was still working.
+
+2026-11-13 amendment (l1 fm-fix re-run):
+3. Dedup-mark moved AFTER the defended-host policy gate: a policy-dropped
+   alert used to poison its ``_seen`` hash for the full 300s window, so the
+   same threat could never re-fire even once the forwarder extracted the
+   destination correctly (iterate_socgod.md LINK D, second half). The
+   destination itself gains a text fallback in ``target_resolver.alert_destip``
+   (``to IP <ip>`` wording).
 """
 from __future__ import annotations
 
@@ -271,7 +280,6 @@ class AutoResponder:
             store.incr("alerts_dropped_duplicate")
             logger.info("dropping duplicate alert (hash=%s)", h[:8])
             return
-        self._seen[h] = now
         self._seen = {k: v for k, v in self._seen.items() if (now - v) < DEDUP_WINDOW}
 
         destip = target_resolver.alert_destip(alert)
@@ -282,6 +290,17 @@ class AutoResponder:
             logger.info("alert target %s is not a defended host; dropping", destip)
             await self._emit("defender_alert_dropped", {"reason": "non_defended_host", "destip": destip})
             return
+
+        # 2026-11-13 dedup-after-policy fix: the hash is marked seen only once the
+        # alert has PASSED the defended-host policy gate. Marking before the gate
+        # (the old line 247) let policy-dropped alerts poison their dedup key for
+        # the full window — live failure: every PORT_SCAN alert lost its destip
+        # ("to IP <ip>" wording), died on the policy gate, and poisoned
+        # md5(topo|src|dst|PORT_SCAN) for 300s, so a later well-formed scan alert
+        # (e.g. after a forwarder fix) was suppressed as a "duplicate" before any
+        # planner call. The dedup CHECK above still runs first (cheap, and keeps
+        # duplicates from hammering the resolver).
+        self._seen[h] = now
 
         # Resolve the container BEFORE planning — don't burn an LLM call if the
         # defended host isn't actually running.

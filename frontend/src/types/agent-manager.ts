@@ -628,6 +628,10 @@ export interface Host {
   generate_data?: boolean;
   data_prompt?: string;
   data_content?: string;
+  /** Static address pinned inside the host's network CIDR (NetSecGame-faithful
+   * presets set these; Docker rejects out-of-subnet assignments). Must survive
+   * editor round-trips — spread the original host object, don't rebuild it. */
+  ip_override?: string;
 }
 
 // =============================================================================

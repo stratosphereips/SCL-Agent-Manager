@@ -67,6 +67,15 @@ logger = logging.getLogger(__name__)
 DEFAULT_OPENCODE_HOST = os.getenv("OPENCODE_DEFAULT_HOST", "127.0.0.1")
 DEFAULT_OPENCODE_PORT = int(os.getenv("OPENCODE_PORT", "4096"))
 DEFAULT_OPENCODE_TIMEOUT = 30
+# 2026-11-14 cause-#4 fix (paper-l1-fmfix2): POST /session must NOT inherit the
+# 30s default. Live incident: opencode's /session handler stalled ~152s fetching
+# its models.dev registry/telemetry (Cloudflare 104.16.x, 607KB unacked) — the
+# session WAS created server-side (ses_e27d4b691…) but the client had already
+# given up at 30s and orphaned it. 180s covers the observed stall with headroom;
+# env-overridable so a slower host can go higher. Create-only: in-session calls
+# (send/poll/messages) keep DEFAULT_OPENCODE_TIMEOUT — they run inside an
+# existing session and are bounded by the defender's SESSION_MAX_WAIT deadline.
+CREATE_SESSION_TIMEOUT = int(os.getenv("OPENCODE_CREATE_SESSION_TIMEOUT", "180"))
 OPENCODE_HEALTH_ENDPOINT = "/global/health"
 OPENCODE_SESSION_ENDPOINT = "/session"
 OPENCODE_SESSION_STATUS_ENDPOINT = "/session/status"
@@ -368,7 +377,7 @@ def create_session(
     host: str = None,
     port: int = None,
     title: str = None,
-    timeout: int = DEFAULT_OPENCODE_TIMEOUT
+    timeout: int = CREATE_SESSION_TIMEOUT
 ) -> Dict[str, Any]:
     """Create a new OpenCode session.
 
@@ -438,7 +447,7 @@ async def create_session_async(
     host: str = None,
     port: int = None,
     title: str = None,
-    timeout: int = DEFAULT_OPENCODE_TIMEOUT
+    timeout: int = CREATE_SESSION_TIMEOUT
 ) -> Dict[str, Any]:
     """Async version of create_session.
 

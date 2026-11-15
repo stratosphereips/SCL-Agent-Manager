@@ -30,8 +30,6 @@ services:
       - OPENCODE_API_KEY=${OPENCODE_API_KEY}
       - DEFENDER_LLM_API_KEY=${OPENCODE_API_KEY}
       - PLANNER_MODEL=${PLANNER_MODEL:-gpt-oss-120b}
-<<<<<<< HEAD
-=======
       # Defender alert work-queue capacity (backend/services/defender/state.py).
       # Default 1000 saturated during the 2026-11-13 pcap-flood: Slips per-flow
       # info lines arrived ~700/min vs the 50/5s drain, the maxlen deque evicted
@@ -76,7 +74,6 @@ services:
       - KEV_REVIEW_THRESHOLD=${KEV_REVIEW_THRESHOLD:-0.60}
       - KEV_TIMEOUT_S=${KEV_TIMEOUT_S:-300}
       - KEV_EVAL_LOG_ENABLED=${KEV_EVAL_LOG_ENABLED:-true}
->>>>>>> 97e4e89... fix(defender): fm-fix2 backlog — dedup-after-policy, destip text fallback, in-arena hardening
     networks:
       - playground-net
     restart: unless-stopped

@@ -287,5 +287,71 @@ class TestAutoResponderEdgeCases:
             assert not responder._seen
 
 
+
+# =============================================================================
+# /enable 2-seat cap (2026-11-15 maintainer requirement: "2 hosts at a time")
+# =============================================================================
+
+class TestEnableSeatCap:
+    """The cap lives at the /enable boundary (defender_router.enable_defender):
+    reject any policy with more than DEFENDER_MAX_DEFENDED_HOSTS host_ids
+    (default 2) with a 400 + named error. StateManager/DefenderStore is mocked
+    out — only the boundary contract is under test."""
+
+    @pytest.fixture
+    def router_store(self):
+        store = DefenderStore(state_path=f"/tmp/test_cap_store_{time.time()}.json")
+        store._policy = {}
+        return store
+
+    @pytest.fixture
+    def enable(self, router_store, monkeypatch):
+        monkeypatch.delenv("DEFENDER_MAX_DEFENDED_HOSTS", raising=False)
+        with patch("backend.services.defender.defender_router.get_defender_store",
+                   return_value=router_store):
+            yield router_store
+
+    async def _enable(self, topo, host_ids, enabled=True):
+        from backend.services.defender.defender_router import EnableRequest, enable_defender
+        return await enable_defender(EnableRequest(
+            topology_id=topo, host_ids=host_ids, enabled=enabled))
+
+    @pytest.mark.asyncio
+    async def test_enable_accepts_two_hosts(self, enable):
+        result = await self._enable("cap-topo", ["defender-host", "file-server"])
+        assert result["status"] == "ok"
+        assert enable.get_defended("cap-topo")["host_ids"] == ["defender-host", "file-server"]
+        assert enable.get_defended("cap-topo")["enabled"] is True
+
+    @pytest.mark.asyncio
+    async def test_enable_rejects_three_hosts_named_error(self, enable):
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as exc:
+            await self._enable("cap-topo", ["h1", "h2", "h3"])
+        assert exc.value.status_code == 400
+        assert exc.value.detail["error"] == "too_many_defended_hosts"
+        assert exc.value.detail["requested"] == 3
+        assert exc.value.detail["max_defended_hosts"] == 2
+        # Nothing persisted on rejection.
+        assert enable.get_defended("cap-topo")["host_ids"] == []
+
+    @pytest.mark.asyncio
+    async def test_enable_env_override_allows_three(self, enable, monkeypatch):
+        monkeypatch.setenv("DEFENDER_MAX_DEFENDED_HOSTS", "3")
+        result = await self._enable("cap-topo", ["h1", "h2", "h3"])
+        assert result["status"] == "ok"
+        assert enable.get_defended("cap-topo")["host_ids"] == ["h1", "h2", "h3"]
+
+    @pytest.mark.asyncio
+    async def test_env_override_back_to_default_rejects_again(self, enable, monkeypatch):
+        monkeypatch.setenv("DEFENDER_MAX_DEFENDED_HOSTS", "not-a-number")
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as exc:
+            await self._enable("cap-topo", ["h1", "h2", "h3"])
+        assert exc.value.status_code == 400
+        assert exc.value.detail["error"] == "too_many_defended_hosts"
+
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -752,6 +752,15 @@ async def execute_in_container(
 ) -> Dict[str, Any]:
     """Execute a command inside a container.
 
+    2026-11-16 FIX: rewritten for aiodocker 0.24 — the old body passed
+    attach_stdout/attach_stderr to container.exec(), which aiodocker has never
+    accepted (DockerContainer.exec(cmd, stdout=..., stderr=..., ...)), and read
+    a (exit_code, stdout, stderr) tuple from start(detach=False), but that
+    returns a websocket stream in 0.24. Both bugs surfaced together when the
+    lead driver's wedged-serve recovery issued its first-ever exec
+    (paper-l1-r1-20261116-024634 03:47: "DockerContainer.exec() got an
+    unexpected keyword argument 'attach_stdout'").
+
     Args:
         docker_client: Connected Docker client instance
         container_id: Container ID to execute in
@@ -770,30 +779,35 @@ async def execute_in_container(
     try:
         container = await docker_client.docker.containers.get(container_id)
 
-        create_kwargs = {
-            "cmd": command,
-            "attach_stdout": True,
-            "attach_stderr": True
-        }
-
+        exec_kwargs: Dict[str, Any] = {}
         if workdir:
-            create_kwargs["workdir"] = workdir
-
+            exec_kwargs["workdir"] = workdir
         if env:
-            create_kwargs["env"] = [f"{k}={v}" for k, v in env.items()]
+            exec_kwargs["environment"] = {str(k): str(v) for k, v in env.items()}
 
-        exec_instance = await container.exec(**create_kwargs)
+        exec_instance = await container.exec(command, **exec_kwargs)
 
-        # Wait for execution with timeout
+        # Detached start: returns once the stream payload is read (bytes), so a
+        # long-running command cannot hold a websocket open. Exit code comes
+        # from the exec inspect afterwards.
         result = await asyncio.wait_for(
-            exec_instance.start(detach=False),
+            exec_instance.start(detach=True),
             timeout=timeout
         )
+        stdout = result if isinstance(result, bytes) else \
+            b"".join(result or b"")
+
+        exit_code = None
+        try:
+            inspect = await exec_instance.inspect()
+            exit_code = inspect.get("ExitCode")
+        except Exception:
+            pass  # inspect is best-effort; start() already proves the exec ran
 
         return {
-            "exit_code": result[0],
-            "stdout": result[1],
-            "stderr": result[2]
+            "exit_code": exit_code,
+            "stdout": stdout.decode("utf-8", "replace")[:8000],
+            "stderr": ""
         }
 
     except asyncio.TimeoutError:

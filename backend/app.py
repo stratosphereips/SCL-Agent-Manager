@@ -286,6 +286,17 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Engagement reportwriter reconcile sweep skipped: {e}")
 
+        # 2026-11-16: re-arm lead drivers for still-RUNNING native-subagents
+        # runs. The in-memory _lead_drivers tasks die with the process, so a
+        # backend restart (deploy/crash) left mid-run engagements unpaced
+        # forever — nothing advanced, gated, or snapshotted. Best-effort.
+        try:
+            from .routers.coder56 import _rearm_lead_drivers_for_running_runs
+            _n = _rearm_lead_drivers_for_running_runs()
+            logger.info("lead-driver re-arm sweep: %d driver(s) re-armed", _n)
+        except Exception as e:
+            logger.warning(f"lead-driver re-arm sweep skipped: {e}")
+
         logger.info("Agent Manager startup complete")
 
     except Exception as e:

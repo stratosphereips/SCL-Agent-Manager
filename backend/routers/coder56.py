@@ -97,7 +97,7 @@ from ..services.mitre_catalog import catalog as mitre_catalog
 from ..services.owasp_catalog import catalog as owasp_catalog
 from ..services.api_security_catalog import catalog as api_security_catalog
 from ..services.report_renderer import render_report, render_client_report
-from ..services.docker_client import create_docker_client
+from ..services.docker_client import create_docker_client, execute_in_container
 from ..services.engagement_metrics import build_engagement_metrics
 from .topologies import fetch_from_topology_plugin, post_to_topology_plugin
 
@@ -2064,6 +2064,57 @@ RUN_SNAPSHOT_CADENCE_S = 300
 # genuinely-sustained judge outage (a dead verdict = 4 guardrail attempts x 4 proxy
 # retries of failed calls, so 6 in a row is unambiguously a down judge, not noise).
 GUARDRAIL_CIRCUIT_BREAKER_N = 6
+
+# --- 2026-11-16 wedged-serve recovery (paper-l1-r1-20261116-010920 root cause) ---
+# glm-5.3 stream-end-never-arrives: the provider stream hangs with zero bytes
+# delivered, the executor opencode serve (4096) stops answering GETs, and each
+# lead-driver poll then burns ~3x30s of client timeouts. entrypoint.sh starts the
+# serve as an UNSUPERVISED background child, so nothing ever restarts it. Worse,
+# the old REC#3(c) no-op gate collapsed a FAILED messages fetch into "0 messages"
+# and halted a HEALTHY run as "agent never ran" (that run: phase 0 completed
+# 01:30:42, AUTO resume 01:31:35, zero-token hung assistant message, 01:36:59
+# halt on the first failed fetch). Two knobs fix the pacing defect:
+#   FIX A — a failed fetch can NEVER fire the no-op gate; the gate requires a
+#           VERIFIED-empty session sustained across this many consecutive polls.
+#   FIX B — sustained fetch failure OR a zero-content open assistant message
+#           older than LEAD_STREAM_STALL_S triggers one bounded serve restart
+#           (sessions persist in the sqlite store; only the hung generation dies)
+#           followed by a lead re-kick prompt.
+LEAD_NOOP_CONFIRM_POLLS = 5      # verified-empty polls before "agent never ran"
+# 240s (was 300): a healthy opencode turn shows text/reasoning parts within
+# seconds; a zero-content open assistant message at 4 minutes is dead. The
+# shorter window matters because the whole recovery cycle (detect -> restart ->
+# re-kick -> provider first token) must land inside the campaign runner's
+# 12-min idle limit — the 10:24 l2final attempt died to a first-turn hang that
+# recovered ~2 min too late.
+LEAD_STREAM_STALL_S = 240
+LEAD_SERVE_RECOVERY_S = 240      # sustained stall before a restart is attempted
+LEAD_SERVE_RESTART_COOLDOWN_S = 300   # min spacing between restart attempts
+# 10 (was 3): the e-infra glm-5.3 provider intermittently returns zero-byte
+# streams (2026-11-16 afternoon: 1-in-4 lead turns delivered; the rest opened
+# and hung at 0 chars). The serve restart is the only recovery lever and the
+# campaign budgets are 150-180 min, so a small cap just runs dry mid-wait.
+LEAD_SERVE_RESTART_MAX = 10      # restart attempts per driver lifetime
+# 2026-11-16 (l2final attempt 2, run -7c9099b9): the phase CHILD can freeze
+# (its provider stream hangs) while the Lead sits IDLE at a pending task call —
+# the Lead's own session looks healthy, so neither lead-side detector fires,
+# guardrail verdicts (one per child bash/MCP call) freeze, and the campaign
+# runner's 12-min idle limit tears the topology down before anything recovers.
+# A pending task with a verdict stream frozen this long IS a sustained stall:
+# recovery skips the extra 240s confirmation and fires immediately (the freeze
+# window itself is the confirmation). 420s clears slow single tools (nmap
+# sweeps, HexStrike probes run minutes) while beating the 12-min idle limit.
+CHILD_STALL_S = 420
+
+
+def _child_frozen(
+    pending_task: bool, verdicts_mtime: Optional[float], now_s: float
+) -> bool:
+    """True when a pending phase task has produced no guardrail verdict for
+    >= CHILD_STALL_S (the child's activity signal is the verdict stream)."""
+    if not pending_task or verdicts_mtime is None:
+        return False
+    return (now_s - verdicts_mtime) >= CHILD_STALL_S
 # A verdict is 'dead-judge' when the JUDGE produced no usable output (vs a genuine
 # refuse/escalate the judge deliberately returned). tokens.total==0 = judge call
 # returned empty body (http 0 / connection fail / parse fail); these reason
@@ -3302,6 +3353,92 @@ async def _graceful_finalize_session(session_id: str, addr: str, timeout_s: int 
         logger.warning("graceful_finalize[%s] best-effort send failed (continuing): %s", session_id, exc)
 
 
+def _rearm_lead_drivers_for_running_runs() -> int:
+    """Re-arm the lead driver for every accepted, still-RUNNING native-subagents
+    run that has no live driver task. A backend restart loses the in-memory
+    _lead_drivers asyncio tasks; without this sweep a mid-run restart leaves the
+    engagement unpaced forever — nothing advances phases, nothing gates on
+    stall, nothing snapshots the transcript (observed first-hand 2026-11-16:
+    the wedged-serve fix deploy restarted the backend under run
+    paper-l1-r1-20261116-024634). Called from the app lifespan on startup.
+    Best-effort: a corrupt manifest is skipped, never raised. Returns the
+    number of drivers re-armed."""
+    armed = 0
+    try:
+        manifests = sorted(OUTPUTS_DIR.glob("*/guardrail/run.json"))
+    except Exception as exc:
+        logger.warning("driver re-arm sweep: manifest glob failed: %s", exc)
+        return 0
+    for manifest in manifests:
+        try:
+            run_id = manifest.parent.parent.name
+            meta = _read_run_meta(run_id)
+            if not meta:
+                continue
+            if meta.get("orchestration") != Orchestration.NATIVE_SUBAGENTS.value:
+                continue
+            if not meta.get("session_id"):
+                continue
+            if _run_overall_status(meta) != "running":
+                continue
+            existing = _lead_drivers.get(run_id)
+            if existing and not existing.done():
+                continue
+            _arm_lead_driver(run_id)
+            armed += 1
+            logger.info("driver re-arm sweep: re-armed lead driver for %s", run_id)
+        except Exception as exc:
+            logger.warning("driver re-arm sweep: %s skipped: %s",
+                           manifest.parent.parent.name, exc)
+    return armed
+
+
+async def _restart_opencode_serve(container_id: str) -> Tuple[bool, str]:
+    """Restart the agent container to recover a wedged executor opencode serve.
+
+    2026-11-16 REWRITE (l2final topo 114845 / run -592c5910): the previous
+    in-container pkill+relaunch was fragile in practice — `sh -lc` login-shell
+    execs died pre-bind (rc=143 / silent exits), the pkill pattern self-matched
+    its own wrapper shell's cmdline, and a serve relaunched OUTSIDE the
+    entrypoint lacked the image's expected supervision context (several
+    relaunches never bound). `docker container restart` re-runs the real
+    entrypoint (executor serve 4096 + guardrail serve 4097 + HexStrike + sshd),
+    preserves the container IP / volumes / sqlite store, and sessions survive —
+    only the in-flight (hung) generation dies, which is the point. Cost: the
+    boot sequence (guardrail readiness wait + HexStrike probes) takes ~20-60s.
+
+    Best-effort: returns (ready, detail); never raises.
+    """
+    from ..services.docker_client import check_opencode_ready, create_docker_client
+    client = create_docker_client()
+    detail = ""
+    try:
+        await client.connect()
+        container = await client.docker.containers.get(container_id)
+        await asyncio.wait_for(container.restart(timeout=10), timeout=90)
+        logger.info("serve_restart[%s]: agent container restarted; waiting for "
+                    "executor serve", container_id[:12])
+        # Readiness: the entrypoint boots the guardrail serve + HexStrike
+        # BEFORE the executor bind, so the first health hits can lag ~20-60s.
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            if await check_opencode_ready(client, container_id):
+                logger.info("serve_restart[%s]: executor serve ready after "
+                            "container restart", container_id[:12])
+                return True, detail
+            await asyncio.sleep(3)
+        return False, detail or "executor serve not ready 120s after container restart"
+    except Exception as exc:
+        detail = f"serve restart failed: {exc}"
+        logger.warning("serve_restart[%s]: %s", container_id[:12], detail)
+        return False, detail
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+
 def _read_verdicts_tail(run_id: str, limit: int = 64) -> List[Dict[str, Any]]:
     """Newest-first tail of the guardrail verdicts.ndjson for a run. Each line is
     {decision, reason, tokens:{total,...}, ...}. Best-effort: missing/garbage file
@@ -3494,6 +3631,99 @@ def _lead_needs_auto_resume(*, mode: str, pending_tool: bool,
     )
 
 
+def _lead_stream_hung(msgs: List[Dict[str, Any]], now_s: float) -> bool:
+    """True when the Lead's newest turn shows the provider-stream hang signature.
+
+    Two signatures match the glm-5.3 stream-end-never-arrives failure mode:
+      1. the newest assistant message was created but never completed AND has
+         zero delivered content (no non-empty text part, no tool part) and is
+         older than LEAD_STREAM_STALL_S — the serve accepted the prompt, wrote
+         the assistant row, and the provider stream never delivered a byte
+         (paper-l1-r1-20261116-010920 01:31:35 message: tokens all 0,
+         completed=NULL);
+      2. the newest message is a USER prompt with no assistant response at all,
+         older than LEAD_STREAM_STALL_S — the serve died before even creating
+         the assistant row.
+
+    A HEALTHY long turn is never flagged: any non-empty text part or ANY tool
+    part (including a long-running coder56_phase task tool, whose part state
+    stays pending for the whole child run) counts as delivered content, and a
+    completed turn is not open.
+    """
+    threshold_ms = LEAD_STREAM_STALL_S * 1000.0
+    for m in reversed(msgs):
+        if not isinstance(m, dict):
+            continue
+        info = m.get("info") or {}
+        role = info.get("role") or m.get("role")
+        mtime = info.get("time") or m.get("time") or {}
+        if role == "user":
+            created = float(mtime.get("created") or 0)
+            return bool(created) and (now_s * 1000.0 - created) >= threshold_ms
+        if role != "assistant":
+            continue
+        if mtime.get("completed") or mtime.get("end"):
+            return False                      # newest turn is closed: healthy
+        has_content = any(
+            isinstance(p, dict) and (
+                (p.get("type") == "text" and (p.get("text") or "").strip())
+                or p.get("type") == "tool"
+            )
+            for p in (m.get("parts") or [])
+        )
+        if has_content:
+            return False                      # streaming or delegating normally
+        created = float(mtime.get("created") or 0)
+        return bool(created) and (now_s * 1000.0 - created) >= threshold_ms
+    return False
+
+
+def _lead_open_signature(msg: Dict[str, Any]) -> Optional[tuple]:
+    """Growth signature of an OPEN (created, never completed) assistant
+    message: (created_ms, n_parts, total content chars). None when the message
+    is completed, not assistant, or malformed. Frozen signatures across polls
+    are the mid-REASONING stream-hang signature (l2final -b3dfd8ce: the lead's
+    first turn froze inside a reasoning part — parts present, zero growth,
+    zero tokens, never completed; the zero-content detector cannot see it)."""
+    if not isinstance(msg, dict):
+        return None
+    info = msg.get("info") or {}
+    role = info.get("role") or msg.get("role")
+    if role != "assistant":
+        return None
+    mtime = info.get("time") or msg.get("time") or {}
+    if mtime.get("completed") or mtime.get("end"):
+        return None
+    created = mtime.get("created")
+    if not created:
+        return None
+    n_parts = 0
+    content_len = 0
+    for p in (msg.get("parts") or []):
+        if not isinstance(p, dict):
+            continue
+        n_parts += 1
+        if p.get("type") in ("text", "reasoning"):
+            content_len += len(str(p.get("text") or ""))
+    return (int(created), n_parts, content_len)
+
+
+def _lead_recovery_due(
+    *,
+    stall_since: Optional[float],
+    now_s: float,
+    restarts: int,
+    last_restart: float,
+) -> bool:
+    """True when a sustained lead stall has earned one bounded serve restart."""
+    return (
+        stall_since is not None
+        and (now_s - stall_since) >= LEAD_SERVE_RECOVERY_S
+        and restarts < LEAD_SERVE_RESTART_MAX
+        and (now_s - last_restart) >= LEAD_SERVE_RESTART_COOLDOWN_S
+    )
+
+
 async def _lead_driver(run_id: str) -> None:
     """Watch the coder56_lead session: derive phase_runtime from its coder56_phase
     task-tool calls and gate between phases per phase_mode. Mirrors _phase_driver
@@ -3526,6 +3756,12 @@ async def _lead_driver(run_id: str) -> None:
     phase0_nudged = False  # one-shot: Phase-0 THREAT_MODEL| nudge already sent
     corrected_for = -1  # phase index already given a corrective task payload
     last_snapshot = time.time()  # mid-run transcript snapshot cadence
+    noop_empty_polls = 0    # FIX A: consecutive VERIFIED-empty (successful) fetches
+    lead_stall_since = None  # FIX B: wall-clock the sustained lead stall began
+    serve_restarts = 0       # FIX B: bounded restart attempts spent
+    last_serve_restart = 0.0  # FIX B: cooldown anchor
+    prev_open_sig = None      # FIX B: open-assistant growth signature tracking
+    prev_open_sig_since = 0.0
 
     while True:
         try:
@@ -3541,7 +3777,12 @@ async def _lead_driver(run_id: str) -> None:
                 break
 
             res = await get_session_messages_async(session_id=lead_sess, host=addr, port=4096)
-            msgs = res.get("messages", []) if res.get("success") else []
+            # FIX A: fetch failure is NOT evidence of an empty session. A
+            # transient serve outage must never look like "the agent never ran".
+            fetch_ok = bool(res.get("success"))
+            msgs = (res.get("messages") or []) if fetch_ok else []
+            if fetch_ok:
+                noop_empty_polls = noop_empty_polls + 1 if not msgs else 0
 
             # Ordered list of coder56_phase task-tool calls + their parsed data + status,
             # plus the Lead's latest assistant text and whether any tool is still pending.
@@ -3784,6 +4025,151 @@ async def _lead_driver(run_id: str) -> None:
                     logger.warning("lead_driver[%s] corrective injection failed: %s", run_id, exc)
 
             now = time.time()
+
+            # === 2026-11-16 WEDGED-SERVE RECOVERY (FIX B) =====================
+            # A sustained lead stall — messages fetch failing (serve wedged by a
+            # hung provider stream) or a zero-content assistant message open
+            # longer than LEAD_STREAM_STALL_S (stream-end-never-arrives) — must
+            # NEVER reach the REC#3(c) no-op gate (that killed a healthy run:
+            # paper-l1-r1-20261116-010920). Instead: one bounded executor-serve
+            # restart (sessions persist in sqlite; the guardrail serve on 4097
+            # is untouched), then a lead re-kick prompt.
+            # CHILD-FREEZE variant (l2final attempt 2, run -7c9099b9): the phase
+            # child froze while the Lead sat healthy and idle on its pending
+            # task call — neither lead-side detector fires, verdicts freeze,
+            # the campaign idle limit tears the run down. A pending task with a
+            # verdict stream frozen >= CHILD_STALL_S IS already-sustained: the
+            # stall is marked pre-confirmed so recovery fires on this poll.
+            pending_task_now = any(
+                st not in ("completed", "error") for _, st in tasks)
+            child_frozen = False
+            if pending_task_now:
+                try:
+                    v_mtime = (_guardrail_dir(run_id)
+                               / "verdicts.ndjson").stat().st_mtime
+                except OSError:
+                    v_mtime = None
+                child_frozen = _child_frozen(pending_task_now, v_mtime, now)
+
+            # Mid-stream growth check: an OPEN assistant message whose
+            # signature (created, n_parts, content chars) froze across polls
+            # for >= LEAD_STREAM_STALL_S is a stream hang even when parts
+            # exist (mid-reasoning freeze, l2final -b3dfd8ce).
+            open_sig = None
+            for m in reversed(msgs):
+                sig = _lead_open_signature(m)
+                if sig is not None:
+                    open_sig = sig
+                    break
+                info = m.get("info") or {}
+                if (info.get("role") or m.get("role")) in ("assistant", "user"):
+                    break       # newest turn is closed: no open message
+            stream_growth_frozen = False
+            if open_sig is not None:
+                if open_sig == prev_open_sig:
+                    if now - prev_open_sig_since >= LEAD_STREAM_STALL_S:
+                        stream_growth_frozen = True
+                else:
+                    prev_open_sig = open_sig
+                    prev_open_sig_since = now
+            else:
+                prev_open_sig = None
+                prev_open_sig_since = 0.0
+
+            stall_now = (not fetch_ok) or _lead_stream_hung(msgs, now) \
+                or child_frozen or stream_growth_frozen
+            if stall_now:
+                if lead_stall_since is None:
+                    lead_stall_since = now
+                    if fetch_ok and (child_frozen
+                                     or _lead_stream_hung(msgs, now)
+                                     or stream_growth_frozen):
+                        # The zero-content open message / frozen growth /
+                        # child-freeze window already proves persistence: skip
+                        # the extra confirmation delay, recover immediately.
+                        # (Only the bare "messages fetch failing" case — which
+                        # can be a transient network blip or a serve mid-boot —
+                        # keeps the 240s confirm.)
+                        lead_stall_since = now - LEAD_SERVE_RECOVERY_S
+                    cause = ("messages fetch failing" if not fetch_ok else
+                             "assistant stream hung with zero content"
+                             if _lead_stream_hung(msgs, now) else
+                             "assistant message frozen mid-stream"
+                             if stream_growth_frozen else
+                             f"phase child frozen (no guardrail verdicts for "
+                             f">{CHILD_STALL_S}s while a task is pending)")
+                    logger.warning(
+                        "lead_driver[%s]: lead stall detected (%s); serve restart "
+                        "%s", run_id, cause,
+                        "now" if lead_stall_since != now
+                        else f"in ~{LEAD_SERVE_RECOVERY_S}s if it persists",
+                    )
+            else:
+                lead_stall_since = None
+
+            if _lead_recovery_due(stall_since=lead_stall_since, now_s=now,
+                                  restarts=serve_restarts,
+                                  last_restart=last_serve_restart):
+                serve_restarts += 1
+                last_serve_restart = now
+                logger.warning(
+                    "lead_driver[%s]: restarting wedged executor opencode serve "
+                    "(attempt %d/%d)", run_id, serve_restarts, LEAD_SERVE_RESTART_MAX)
+                ok, detail = await _restart_opencode_serve(container_id)
+                lead_stall_since = None          # fresh observation window
+                if ok:
+                    # Robust re-kick gate (l2final -b3dfd8ce: two re-kick
+                    # POSTs were lost against a serve that answered
+                    # /global/health but was not taking session calls yet —
+                    # check_opencode_ready passed ~0.2s after relaunch).
+                    # Ready means: a REAL session-messages GET returns
+                    # 200+JSON. Poll up to ~120s — a full CONTAINER restart
+                    # (the recovery path since the pkill rewrite) boots the
+                    # guardrail serve + HexStrike before the executor bind,
+                    # so 30s regularly missed it (l2final -c76b2d41 14:2x:
+                    # five consecutive re-kicks skipped at 30s).
+                    for _ in range(40):
+                        probe = await get_session_messages_async(
+                            session_id=lead_sess, host=addr, port=4096,
+                            timeout=8, max_retries=1)
+                        if probe.get("success"):
+                            break
+                        await asyncio.sleep(3)
+                    else:
+                        logger.warning(
+                            "lead_driver[%s]: serve messages endpoint not "
+                            "ready 120s after restart; re-kick skipped "
+                            "(stall watcher continues)", run_id)
+                        ok = False
+                        detail = detail or "messages endpoint not ready"
+                if ok:
+                    next_phase = min(n_completed + 1, len(phases))
+                    try:
+                        await send_prompt_async(
+                            session_id=lead_sess, host=addr, port=4096,
+                            agent="coder56_lead", async_mode=True, timeout=120,
+                            prompt=(
+                                "Your previous turn was interrupted: the provider stream "
+                                "hung and the executor OpenCode serve was restarted. Session "
+                                "history is intact. Continue exactly where you left off: if a "
+                                "coder56_phase subagent was interrupted by the restart, spawn "
+                                "it again (its partial findings remain in engagement memory at "
+                                f"/outputs/{run_id}/memory/MEMORY.md — do not redo completed "
+                                "work); otherwise proceed to phase " + str(next_phase) + " per "
+                                "runtime pacing (AUTO_CONTINUE overrides any earlier "
+                                "stop-at-boundary instruction)."
+                            ),
+                        )
+                        last_progress = time.time()
+                        logger.info("lead_driver[%s]: lead re-kicked after serve restart",
+                                    run_id)
+                    except Exception as exc:
+                        logger.warning("lead_driver[%s]: post-restart re-kick failed: %s",
+                                       run_id, exc)
+                else:
+                    logger.warning("lead_driver[%s]: serve restart did not recover "
+                                   "readiness: %s", run_id, detail)
+
             # Periodic mid-run transcript snapshot: the exit snapshot at driver
             # exit (below) covers phase boundaries; this covers a mid-phase host
             # recreate/crash so the full execution is never lost. Best-effort.
@@ -3799,9 +4185,12 @@ async def _lead_driver(run_id: str) -> None:
             halt_reason = ""
             # (c) NO-OP FAILURE DETECTOR: the Lead session produced no parts at all —
             # the agent never really ran. Fabricating deliverables (71592e76) is
-            # worse than an honest failure.
-            if not msgs:
-                halt_reason = "no-op session: lead session produced 0 messages/parts — the agent never ran (no transcript to report)"
+            # worse than an honest failure. FIX A: requires a VERIFIED-empty session
+            # (successful fetch, sustained across LEAD_NOOP_CONFIRM_POLLS polls) —
+            # a FAILED fetch collapses to msgs==[] but is not evidence of emptiness;
+            # the wedged-serve recovery (FIX B) owns that path instead.
+            if not msgs and fetch_ok and noop_empty_polls >= LEAD_NOOP_CONFIRM_POLLS:
+                halt_reason = "no-op session: lead session produced 0 messages/parts across %d verified polls — the agent never ran (no transcript to report)" % LEAD_NOOP_CONFIRM_POLLS
             # (b) CONSECUTIVE-FAIL CIRCUIT BREAKER: >=3 dead-judge verdicts in a row
             # (judge unreachable / empty body). Stop burning retries.
             elif not meta.get("guardrail_shadow") and _consecutive_dead_judge(run_id) >= GUARDRAIL_CIRCUIT_BREAKER_N:
